@@ -67,6 +67,15 @@ pub fn router() -> axum::Router<WebState> {
         .route("/api/usage/recent", get(usage_recent))
 }
 
+/// 上游每账号并发上限（与 api.rs 保持一致）。
+fn concurrency_limit() -> usize {
+    std::env::var("CODEARTS_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(3)
+}
+
 /// 账号文件位置：优先 CODEARTS_ACCOUNTS，其次 .env 同目录 accounts.json。
 pub fn accounts_file_path(cfg: &Config) -> PathBuf {
     std::env::var("CODEARTS_ACCOUNTS")
@@ -268,6 +277,14 @@ pub async fn status(State(state): State<WebState>) -> Response {
             })
             .collect();
 
+    // 每账号的并发/健康快照
+    let mut health = serde_json::Map::new();
+    for account in &cfg.accounts {
+        let gate = state.gate(&account.id, concurrency_limit()).await;
+        health.insert(account.id.clone(), gate.snapshot().await);
+    }
+    let pinned_sessions = state.pins.len().await;
+
     let merged = pool.merged_models().await;
     let model_list: Vec<Value> = merged
         .iter()
@@ -290,10 +307,13 @@ pub async fn status(State(state): State<WebState>) -> Response {
             "enabled_count": cfg.accounts.iter().filter(|a| a.enabled).count(),
             "model_count": total_models,
             "oauth_count": oauth_accounts.len(),
+            "pinned_sessions": pinned_sessions,
+            "concurrency_limit": concurrency_limit(),
             "total_account_models": described.iter().map(|(_, _, n)| *n).sum::<usize>(),
             "listen": format!("{}:{}", cfg.host, cfg.port),
         },
         "oauth": oauth_accounts,
+        "health": health,
         "config": {
             "host": cfg.host,
             "port": cfg.port,

@@ -30,6 +30,10 @@ pub struct WebState {
     pub quota: Arc<RwLock<HashMap<String, Quota>>>,
     /// 最近一次签到结果，供页面展示。
     pub last_checkin: Arc<RwLock<Option<crate::checkin::Outcome>>>,
+    /// 每账号的并发闸门与健康状态。
+    pub gates: Arc<RwLock<HashMap<String, Arc<crate::concurrency::AccountGate>>>>,
+    /// 会话钉号表。
+    pub pins: crate::concurrency::SessionPins,
 }
 
 impl WebState {
@@ -46,6 +50,8 @@ impl WebState {
             usage,
             quota: Arc::new(RwLock::new(HashMap::new())),
             last_checkin: Arc::new(RwLock::new(None)),
+            gates: Arc::new(RwLock::new(HashMap::new())),
+            pins: crate::concurrency::SessionPins::new(),
         }
     }
 
@@ -55,6 +61,21 @@ impl WebState {
             .try_read()
             .map(|c| c.clone())
             .unwrap_or_else(|_| Config::load().expect("配置在运行期不应失效"))
+    }
+
+    /// 取（或按需创建）某账号的并发闸门。
+    pub async fn gate(&self, account_id: &str, limit: usize) -> Arc<crate::concurrency::AccountGate> {
+        {
+            let guard = self.gates.read().await;
+            if let Some(g) = guard.get(account_id) {
+                return g.clone();
+            }
+        }
+        let mut guard = self.gates.write().await;
+        guard
+            .entry(account_id.to_string())
+            .or_insert_with(|| Arc::new(crate::concurrency::AccountGate::new(limit)))
+            .clone()
     }
 
     pub fn reload_config(&self) -> Result<(), String> {

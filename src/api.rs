@@ -74,6 +74,15 @@ async fn get_model(State(state): State<AppState>, Path(model_id): Path<String>) 
     }
 }
 
+/// 上游每账号的并发会话上限（实测套餐为 3），可用环境变量覆盖。
+fn upstream_concurrency_limit() -> usize {
+    std::env::var("CODEARTS_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(3)
+}
+
 fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
     (
         status,
@@ -109,7 +118,11 @@ fn is_account_switchable(payload: &Value) -> bool {
     false
 }
 
-async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Response {
+async fn chat_completions(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
     if body.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "empty body");
     }
@@ -160,7 +173,47 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
     }
 
     let started = std::time::Instant::now();
-    let candidates = pool.accounts_for(&model).await;
+    let mut candidates = pool.accounts_for(&model).await;
+    if candidates.is_empty() {
+        return error_response(StatusCode::NOT_FOUND, format!("model '{model}' 无可用账号"));
+    }
+
+    // 会话钉号：同一对话固定到同一账号，避免上游把每轮都当成新会话占用槽位。
+    let header_hint = headers
+        .get("x-codearts-chat-id")
+        .or_else(|| headers.get("x-conversation-id"))
+        .and_then(|v| v.to_str().ok());
+    let sess_key = crate::concurrency::session_key(&req_json, header_hint);
+
+    if let Some(key) = sess_key.as_ref() {
+        if let Some(pinned) = state.pins.get(key).await {
+            // 把钉住的账号排到最前；若它已不可用则释放钉号重新选
+            if let Some(pos) = candidates.iter().position(|c| c.account_id() == pinned) {
+                let c = candidates.remove(pos);
+                candidates.insert(0, c);
+                state.pins.touch(key).await;
+            } else {
+                state.pins.release_account(&pinned).await;
+            }
+        }
+    }
+
+    // 过滤掉冷却中的账号（除非全都在冷却）
+    let usable: Vec<_> = {
+        let mut v = Vec::new();
+        for c in &candidates {
+            let gate = state.gate(c.account_id(), upstream_concurrency_limit()).await;
+            if gate.available().await {
+                v.push(c.clone());
+            }
+        }
+        if v.is_empty() {
+            candidates.clone()
+        } else {
+            v
+        }
+    };
+    let candidates = usable;
     if candidates.is_empty() {
         return error_response(StatusCode::NOT_FOUND, format!("model '{model}' 无可用账号"));
     }
@@ -170,6 +223,31 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
     let mut switched = 0usize;
 
     for (idx, catalog) in candidates.iter().enumerate() {
+        let gate = state.gate(catalog.account_id(), upstream_concurrency_limit()).await;
+
+        // 等待并发槽位（超出上游上限时排队而非直接失败）
+        let _permit = match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            gate.acquire(),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                println!("[{}] {model}: 跳过（{e}）", catalog.account_id());
+                last = Some(error_response(StatusCode::SERVICE_UNAVAILABLE, e));
+                continue;
+            }
+            Err(_) => {
+                println!("[{}] {model}: 等待并发槽位超时", catalog.account_id());
+                last = Some(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "等待并发槽位超时，请稍后重试",
+                ));
+                continue;
+            }
+        };
+
         let benefit = !catalog.is_agent_channel(&model).await;
         let body_bytes = match serde_json::to_vec(&prepared) {
             Ok(v) => v,
@@ -212,6 +290,7 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
                 catalog.account_id(),
                 &text[..text.len().min(300)]
             );
+            gate.note_failure(&text).await;
             if is_account_switchable(&parsed) && idx + 1 < candidates.len() {
                 catalog.note_failure();
                 switched += 1;
@@ -236,6 +315,10 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
 
         if want_stream {
             catalog.note_success();
+            gate.note_success().await;
+            if let Some(key) = sess_key.as_ref() {
+                state.pins.pin(key, catalog.account_id()).await;
+            }
             if switched > 0 {
                 println!("[pool] {model}: 已切换到账号 {}", catalog.account_id());
             }
@@ -296,6 +379,10 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         }
 
         catalog.note_success();
+        gate.note_success().await;
+        if let Some(key) = sess_key.as_ref() {
+            state.pins.pin(key, catalog.account_id()).await;
+        }
         if switched > 0 {
             println!("[pool] {model}: 已切换到账号 {}", catalog.account_id());
         }

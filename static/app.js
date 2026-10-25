@@ -118,6 +118,11 @@
     setStat('#statEnabled', summary.enabled_count || 0, true);
     const listenEl = $('#statListen');
     if (listenEl) listenEl.textContent = summary.listen || '—';
+    const concEl = $('#statConc');
+    if (concEl) {
+      concEl.textContent = (summary.concurrency_limit || 3) + ' 并发 · ' +
+        (summary.pinned_sessions || 0) + ' 钉号';
+    }
 
     const badge = $('#poolBadge');
     if (badge) {
@@ -172,11 +177,29 @@
       tbody.innerHTML = '<tr><td colspan="5" class="empty-cell">还没有账号，点击右上角"添加账号"</td></tr>';
       return;
     }
-    tbody.innerHTML = state.accounts.map((a) => `
+    const health = (state.status && state.status.health) || {};
+    tbody.innerHTML = state.accounts.map((a) => {
+      const h = health[a.id] || {};
+      const isOauth = a.oauth || (!a.ak || a.ak === '****');
+      const credBadge = isOauth
+        ? '<span class="mx-badge mx-badge-success">OAuth</span>'
+        : '<span class="mx-badge">AK/SK</span>';
+      let healthBadge;
+      if (h.available === false) {
+        healthBadge = '<span class="mx-badge mx-badge-error">冷却 ' + (h.cooldown_remaining || 0) + 's</span>';
+      } else if ((h.in_flight || 0) > 0) {
+        healthBadge = '<span class="mx-badge mx-badge-warning">' + h.in_flight + '/' + (h.limit || 3) + '</span>';
+      } else if ((h.total_failures || 0) > 0) {
+        healthBadge = '<span class="mx-badge mx-badge-warning">失败 ' + h.total_failures + '</span>';
+      } else {
+        healthBadge = '<span class="mx-badge mx-badge-success">正常</span>';
+      }
+      return `
       <tr>
         <td data-label="账号" class="mono">${escapeHtml(a.id)}</td>
-        <td data-label="AK" class="mono">${escapeHtml(a.ak)}</td>
+        <td data-label="凭证">${credBadge}</td>
         <td data-label="模型数">${fmtNumber(a.model_count || 0)}</td>
+        <td data-label="健康">${healthBadge}</td>
         <td data-label="启用">
           <label class="mx-switch">
             <input type="checkbox" ${a.enabled ? 'checked' : ''} data-toggle="${escapeHtml(a.id)}">
@@ -189,7 +212,8 @@
             <button class="mx-btn mx-btn-sm mx-btn-danger" data-del="${escapeHtml(a.id)}" data-ripple>删除</button>
           </div>
         </td>
-      </tr>`).join('');
+      </tr>`;
+    }).join('');
   }
 
   function modelOwnerNames(modelId) {

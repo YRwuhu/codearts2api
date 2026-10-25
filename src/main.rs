@@ -1,6 +1,7 @@
 mod admin;
 mod api;
 mod checkin;
+mod concurrency;
 mod config;
 mod models;
 mod oauth;

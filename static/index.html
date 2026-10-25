@@ -25,7 +25,7 @@
 <link rel="stylesheet" href="/vendor/components/empty.css">
 <link rel="stylesheet" href="/vendor/components/tag.css">
 <link rel="stylesheet" href="/vendor/components/tooltip.css">
-<link rel="stylesheet" href="/app.css?v=1792916227">
+<link rel="stylesheet" href="/app.css?v=1792918099">
 </head>
 <body>
 <div class="mx-app">
@@ -153,6 +153,10 @@
           </div>监听地址</div>
           <div class="mx-stat-value" id="statListen" style="font-size:15px">—</div>
         </div>
+        <div class="mx-stat" style="--mx-stat-accent: var(--mx-primary)">
+          <div class="mx-stat-label">并发 / 会话</div>
+          <div class="mx-stat-value" id="statConc" style="font-size:15px">—</div>
+        </div>
       </div>
 
       <div class="mx-card" style="margin-top:16px">
@@ -204,7 +208,7 @@
         <div class="mx-card-body">
           <div class="mx-table-wrap">
             <table class="mx-table">
-              <thead><tr><th>账号</th><th>AK</th><th>模型数</th><th>启用</th><th>操作</th></tr></thead>
+              <thead><tr><th>账号</th><th>凭证</th><th>模型数</th><th>健康</th><th>启用</th><th>操作</th></tr></thead>
               <tbody id="accountRows"></tbody>
             </table>
           </div>
@@ -535,6 +539,6 @@
     try { if (window.MxSmoothCorner && MxSmoothCorner.init) MxSmoothCorner.init(); } catch (_) {}
   })();
 </script>
-<script src="/app.js?v=1792916227"></script>
+<script src="/app.js?v=1792918099"></script>
 </body>
 </html>
