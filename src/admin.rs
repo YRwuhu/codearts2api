@@ -31,6 +31,9 @@ struct AccountRecord {
     ak: String,
     #[serde(default)]
     sk: String,
+    /// true 表示该账号用 OAuth 凭证（auths/ 目录），ak/sk 留空
+    #[serde(default)]
+    oauth: bool,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -49,6 +52,12 @@ pub fn router() -> axum::Router<WebState> {
         )
         .route("/api/refresh", post(refresh_models))
         .route("/api/test", post(test_model))
+        .route("/api/oauth/start", post(crate::oauth::flow::start))
+        .route("/api/oauth/poll", post(crate::oauth::flow::poll))
+        .route(
+            "/api/oauth/account/{account}",
+            axum::routing::delete(oauth_logout),
+        )
         .route("/api/checkin/status", get(checkin_status))
         .route("/api/checkin/run", post(run_checkin))
         .route("/api/checkin/last", get(last_checkin))
@@ -141,6 +150,47 @@ fn err(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({"error": message.into()}))).into_response()
 }
 
+/// 解析账号的最终凭证：OAuth 账号从 auths/ 读取 STS 临时 AK/SK，
+/// 必要时先续期；手动账号直接用 JSON 里的 AK/SK。
+pub async fn resolve_account(
+    http: &reqwest::Client,
+    env_dir: &std::path::Path,
+    account: &Account,
+) -> Result<Account, String> {
+    if !account.is_oauth() {
+        return Ok(account.clone());
+    }
+
+    let Some(mut identity) = crate::oauth::store::load(env_dir, &account.id) else {
+        return Err(format!("账号 {} 的 OAuth 凭证不存在，请重新登录", account.id));
+    };
+
+    // 快过期（30 分钟内）或已过期时先续期
+    if identity.expired() || identity.expiring_within(1800) {
+        match crate::oauth::store::refresh_and_save(http, env_dir, &identity).await {
+            Ok(fresh) => {
+                println!("[oauth] 账号 {} 凭证已续期", account.id);
+                identity = fresh;
+            }
+            Err(e) => {
+                if identity.expired() {
+                    return Err(format!("账号 {} 凭证已过期且续期失败: {e}", account.id));
+                }
+                eprintln!("[oauth] 账号 {} 续期失败（继续用旧凭证）: {e}", account.id);
+            }
+        }
+    }
+
+    Ok(Account {
+        id: account.id.clone(),
+        ak: identity.access_key_id.clone(),
+        sk: identity.secret_access_key.clone(),
+        security_token: Some(identity.security_token.clone()),
+        kind: account.kind.clone(),
+        enabled: account.enabled,
+    })
+}
+
 /// 重建账号池（账号变更后调用）。
 pub async fn rebuild_pool(state: &WebState) -> Result<usize, String> {
     let cfg = state.config();
@@ -150,9 +200,17 @@ pub async fn rebuild_pool(state: &WebState) -> Result<usize, String> {
     }
     let mut catalogs = Vec::new();
     for account in enabled {
+        // OAuth 账号需要先解析出 STS 凭证
+        let resolved = match resolve_account(&state.http, &cfg.env_dir, account).await {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("[pool] 跳过账号 {}: {e}", account.id);
+                continue;
+            }
+        };
         let cache_path = cfg.cache_path_for(account);
         let catalog = Catalog::new(
-            account.clone(),
+            resolved,
             &cache_path,
             cfg.benefit_fallback,
             state.http.clone(),
@@ -161,6 +219,9 @@ pub async fn rebuild_pool(state: &WebState) -> Result<usize, String> {
             catalog.load_cache().await;
         }
         catalogs.push(Arc::new(catalog));
+    }
+    if catalogs.is_empty() {
+        return Err("没有任何账号能成功初始化（OAuth 账号可能需要重新登录）".to_string());
     }
     let count = catalogs.len();
     *state.pool.write().await = Pool::new(catalogs);
@@ -192,6 +253,21 @@ pub async fn status(State(state): State<WebState>) -> Response {
         }));
     }
 
+    // OAuth 账号的登录状态（凭证有效期）
+    let oauth_accounts: Vec<serde_json::Value> =
+        crate::oauth::store::load_all(&cfg.env_dir)
+            .iter()
+            .map(|id| {
+                json!({
+                    "user_id": id.user_id,
+                    "user_name": id.display_name(),
+                    "remaining_secs": id.remaining_secs(),
+                    "expires_at": id.expiration,
+                    "expiring_soon": id.expiring_within(1800),
+                })
+            })
+            .collect();
+
     let merged = pool.merged_models().await;
     let model_list: Vec<Value> = merged
         .iter()
@@ -213,9 +289,11 @@ pub async fn status(State(state): State<WebState>) -> Response {
             "account_count": cfg.accounts.len(),
             "enabled_count": cfg.accounts.iter().filter(|a| a.enabled).count(),
             "model_count": total_models,
+            "oauth_count": oauth_accounts.len(),
             "total_account_models": described.iter().map(|(_, _, n)| *n).sum::<usize>(),
             "listen": format!("{}:{}", cfg.host, cfg.port),
         },
+        "oauth": oauth_accounts,
         "config": {
             "host": cfg.host,
             "port": cfg.port,
@@ -300,6 +378,7 @@ pub async fn add_account(
         id: id.clone(),
         ak,
         sk,
+        oauth: false,
         enabled: req.enabled,
     });
 
@@ -617,7 +696,29 @@ pub async fn checkin_status(State(state): State<WebState>) -> Response {
     let mut all_ok = true;
 
     for account in cfg.accounts.iter().filter(|a| a.enabled) {
-        match crate::checkin::fetch_activities(&state.http, &account.ak, &account.sk, None).await {
+        let resolved = match resolve_account(&state.http, &cfg.env_dir, account).await {
+            Ok(a) => a,
+            Err(e) => {
+                all_ok = false;
+                accounts.push(AccountCheckin {
+                    account: account.id.clone(),
+                    ok: false,
+                    message: e,
+                    claimed_today: false,
+                    benefit_amount: 0.0,
+                    activities: Vec::new(),
+                });
+                continue;
+            }
+        };
+        match crate::checkin::fetch_activities(
+            &state.http,
+            &resolved.ak,
+            &resolved.sk,
+            resolved.security_token(),
+        )
+        .await
+        {
             Ok(activities) => {
                 let daily = activities.iter().find(|a| a.is_daily());
                 let claimed = daily.map(|a| a.claimed()).unwrap_or(false);
@@ -664,8 +765,28 @@ pub async fn run_checkin(State(state): State<WebState>) -> Response {
     let mut any_claimed = false;
 
     for account in cfg.accounts.iter().filter(|a| a.enabled) {
-        let outcome =
-            crate::checkin::run(&state.http, &account.ak, &account.sk, None).await;
+        let resolved = match resolve_account(&state.http, &cfg.env_dir, account).await {
+            Ok(a) => a,
+            Err(e) => {
+                all_ok = false;
+                accounts.push(AccountCheckin {
+                    account: account.id.clone(),
+                    ok: false,
+                    message: e,
+                    claimed_today: false,
+                    benefit_amount: 0.0,
+                    activities: Vec::new(),
+                });
+                continue;
+            }
+        };
+        let outcome = crate::checkin::run(
+            &state.http,
+            &resolved.ak,
+            &resolved.sk,
+            resolved.security_token(),
+        )
+        .await;
         println!(
             "[checkin] account={} ok={} claimed={} {}",
             account.id, outcome.ok, outcome.claimed_today, outcome.message
@@ -707,16 +828,33 @@ pub fn spawn_checkin_scheduler(state: WebState) {
         loop {
             let cfg = state.config();
             for account in cfg.accounts.iter().filter(|a| a.enabled) {
-                match crate::checkin::fetch_activities(&state.http, &account.ak, &account.sk, None)
-                    .await
+                let resolved = match resolve_account(&state.http, &cfg.env_dir, account).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("[checkin] account={} 凭证不可用: {e}", account.id);
+                        continue;
+                    }
+                };
+                match crate::checkin::fetch_activities(
+                    &state.http,
+                    &resolved.ak,
+                    &resolved.sk,
+                    resolved.security_token(),
+                )
+                .await
                 {
                     Ok(activities) => {
                         let daily: Vec<_> = activities.iter().filter(|a| a.is_daily()).collect();
                         if daily.is_empty() || daily.iter().all(|a| a.claimed()) {
                             continue;
                         }
-                        let outcome =
-                            crate::checkin::run(&state.http, &account.ak, &account.sk, None).await;
+                        let outcome = crate::checkin::run(
+                            &state.http,
+                            &resolved.ak,
+                            &resolved.sk,
+                            resolved.security_token(),
+                        )
+                        .await;
                         println!(
                             "[checkin] 自动签到 account={} ok={} {}",
                             account.id, outcome.ok, outcome.message
@@ -731,4 +869,67 @@ pub fn spawn_checkin_scheduler(state: WebState) {
             tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
         }
     });
+}
+
+// ── OAuth 账号 ──────────────────────────────────────────────
+
+/// 保存 OAuth 登录得到的凭证，并把该账号登记到 accounts.json。
+pub async fn save_oauth_identity(
+    state: &WebState,
+    identity: crate::oauth::Identity,
+) -> Result<(), String> {
+    let cfg = state.config();
+
+    // 1) 凭证落盘到 auths/
+    crate::oauth::store::save(&cfg.env_dir, &identity)?;
+
+    // 2) 在 accounts.json 里标记为 oauth 账号（不写 AK/SK）
+    let path = accounts_file_path(&cfg);
+    let mut accounts = read_accounts(&path)?;
+    let id = identity.user_id.clone();
+    if !accounts.iter().any(|a| a.id == id) {
+        accounts.push(AccountRecord {
+            id: id.clone(),
+            ak: String::new(),
+            sk: String::new(),
+            oauth: true,
+            enabled: true,
+        });
+        write_accounts(&path, &accounts)?;
+    }
+
+    // 3) 重载配置并重建账号池
+    state.reload_config()?;
+    let _ = rebuild_pool(state).await;
+
+    println!(
+        "[oauth] 账号已保存: {} ({})",
+        identity.display_name(),
+        id
+    );
+    Ok(())
+}
+
+/// POST /api/oauth/logout —— 移除某个 OAuth 账号。
+pub async fn oauth_logout(
+    State(state): State<WebState>,
+    Path(account): Path<String>,
+) -> Response {
+    let cfg = state.config();
+
+    if let Err(e) = crate::oauth::store::remove(&cfg.env_dir, &account) {
+        return err(StatusCode::NOT_FOUND, e);
+    }
+
+    // 同步从 accounts.json 移除
+    let path = accounts_file_path(&cfg);
+    if let Ok(mut accounts) = read_accounts(&path) {
+        accounts.retain(|a| a.id != account);
+        let _ = write_accounts(&path, &accounts);
+    }
+
+    let _ = state.reload_config();
+    let _ = rebuild_pool(&state).await;
+
+    Json(json!({ "ok": true })).into_response()
 }

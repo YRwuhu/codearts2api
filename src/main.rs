@@ -3,6 +3,7 @@ mod api;
 mod checkin;
 mod config;
 mod models;
+mod oauth;
 mod params;
 mod quota;
 mod signer;

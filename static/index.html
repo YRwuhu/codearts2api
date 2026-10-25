@@ -25,7 +25,7 @@
 <link rel="stylesheet" href="/vendor/components/empty.css">
 <link rel="stylesheet" href="/vendor/components/tag.css">
 <link rel="stylesheet" href="/vendor/components/tooltip.css">
-<link rel="stylesheet" href="/app.css?v=1792914746">
+<link rel="stylesheet" href="/app.css?v=1792916227">
 </head>
 <body>
 <div class="mx-app">
@@ -176,6 +176,24 @@
       <div class="mx-page-head">
         <h1 class="mx-page-title">账号管理</h1>
         <p class="mx-page-sub">增删账号、启用停用、密钥轮换。变更会立即写入accounts.json并重建账号池。</p>
+      </div>
+
+      <div class="mx-card" style="margin-bottom:16px">
+        <div class="mx-card-head">
+          <span class="mx-card-title">登录华为云账号</span>
+          <span class="mx-badge mx-badge-success">推荐</span>
+        </div>
+        <div class="mx-card-body">
+          <p class="helper-block">
+            点击下方按钮，浏览器会打开华为云授权页。用手机号或扫码登录一次即可，
+            <strong>无需填写 AK/SK</strong>；凭证有效期 24 小时，到期前自动续期。
+          </p>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px">
+            <button class="mx-btn mx-btn-primary" id="oauthLoginBtn" data-ripple>登录华为云</button>
+            <button class="mx-btn mx-btn-secondary" id="oauthLinkBtn" hidden data-ripple>打开授权页</button>
+            <span class="mx-helper" id="oauthHint"></span>
+          </div>
+        </div>
       </div>
 
       <div class="mx-card">
@@ -517,6 +535,6 @@
     try { if (window.MxSmoothCorner && MxSmoothCorner.init) MxSmoothCorner.init(); } catch (_) {}
   })();
 </script>
-<script src="/app.js?v=1792914746"></script>
+<script src="/app.js?v=1792916227"></script>
 </body>
 </html>

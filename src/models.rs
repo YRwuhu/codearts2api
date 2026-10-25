@@ -210,7 +210,13 @@ impl Catalog {
         extra: &[(&str, &str)],
     ) -> Result<(u16, String), reqwest::Error> {
         let signer = Signer::new(&self.account.ak, &self.account.sk);
-        let signed = signer.sign(method, url, body, extra);
+        // OAuth 账号用 STS 临时凭证，必须走 sign_full（带 X-Sdk-Content-Sha256
+        // 与 X-Security-Token）；手动 AK/SK 账号保持原有基础签名。
+        let signed = if self.account.is_oauth() {
+            signer.sign_full(method, url, body, extra, self.account.security_token())
+        } else {
+            signer.sign(method, url, body, extra)
+        };
         let mut req = self
             .http
             .request(method.parse().unwrap_or(reqwest::Method::GET), url);
@@ -239,8 +245,15 @@ impl Catalog {
             extra.push(("model-name", model_id));
         }
         let signer = Signer::new(&self.account.ak, &self.account.sk);
-        signer.sign("POST", TARGET, body, &extra).headers
+        if self.account.is_oauth() {
+            signer
+                .sign_full("POST", TARGET, body, &extra, self.account.security_token())
+                .headers
+        } else {
+            signer.sign("POST", TARGET, body, &extra).headers
+        }
     }
+
 
     /// 从 opengw 免费额度网关取模型列表；失败返回空。
     async fn refresh_benefit_models(&self) -> Vec<ModelInfo> {

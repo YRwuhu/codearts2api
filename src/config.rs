@@ -2,12 +2,47 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+/// 账号凭证来源。
+#[derive(Clone, Debug, PartialEq)]
+pub enum CredentialKind {
+    /// 手动填写的永久 AK/SK
+    Manual,
+    /// OAuth 登录获得的 STS 临时凭证
+    OAuth,
+}
+
 #[derive(Clone, Debug)]
 pub struct Account {
     pub id: String,
     pub ak: String,
     pub sk: String,
+    /// STS 安全令牌；OAuth 登录的账号才有，签名时需带 X-Security-Token
+    pub security_token: Option<String>,
+    pub kind: CredentialKind,
     pub enabled: bool,
+}
+
+impl Account {
+    /// 构造手动 AK/SK 账号。
+    pub fn manual(id: String, ak: String, sk: String, enabled: bool) -> Self {
+        Self {
+            id,
+            ak,
+            sk,
+            security_token: None,
+            kind: CredentialKind::Manual,
+            enabled,
+        }
+    }
+
+    pub fn is_oauth(&self) -> bool {
+        self.kind == CredentialKind::OAuth
+    }
+
+    /// 签名用的 security_token
+    pub fn security_token(&self) -> Option<&str> {
+        self.security_token.as_deref()
+    }
 }
 
 impl Account {
@@ -105,6 +140,9 @@ struct AccountEntry {
     ak: String,
     #[serde(default)]
     sk: String,
+    /// OAuth 账号：凭证来自 auths/ 目录，这里只需 id
+    #[serde(default)]
+    oauth: bool,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -137,6 +175,21 @@ fn load_accounts_file(path: &Path) -> Result<Vec<Account>, String> {
     for (idx, entry) in parsed.accounts.into_iter().enumerate() {
         let ak = entry.ak.trim().to_string();
         let sk = entry.sk.trim().to_string();
+        let id = unique_id(&entry.id, &mut used);
+
+        if entry.oauth {
+            // OAuth 账号的凭证从 auths/ 读取，这里只占位
+            accounts.push(Account {
+                id,
+                ak: String::new(),
+                sk: String::new(),
+                security_token: None,
+                kind: CredentialKind::OAuth,
+                enabled: entry.enabled,
+            });
+            continue;
+        }
+
         if ak.is_empty() || sk.is_empty() {
             return Err(format!(
                 "账号文件 {} 中第 {} 个账号缺少 ak 或 sk",
@@ -144,13 +197,7 @@ fn load_accounts_file(path: &Path) -> Result<Vec<Account>, String> {
                 idx + 1
             ));
         }
-        let id = unique_id(&entry.id, &mut used);
-        accounts.push(Account {
-            id,
-            ak,
-            sk,
-            enabled: entry.enabled,
-        });
+        accounts.push(Account::manual(id, ak, sk, entry.enabled));
     }
     Ok(accounts)
 }
@@ -193,12 +240,7 @@ impl Config {
             let ak = std::env::var("CODEARTS_AK").unwrap_or_default().trim().to_string();
             let sk = std::env::var("CODEARTS_SK").unwrap_or_default().trim().to_string();
             if !ak.is_empty() && !sk.is_empty() {
-                accounts.push(Account {
-                    id: "default".to_string(),
-                    ak,
-                    sk,
-                    enabled: true,
-                });
+                accounts.push(Account::manual("default".to_string(), ak, sk, true));
             }
         }
 

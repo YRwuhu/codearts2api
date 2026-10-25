@@ -717,6 +717,85 @@
   }
 
 
+  // ── OAuth 登录 ──────────────────────────────────────────
+  let oauthPollTimer = null;
+
+  async function startOauthLogin() {
+    const hint = $('#oauthHint');
+    const btn = $('#oauthLoginBtn');
+    const linkBtn = $('#oauthLinkBtn');
+
+    if (btn) { btn.disabled = true; btn.textContent = '正在打开…'; }
+    if (hint) hint.textContent = '已打开浏览器授权页，请完成登录…';
+
+    try {
+      const data = await api('/api/oauth/start', { method: 'POST' });
+      if (linkBtn) {
+        linkBtn.hidden = false;
+        linkBtn.onclick = () => window.open(data.auth_url, '_blank', 'noopener');
+      }
+      if (hint) {
+        hint.textContent = data.opened
+          ? '浏览器已打开授权页，请完成登录（本页会自动检测）'
+          : '请点击「打开授权页」完成登录';
+      }
+      pollOauth(data.session_id);
+    } catch (e) {
+      if (hint) hint.textContent = '发起登录失败：' + e.message;
+      toast('error', e.message);
+      if (btn) { btn.disabled = false; btn.textContent = '登录华为云'; }
+    }
+  }
+
+  function pollOauth(sessionId) {
+    if (oauthPollTimer) clearInterval(oauthPollTimer);
+    let tries = 0;
+
+    oauthPollTimer = setInterval(async () => {
+      tries += 1;
+      if (tries > 100) {
+        clearInterval(oauthPollTimer);
+        oauthPollTimer = null;
+        const hint = $('#oauthHint');
+        const btn = $('#oauthLoginBtn');
+        if (hint) hint.textContent = '登录超时，请重新点击登录';
+        if (btn) { btn.disabled = false; btn.textContent = '登录华为云'; }
+        return;
+      }
+
+      try {
+        const res = await api('/api/oauth/poll', {
+          method: 'POST',
+          body: JSON.stringify({ session_id: sessionId }),
+        });
+
+        if (res.status === 'done') {
+          clearInterval(oauthPollTimer);
+          oauthPollTimer = null;
+          const hint = $('#oauthHint');
+          const btn = $('#oauthLoginBtn');
+          const linkBtn = $('#oauthLinkBtn');
+          if (hint) hint.textContent = '登录成功：' + (res.user_name || '');
+          if (btn) { btn.disabled = false; btn.textContent = '登录华为云'; }
+          if (linkBtn) linkBtn.hidden = true;
+          toast('success', '登录成功');
+          await loadStatus(false);
+        } else if (res.status === 'error') {
+          clearInterval(oauthPollTimer);
+          oauthPollTimer = null;
+          const hint = $('#oauthHint');
+          const btn = $('#oauthLoginBtn');
+          if (hint) hint.textContent = '登录失败：' + (res.error || '');
+          if (btn) { btn.disabled = false; btn.textContent = '登录华为云'; }
+          toast('error', res.error || '登录失败');
+        }
+      } catch (_) {
+        // 轮询失败继续重试
+      }
+    }, 2000);
+  }
+
+
   // ── 事件绑定 ────────────────────────────────────────────
   function bindEvents() {
     $$('.mx-nav-item, .mx-btm-item').forEach((el) => {
@@ -727,6 +806,9 @@
 
     const refreshBtn = $('#refreshBtn');
     if (refreshBtn) refreshBtn.addEventListener('click', refreshModels);
+
+    const oauthBtn = $('#oauthLoginBtn');
+    if (oauthBtn) oauthBtn.addEventListener('click', startOauthLogin);
 
     const addBtn = $('#addAccountBtn');
     if (addBtn) addBtn.addEventListener('click', () => openAccountModal(null));

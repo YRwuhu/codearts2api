@@ -93,6 +93,30 @@ backup             HPUA****X9         enabled  5
 | `CODEARTS_BENEFIT_FALLBACK` | `1` 时即使免费网关拿不到模型也列出兜底清单 |
 | `CODEARTS_MODEL_CACHE` | 模型缓存路径，默认与 `.env` 同目录 |
 
+## 登录（推荐，无需 AK/SK）
+
+打开面板「账号」页，点 **登录华为云**：浏览器会打开华为云授权页，
+用手机号或扫码登录一次即可。凭证自动保存到 `auths/`，有效期 24 小时，
+到期前自动续期，**不需要手动填写任何密钥**。
+
+实现方式（逆向自官方 `huaweicloud.authentication` 扩展）：
+
+1. 生成 ticket_id / secret / PKCE 校验码 / DPoP 密钥对（ES256, P-256）
+2. 构造 `codearts.huaweicloud.com/portal/authorize` 授权链接
+3. 登录后双通道取凭据：
+   - 主通道：portal 回调 `127.0.0.1:{port}/oauth/callback` 拿到 code
+   - 兜底：轮询 `snap-manager /v1/login/ticket`
+4. 用 code + PKCE verifier + DPoP 证明换 STS 临时凭证
+5. 凭证落盘 `auths/codearts-{user_id}.json`（0600 权限）
+
+关键约束：
+
+- **refresh_token 与 DPoP 私钥绑定**：续期必须复用登录时的那对密钥，
+  所以私钥要随凭证一起保存，否则续期报 `InvalidDPoPHeader`
+- **client_id 固定为 `codearts-agent`**：换值会被 STS 拒绝
+
+也支持手动 AK/SK（面板「添加账号」），两种账号可以并存。
+
 ## 运行
 
 双击 `start.bat`，或：
@@ -231,6 +255,10 @@ codearts2api.exe benefit claim backup  对指定账号签到（追加账号 id�
 | `POST /api/quota/refresh` | 立即刷新额度 |
 | `GET /api/usage?hours=&bucket=` | 用量汇总与时间序列 |
 | `GET /api/usage/recent?hours=` | 最近请求明细 |
+| `POST /api/oauth/start` | 发起 OAuth 登录，返回授权链接 |
+| `POST /api/oauth/poll` | 轮询登录结果 |
+| `GET /oauth/callback` | OAuth 回调（portal 跳回） |
+| `DELETE /api/oauth/account/{id}` | 移除 OAuth 账号 |
 | `GET /api/checkin/status` | 各账号签到状态与活动列表 |
 
 | `POST /api/checkin/run` | 立即对所有启用账号签到 |

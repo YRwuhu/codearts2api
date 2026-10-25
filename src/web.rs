@@ -142,5 +142,6 @@ pub fn router() -> Router<WebState> {
         .route("/quota", get(static_handler))
         .route("/usage", get(static_handler))
         .route("/checkin", get(static_handler))
+        .route("/oauth/callback", get(crate::oauth::flow::callback))
         .fallback(static_handler)
 }

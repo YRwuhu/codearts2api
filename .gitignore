@@ -14,6 +14,7 @@ __pycache__/
 
 # Runtime/cache
 models-cache.json
+models-cache.*.json
 *.log
 
 # Editor / OS
@@ -23,3 +24,6 @@ Thumbs.db
 desktop.ini
 usage.jsonl
 checkin.json
+
+# OAuth 登录凭证（含 refresh_token 与 DPoP 私钥）
+auths/
