@@ -601,7 +601,30 @@ async fn refresh_all_quota(state: &WebState) -> usize {
     let cfg = state.config();
     let mut success = 0;
     for account in cfg.accounts.iter().filter(|a| a.enabled) {
-        let quota = crate::quota::fetch_quota(&state.http, &account.ak, &account.sk).await;
+        // OAuth 账号的 AK/SK 在 auths/ 里，需要先解析出来
+        let resolved = match resolve_account(&state.http, &cfg.env_dir, account).await {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("[quota] 账号 {} 凭证不可用: {e}", account.id);
+                state.quota.write().await.insert(
+                    account.id.clone(),
+                    crate::quota::Quota {
+                        ok: false,
+                        error: Some(e),
+                        fetched_at: chrono::Utc::now().timestamp(),
+                        ..Default::default()
+                    },
+                );
+                continue;
+            }
+        };
+        let quota = crate::quota::fetch_quota(
+            &state.http,
+            &resolved.ak,
+            &resolved.sk,
+            resolved.security_token(),
+        )
+        .await;
         if quota.ok {
             success += 1;
         }

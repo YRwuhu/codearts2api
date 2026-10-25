@@ -25,7 +25,7 @@
 <link rel="stylesheet" href="/vendor/components/empty.css">
 <link rel="stylesheet" href="/vendor/components/tag.css">
 <link rel="stylesheet" href="/vendor/components/tooltip.css">
-<link rel="stylesheet" href="/app.css?v=1792918099">
+<link rel="stylesheet" href="/app.css?v=1792919805">
 </head>
 <body>
 <div class="mx-app">
@@ -313,23 +313,6 @@
         </div>
       </div>
 
-      <div class="mx-card" style="margin-top:16px">
-        <div class="mx-card-head">
-          <span class="mx-card-title">关于自动签到</span>
-        </div>
-        <div class="mx-card-body">
-          <p class="helper-block">
-            CodeArts 侧没有「每日签到领取额度」的接口：官方额度来自套餐订阅，
-            <code>benefit/claim</code>、<code>welfare</code> 等路径在网关返回 404，
-            免费额度通道需账号在华为云侧开通（当前账号未开通）。
-            因此本面板不提供签到按钮，避免显示一个必然失败的操作。
-          </p>
-          <p class="helper-block">
-            本服务已自动为你做两件事：每 10 分钟刷新一次额度缓存，并将每次请求的
-            token 用量记录到本地 <code>usage.jsonl</code>，在「用量」页可查。
-          </p>
-        </div>
-      </div>
     </section>
 
     <!-- 用量 -->
@@ -539,6 +522,6 @@
     try { if (window.MxSmoothCorner && MxSmoothCorner.init) MxSmoothCorner.init(); } catch (_) {}
   })();
 </script>
-<script src="/app.js?v=1792918099"></script>
+<script src="/app.js?v=1792919805"></script>
 </body>
 </html>

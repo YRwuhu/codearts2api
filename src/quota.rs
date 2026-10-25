@@ -199,14 +199,39 @@ pub async fn fetch_quota(
     http: &reqwest::Client,
     ak: &str,
     sk: &str,
+    security_token: Option<&str>,
 ) -> Quota {
+    if ak.trim().is_empty() || sk.trim().is_empty() {
+        return Quota {
+            ok: false,
+            error: Some("缺少 AK/SK 凭证（OAuth 账号请先登录）".to_string()),
+            fetched_at: chrono::Utc::now().timestamp(),
+            ..Default::default()
+        };
+    }
+
     let signer = Signer::new(ak, sk);
-    let signed = signer.sign(
-        "GET",
-        STATISTICS_URL,
-        b"",
-        &[("x-language", "zh-cn"), ("accept", "application/json")],
-    );
+    // OAuth 账号用 STS 临时凭证，必须走完整签名（带 X-Security-Token）
+    let signed = if security_token.is_some() {
+        signer.sign_full(
+            "GET",
+            STATISTICS_URL,
+            b"",
+            &[
+                ("content-type", "application/json"),
+                ("x-language", "zh-cn"),
+                ("accept", "application/json"),
+            ],
+            security_token,
+        )
+    } else {
+        signer.sign(
+            "GET",
+            STATISTICS_URL,
+            b"",
+            &[("x-language", "zh-cn"), ("accept", "application/json")],
+        )
+    };
 
     let mut req = http.get(STATISTICS_URL);
     for (k, v) in signed.headers {
