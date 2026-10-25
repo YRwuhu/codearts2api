@@ -21,7 +21,6 @@ Rust 重写版，行为与仓库根目录的 Python 版（`server.py`）保持�
 ## 构建
 
 ```cmd
-cd rust
 cargo build --release
 ```
 
@@ -31,23 +30,63 @@ cargo build --release
 
 ## 配置
 
+### 单账号
+
 使用仓库根目录的 `.env`（也可用 `CODEARTS_ENV_FILE` 指定路径）：
 
 ```ini
 CODEARTS_AK=你的AccessKey
 CODEARTS_SK=你的SecretKey
-
-# 可选
-CODEARTS_PROXY_HOST=127.0.0.1
-CODEARTS_PROXY_PORT=8787
-CODEARTS_MAX_TOKENS_CAP=65536
-CODEARTS_BENEFIT_FALLBACK=0
-CODEARTS_MODEL_CACHE=C:\path\to\models-cache.json
 ```
+
+### 多账号
+
+复制 `accounts.example.json` 为 `accounts.json`，填入多个账号：
+
+```json
+{
+  "accounts": [
+    { "id": "main",   "ak": "第一个AccessKey", "sk": "第一个SecretKey", "enabled": true },
+    { "id": "backup", "ak": "第二个AccessKey", "sk": "第二个SecretKey", "enabled": true }
+  ]
+}
+```
+
+`accounts.json` 已加入 `.gitignore`，不会被提交。存在该文件时优先于 `.env` 的单账号配置。
+
+工作方式：
+
+- **模型合并去重**：所有账号的模型汇总到 `/v1/models`，同一模型在多个账号可用时只出现一次
+- **按序故障切换**：请求按 `accounts.json` 中的顺序尝试；遇到以下情况自动换下一个账号
+  - 并发会话数已达上限（`TM.00001041`）
+  - 鉴权失败（`APIG.0301` 等）
+  - 该账号没有此模型（`benefit not found` / `not registered`）
+- **不切换的情况**：客户端参数错误、模型不存在等，直接返回，避免无意义地打满所有账号
+- **独立缓存**：多账号时每个账号的模型缓存分开存放（`models-cache.<id>.json`）
+
+查看账号状态：
+
+```cmd
+codearts2api.exe accounts
+```
+
+```text
+账号                 AK                 状态       模型数
+------------------------------------------------------------
+main               HPUA****L2         enabled  7
+backup             HPUA****X9         enabled  5
+
+合并去重后共 9 个模型:
+  GLM-5.2                      可用账号: main, backup
+  deepseek-v4.1-flash          可用账号: main
+```
+
+### 环境变量
 
 | 变量 | 说明 |
 |---|---|
-| `CODEARTS_AK` / `CODEARTS_SK` | 华为云访问密钥，必填 |
+| `CODEARTS_AK` / `CODEARTS_SK` | 单账号模式的华为云访问密钥 |
+| `CODEARTS_ACCOUNTS` | 账号文件路径，默认 `.env` 同目录的 `accounts.json` |
 | `CODEARTS_PROXY_HOST` | 监听地址，默认 `127.0.0.1`（只本机可访问） |
 | `CODEARTS_PROXY_PORT` | 监听端口，默认 `8787` |
 | `CODEARTS_MAX_TOKENS_CAP` | 模型元数据缺失时 `max_tokens` 的兜底上限，默认 `65536` |
@@ -82,12 +121,14 @@ Model    : deepseek-v4.1-flash / glm-5.3 / kimi-k3 / openpangu-2.0-pro ...
 
 ```cmd
 codearts2api.exe serve                 启动代理（默认）
-codearts2api.exe models                列出当前账号可用模型及通道/上下文/输出上限
+codearts2api.exe accounts              列出账号、AK（打码）、模型数及模型归属
+codearts2api.exe models                列出合并后的可用模型及通道/上下文/输出上限
 codearts2api.exe selftest [MODEL...]   对运行中的代理做端到端自检（非流式 + 流式）
 codearts2api.exe benefit status        查询签到状态
 codearts2api.exe benefit claim         签到领取当日免费额度
 codearts2api.exe benefit balance       查询免费额度余额
 codearts2api.exe benefit models        查询免费模型列表
+codearts2api.exe benefit claim backup  对指定账号签到（追加账号 id）
 ```
 
 `selftest` 可用 `CODEARTS_SELFTEST_BASE` 指向其他地址（默认 `http://127.0.0.1:8787/v1`）。
@@ -133,8 +174,8 @@ codearts2api.exe benefit models        查询免费模型列表
 
 ## 已知限制
 
-- **并发上限取决于账号套餐**，实测套餐为 3。超出时上游返回
-  `TM.00001041 并发会话数已达上限`，代理会以 502 包装该信息。
+- **并发上限取决于账号套餐**，实测单账号套餐为 3。超出时上游返回
+  `TM.00001041 并发会话数已达上限`；多账号模式下会自动切到下一个账号重试。
 - **免费 benefit 通道需账号开通**。未开通时 `benefit-gateway-config` 返回
   `enabled:false`，签到/余额接口报 `invalid channel, group not found`。
   默认不把这类必然失败的模型列进 `/v1/models`。

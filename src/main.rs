@@ -6,8 +6,10 @@ mod signer;
 mod stream;
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use config::Config;
+use config::{Account, Config};
+use models::{Catalog, Pool};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -15,6 +17,7 @@ fn main() -> ExitCode {
 
     match command {
         "serve" | "" => serve(),
+        "accounts" => accounts_cmd(),
         "benefit" => benefit_cmd(&args[2..]),
         "selftest" => selftest_cmd(&args[2..]),
         "models" => models_cmd(),
@@ -36,13 +39,20 @@ fn print_help() {
 
 用法:
   codearts2api serve            启动 HTTP 代理（默认）
-  codearts2api models           列出当前账号可用模型
+  codearts2api accounts         列出已配置账号及其模型数量
+  codearts2api models           列出合并后的可用模型
   codearts2api selftest [MODEL...]  对运行中的代理做端到端自检
-  codearts2api benefit [status|claim|models|balance]
+  codearts2api benefit [status|claim|models|balance] [账号id]
                                 查询/领取免费额度
 
+多账号:
+  在 .env 同目录创建 accounts.json（参考 accounts.example.json）即可启用多账号。
+  请求按文件中的顺序尝试，遇到并发超限/鉴权失败/该账号无此模型时自动切换下一个。
+  未创建 accounts.json 时退回 .env 里的单个 CODEARTS_AK / CODEARTS_SK。
+
 环境变量（也可写在 .env）:
-  CODEARTS_AK / CODEARTS_SK     华为云访问密钥（必填）
+  CODEARTS_AK / CODEARTS_SK     华为云访问密钥（单账号模式）
+  CODEARTS_ACCOUNTS             账号文件路径，默认 .env 同目录 accounts.json
   CODEARTS_PROXY_HOST           监听地址，默认 127.0.0.1
   CODEARTS_PROXY_PORT           监听端口，默认 8787
   CODEARTS_MAX_TOKENS_CAP       max_tokens 兜底上限，默认 65536
@@ -57,6 +67,27 @@ fn build_runtime() -> Result<tokio::runtime::Runtime, String> {
         .enable_all()
         .build()
         .map_err(|e| format!("创建运行时失败: {e}"))
+}
+
+/// 按配置构建每个启用账号的模型目录。
+async fn build_pool(cfg: &Config, http: reqwest::Client) -> Pool {
+    let enabled: Vec<&Account> = cfg.accounts.iter().filter(|a| a.enabled).collect();
+    let mut catalogs = Vec::new();
+    for account in enabled {
+        let cache_path = cfg.cache_path_for(account);
+        let catalog = Catalog::new(
+            account.clone(),
+            &cache_path,
+            cfg.benefit_fallback,
+            http.clone(),
+        );
+        // 启动时同步一次真实模型列表；失败则回退到缓存/兜底
+        if !catalog.refresh().await {
+            catalog.load_cache().await;
+        }
+        catalogs.push(Arc::new(catalog));
+    }
+    Pool::new(catalogs)
 }
 
 fn serve() -> ExitCode {
@@ -88,20 +119,14 @@ fn serve() -> ExitCode {
             }
         };
 
-        let catalog = models::Catalog::new(
-            &cfg.ak,
-            &cfg.sk,
-            &cfg.model_cache_path,
-            cfg.benefit_fallback,
-            http.clone(),
-        );
+        let pool = build_pool(&cfg, http.clone()).await;
+        let merged: Vec<String> = pool
+            .merged_models()
+            .await
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
 
-        // 启动时同步一次真实模型列表；失败则回退到缓存/兜底
-        if !catalog.refresh().await {
-            catalog.load_cache().await;
-        }
-
-        let model_ids: Vec<String> = catalog.models().await.iter().map(|m| m.id.clone()).collect();
         let addr = format!("{}:{}", cfg.host, cfg.port);
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
@@ -112,13 +137,17 @@ fn serve() -> ExitCode {
             }
         };
 
+        let account_count = pool.catalogs().len();
         println!("CodeArts OpenAI 兼容代理已启动: http://{addr}");
         println!("OpenAI Base URL: http://{addr}/v1");
-        println!("可用模型: {model_ids:?}");
+        println!("账号数: {account_count}，合并可用模型 {} 个: {merged:?}", merged.len());
+        if account_count > 1 {
+            println!("多账号已启用：失败时按配置顺序自动切换");
+        }
         println!("按 Ctrl+C 停止");
 
         let state = api::AppState {
-            catalog,
+            pool,
             http,
             max_tokens_cap: cfg.max_tokens_cap,
         };
@@ -127,6 +156,64 @@ fn serve() -> ExitCode {
         if let Err(e) = axum::serve(listener, app).await {
             eprintln!("服务异常退出: {e}");
             return ExitCode::FAILURE;
+        }
+        ExitCode::SUCCESS
+    })
+}
+
+fn accounts_cmd() -> ExitCode {
+    let cfg = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rt = match build_runtime() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    rt.block_on(async move {
+        let http = reqwest::Client::new();
+        let pool = build_pool(&cfg, http).await;
+        let described = pool.describe().await;
+        println!("{:<18} {:<18} {:<8} {}", "账号", "AK", "状态", "模型数");
+        println!("{}", "-".repeat(60));
+        for account in &cfg.accounts {
+            if !account.enabled {
+                println!("{:<18} {:<18} {:<8} -", account.id, account.masked_ak(), "disabled");
+                continue;
+            }
+            let count = described
+                .iter()
+                .find(|(id, _, _)| id == &account.id)
+                .map(|(_, _, n)| *n)
+                .unwrap_or(0);
+            println!(
+                "{:<18} {:<18} {:<8} {}",
+                account.id,
+                account.masked_ak(),
+                "enabled",
+                count
+            );
+        }
+
+        let merged = pool.merged_models().await;
+        println!("\n合并去重后共 {} 个模型:", merged.len());
+        for m in merged {
+            let owners: Vec<String> = {
+                let mut v = Vec::new();
+                for c in pool.catalogs() {
+                    if c.contains(&m.id).await {
+                        v.push(c.account_id().to_string());
+                    }
+                }
+                v
+            };
+            println!("  {:<28} 可用账号: {}", m.id, owners.join(", "));
         }
         ExitCode::SUCCESS
     })
@@ -149,17 +236,8 @@ fn models_cmd() -> ExitCode {
     };
     rt.block_on(async move {
         let http = reqwest::Client::new();
-        let catalog = models::Catalog::new(
-            &cfg.ak,
-            &cfg.sk,
-            &cfg.model_cache_path,
-            cfg.benefit_fallback,
-            http,
-        );
-        if !catalog.refresh().await {
-            catalog.load_cache().await;
-        }
-        for m in catalog.models().await {
+        let pool = build_pool(&cfg, http).await;
+        for m in pool.merged_models().await {
             let ctx = m
                 .context_window
                 .map(|v| format!("{v}"))
@@ -182,6 +260,24 @@ fn benefit_cmd(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // 可选第二个参数指定账号；未指定时用第一个启用账号
+    let target = args
+        .get(1)
+        .map(|s| s.as_str())
+        .filter(|s| !s.is_empty());
+    let account = match target {
+        Some(id) => cfg.accounts.iter().find(|a| a.id == id),
+        None => cfg.accounts.iter().find(|a| a.enabled),
+    };
+    let account = match account {
+        Some(a) => a.clone(),
+        None => {
+            eprintln!("找不到指定账号: {}", target.unwrap_or("(第一个启用账号)"));
+            return ExitCode::FAILURE;
+        }
+    };
+
     let rt = match build_runtime() {
         Ok(r) => r,
         Err(e) => {
@@ -195,22 +291,21 @@ fn benefit_cmd(args: &[String]) -> ExitCode {
         let action = args.first().map(|s| s.as_str()).unwrap_or("default");
 
         let call = |method: &'static str, path: String| {
-            let signer = signer::Signer::new(&cfg.ak, &cfg.sk);
+            let ak = account.ak.clone();
+            let sk = account.sk.clone();
             let http = http.clone();
             async move {
                 let url = format!("{base}{path}");
+                let signer = signer::Signer::new(&ak, &sk);
                 let signed = signer.sign(method, &url, b"", &[("x-language", "zh-cn")]);
-                let mut req = http.request(
-                    method.parse().unwrap_or(reqwest::Method::GET),
-                    &url,
-                );
+                let mut req = http.request(method.parse().unwrap_or(reqwest::Method::GET), &url);
                 for (k, v) in signed.headers {
                     req = req.header(k, v);
                 }
                 let resp = req.send().await.map_err(|e| format!("请求失败: {e}"))?;
                 let text = resp.text().await.unwrap_or_default();
-                let value: serde_json::Value =
-                    serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "raw": text }));
+                let value: serde_json::Value = serde_json::from_str(&text)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": text }));
                 let code = value
                     .get("error_code")
                     .and_then(|v| v.as_str())
@@ -225,10 +320,14 @@ fn benefit_cmd(args: &[String]) -> ExitCode {
                             .unwrap_or("")
                     ));
                 }
-                Ok(value.get("result").cloned().unwrap_or_else(|| serde_json::json!({})))
+                Ok(value
+                    .get("result")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})))
             }
         };
 
+        println!("账号: {}", account.id);
         let result: Result<(), String> = match action {
             "status" => call("GET", "/api/v1/benefit/claim".to_string())
                 .await
@@ -250,10 +349,7 @@ fn benefit_cmd(args: &[String]) -> ExitCode {
                     println!("免费模型列表:");
                     if let Some(models) = r.get("models").and_then(|m| m.as_array()) {
                         for m in models {
-                            let id = m
-                                .get("model_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("?");
+                            let id = m.get("model_id").and_then(|v| v.as_str()).unwrap_or("?");
                             println!("  {id}");
                         }
                     }
@@ -267,8 +363,10 @@ fn benefit_cmd(args: &[String]) -> ExitCode {
                                 println!("签到成功，最近签到时间: {}", fmt_claim_time(&r2));
                                 match call("GET", "/api/v1/user/tokens/balance".to_string()).await {
                                     Ok(b) => {
-                                        let total =
-                                            b.get("total_quota").and_then(|v| v.as_i64()).unwrap_or(0);
+                                        let total = b
+                                            .get("total_quota")
+                                            .and_then(|v| v.as_i64())
+                                            .unwrap_or(0);
                                         let remain = b
                                             .get("total_balance")
                                             .and_then(|v| v.as_i64())
@@ -338,7 +436,6 @@ fn selftest_cmd(args: &[String]) -> ExitCode {
 
         let mut all_ok = true;
         for model in models {
-            // 非流式
             let payload = serde_json::json!({
                 "model": model,
                 "messages": [{"role": "user", "content": "只回复两个字：成功"}],
@@ -356,12 +453,9 @@ fn selftest_cmd(args: &[String]) -> ExitCode {
                     let text = resp.text().await.unwrap_or_default();
                     match serde_json::from_str::<serde_json::Value>(&text) {
                         Ok(v) if v.get("choices").is_some() => {
-                            let content = v["choices"][0]["message"]["content"]
-                                .as_str()
-                                .unwrap_or("");
-                            let finish = v["choices"][0]["finish_reason"]
-                                .as_str()
-                                .unwrap_or("");
+                            let content =
+                                v["choices"][0]["message"]["content"].as_str().unwrap_or("");
+                            let finish = v["choices"][0]["finish_reason"].as_str().unwrap_or("");
                             println!("[非流式] {model}: finish={finish} content={content:?}");
                         }
                         _ => {
@@ -376,7 +470,6 @@ fn selftest_cmd(args: &[String]) -> ExitCode {
                 }
             }
 
-            // 流式
             let payload = serde_json::json!({
                 "model": model,
                 "messages": [{"role": "user", "content": "数到三，用中文"}],
@@ -396,7 +489,9 @@ fn selftest_cmd(args: &[String]) -> ExitCode {
                     let has_error = text.contains("\"error\"");
                     let mut content = String::new();
                     for line in text.lines() {
-                        let Some(p) = line.strip_prefix("data:") else { continue };
+                        let Some(p) = line.strip_prefix("data:") else {
+                            continue;
+                        };
                         let p = p.trim();
                         if p.is_empty() || p == "[DONE]" {
                             continue;

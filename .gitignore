@@ -1,6 +1,7 @@
 .env
 .env.local
 .env.*.local
+accounts.json
 
 # Rust build artifacts
 /target

@@ -3,15 +3,18 @@
 //! 模型分两条上游通道：
 //! - `agent`：老套餐模型，走 AgentCenter；
 //! - `benefit`：免费额度模型，签名时必须多带 maas_type / model-id / model-name。
+//!
+//! 多账号场景下每个账号各持一个 `Catalog`，由 `Pool` 负责合并与故障切换。
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::config::Account;
 use crate::signer::Signer;
 
 pub const BASE_URL: &str = "https://snap-access.cn-north-4.myhuaweicloud.com";
@@ -114,60 +117,57 @@ struct CacheFile {
     models: Vec<ModelInfo>,
 }
 
-#[derive(Clone)]
-pub struct Catalog {
-    inner: Arc<tokio::sync::RwLock<CatalogState>>,
-    signer: Arc<SignerOwned>,
-    cache_path: std::path::PathBuf,
-    benefit_fallback: bool,
-    http: reqwest::Client,
-}
-
-struct SignerOwned {
-    ak: String,
-    sk: String,
-}
-
 struct CatalogState {
     models: BTreeMap<String, ModelInfo>,
     last_refresh: Option<std::time::Instant>,
 }
 
+/// 单个账号的模型目录与签名凭证。
+pub struct Catalog {
+    account: Account,
+    inner: Arc<tokio::sync::RwLock<CatalogState>>,
+    cache_path: PathBuf,
+    benefit_fallback: bool,
+    http: reqwest::Client,
+    /// 连续失败次数，用于 fetch 失败时回退缓存并抑制日志噪声。
+    consecutive_failures: Arc<std::sync::atomic::AtomicU32>,
+}
+
 impl Catalog {
     pub fn new(
-        ak: &str,
-        sk: &str,
+        account: Account,
         cache_path: &Path,
         benefit_fallback: bool,
         http: reqwest::Client,
     ) -> Self {
-        let signer = Arc::new(SignerOwned {
-            ak: ak.to_string(),
-            sk: sk.to_string(),
-        });
         let mut models = BTreeMap::new();
-        if !benefit_fallback {
-            for id in FALLBACK_AGENT_MODELS {
-                models.insert(id.to_string(), ModelInfo::new(id.to_string(), "agent"));
-            }
-        } else {
-            for id in FALLBACK_AGENT_MODELS {
-                models.insert(id.to_string(), ModelInfo::new(id.to_string(), "agent"));
-            }
+        for id in FALLBACK_AGENT_MODELS {
+            models.insert(id.to_string(), ModelInfo::new(id.to_string(), "agent"));
+        }
+        if benefit_fallback {
             for id in BENEFIT_MODELS {
                 models.insert(id.to_string(), ModelInfo::new(id.to_string(), "benefit"));
             }
         }
         Self {
+            account,
             inner: Arc::new(tokio::sync::RwLock::new(CatalogState {
                 models,
                 last_refresh: None,
             })),
-            signer,
             cache_path: cache_path.to_path_buf(),
             benefit_fallback,
             http,
+            consecutive_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
+    }
+
+    pub fn account_id(&self) -> &str {
+        &self.account.id
+    }
+
+    pub fn masked_ak(&self) -> String {
+        self.account.masked_ak()
     }
 
     pub async fn load_cache(&self) {
@@ -187,6 +187,7 @@ impl Catalog {
     async fn save_cache(&self, models: &[ModelInfo]) {
         let payload = json!({
             "updated_at": chrono::Utc::now().timestamp(),
+            "account": self.account.id,
             "models": models,
         });
         let Ok(text) = serde_json::to_string_pretty(&payload) else {
@@ -208,12 +209,11 @@ impl Catalog {
         body: &[u8],
         extra: &[(&str, &str)],
     ) -> Result<(u16, String), reqwest::Error> {
-        let signer = Signer::new(&self.signer.ak, &self.signer.sk);
+        let signer = Signer::new(&self.account.ak, &self.account.sk);
         let signed = signer.sign(method, url, body, extra);
-        let mut req = self.http.request(
-            method.parse().unwrap_or(reqwest::Method::GET),
-            url,
-        );
+        let mut req = self
+            .http
+            .request(method.parse().unwrap_or(reqwest::Method::GET), url);
         for (k, v) in signed.headers {
             req = req.header(k, v);
         }
@@ -238,7 +238,7 @@ impl Catalog {
             extra.push(("model-id", model_id));
             extra.push(("model-name", model_id));
         }
-        let signer = Signer::new(&self.signer.ak, &self.signer.sk);
+        let signer = Signer::new(&self.account.ak, &self.account.sk);
         signer.sign("POST", TARGET, body, &extra).headers
     }
 
@@ -280,11 +280,15 @@ impl Catalog {
                 out
             }
             Ok((status, text)) => {
-                eprintln!("免费模型列表同步失败（HTTP {status}）: {}", &text[..text.len().min(200)]);
+                eprintln!(
+                    "[{}] 免费模型列表同步失败（HTTP {status}）: {}",
+                    self.account.id,
+                    &text[..text.len().min(200)]
+                );
                 Vec::new()
             }
             Err(e) => {
-                eprintln!("免费模型列表同步失败: {e}");
+                eprintln!("[{}] 免费模型列表同步失败: {e}", self.account.id);
                 Vec::new()
             }
         }
@@ -300,16 +304,16 @@ impl Catalog {
         let (status, text) = match self.signed_send("GET", AGENT_LIST_URL, b"", &extra).await {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("自动同步模型失败，将使用缓存或兜底列表: {e}");
+                eprintln!("[{}] 自动同步模型失败: {e}", self.account.id);
                 return false;
             }
         };
         if status != 200 {
-            eprintln!("自动同步模型失败（HTTP {status}）");
+            eprintln!("[{}] 自动同步模型失败（HTTP {status}）", self.account.id);
             return false;
         }
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
-            eprintln!("自动同步模型失败：响应不是合法 JSON");
+            eprintln!("[{}] 自动同步模型失败：响应不是合法 JSON", self.account.id);
             return false;
         };
         let Some(agents) = value.get("agents").and_then(|v| v.as_array()) else {
@@ -338,10 +342,7 @@ impl Catalog {
                 "{BASE_URL}{AGENT_DETAIL_PATH}?agent_id={}",
                 crate::signer::encode_component(agent_id)
             );
-            let (dstatus, dtext) = match self
-                .signed_send("GET", &detail_url, b"", &extra)
-                .await
-            {
+            let (dstatus, dtext) = match self.signed_send("GET", &detail_url, b"", &extra).await {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -422,7 +423,7 @@ impl Catalog {
             state.last_refresh = Some(std::time::Instant::now());
         }
         self.save_cache(&discovered).await;
-        println!("已自动同步模型: {}", ids.join(", "));
+        println!("[{}] 已同步 {} 个模型: {}", self.account.id, ids.len(), ids.join(", "));
         true
     }
 
@@ -476,6 +477,10 @@ impl Catalog {
         self.inner.read().await.models.contains_key(id)
     }
 
+    pub async fn model(&self, id: &str) -> Option<ModelInfo> {
+        self.inner.read().await.models.get(id).cloned()
+    }
+
     pub async fn is_agent_channel(&self, id: &str) -> bool {
         self.inner
             .read()
@@ -486,16 +491,118 @@ impl Catalog {
             .unwrap_or(false)
     }
 
-    pub async fn max_tokens_of(&self, id: &str) -> Option<i64> {
-        self.inner
-            .read()
-            .await
-            .models
-            .get(id)
-            .and_then(|m| m.max_tokens)
+    pub fn note_failure(&self) {
+        self.consecutive_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn note_success(&self) {
+        self.consecutive_failures
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 多账号池：合并模型列表并按顺序提供故障切换。
+#[derive(Clone)]
+pub struct Pool {
+    catalogs: Vec<Arc<Catalog>>,
+}
+
+impl Pool {
+    pub fn new(catalogs: Vec<Arc<Catalog>>) -> Self {
+        Self { catalogs }
+    }
+
+    pub fn catalogs(&self) -> &[Arc<Catalog>] {
+        &self.catalogs
+    }
+
+    pub async fn ensure_fresh(&self) {
+        for catalog in &self.catalogs {
+            catalog.ensure_fresh(false).await;
+        }
+    }
+
+    /// 合并所有账号的模型，同 id 取第一个账号的元数据（信息更完整者优先）。
+    pub async fn merged_models(&self) -> Vec<ModelInfo> {
+        let mut merged: BTreeMap<String, ModelInfo> = BTreeMap::new();
+        for catalog in &self.catalogs {
+            for model in catalog.models().await {
+                match merged.get(&model.id) {
+                    Some(existing) => {
+                        let mut better = existing.clone();
+                        if better.context_window.is_none() {
+                            better.context_window = model.context_window;
+                        }
+                        if better.max_tokens.is_none() {
+                            better.max_tokens = model.max_tokens;
+                        }
+                        if better.description.as_deref().unwrap_or("").is_empty() {
+                            better.description = model.description.clone();
+                        }
+                        better.supports_images |= model.supports_images;
+                        merged.insert(better.id.clone(), better);
+                    }
+                    None => {
+                        merged.insert(model.id.clone(), model);
+                    }
+                }
+            }
+        }
+        merged.into_values().collect()
+    }
+
+    /// 该模型在哪些账号上可用（保持配置顺序，用于故障切换）。
+    pub async fn accounts_for(&self, model_id: &str) -> Vec<Arc<Catalog>> {
+        let mut out = Vec::new();
+        for catalog in &self.catalogs {
+            if catalog.contains(model_id).await {
+                out.push(catalog.clone());
+            }
+        }
+        out
+    }
+
+    pub async fn contains(&self, model_id: &str) -> bool {
+        for catalog in &self.catalogs {
+            if catalog.contains(model_id).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 模型的输出上限：取第一个可用账号的元数据，缺失则由调用方兜底。
+    pub async fn max_tokens_of(&self, model_id: &str) -> Option<i64> {
+        for catalog in &self.catalogs {
+            if let Some(info) = catalog.model(model_id).await {
+                if let Some(v) = info.max_tokens {
+                    return Some(v);
+                }
+            }
+        }
+        None
     }
 
     pub async fn first_model(&self) -> Option<String> {
-        self.inner.read().await.models.keys().next().cloned()
+        for catalog in &self.catalogs {
+            if let Some(id) = catalog.models().await.first().map(|m| m.id.clone()) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// 汇总每个账号的模型数量，供 accounts 子命令展示。
+    pub async fn describe(&self) -> Vec<(String, String, usize)> {
+        let mut out = Vec::new();
+        for catalog in &self.catalogs {
+            out.push((
+                catalog.account_id().to_string(),
+                catalog.masked_ak(),
+                catalog.models().await.len(),
+            ));
+        }
+        out
     }
 }

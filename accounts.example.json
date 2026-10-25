@@ -1,0 +1,17 @@
+{
+  "_comment": "复制为 accounts.json 并填入真实密钥。该文件已被 .gitignore 排除，请勿提交。",
+  "accounts": [
+    {
+      "id": "main",
+      "ak": "你的AccessKey",
+      "sk": "你的SecretKey",
+      "enabled": true
+    },
+    {
+      "id": "backup",
+      "ak": "第二个账号的AccessKey",
+      "sk": "第二个账号的SecretKey",
+      "enabled": true
+    }
+  ]
+}
