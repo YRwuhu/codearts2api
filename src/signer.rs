@@ -88,6 +88,111 @@ impl<'a> Signer<'a> {
         Self { ak, sk }
     }
 
+    /// 完整 SDK 签名（对齐 @huaweicloud/huaweicloud-sdk-core AKSKSigner）。
+    ///
+    /// 与 `sign` 的区别，也是 AK/SK 调用 ops 类接口成功的关键：
+    ///   - 额外携带 `X-Sdk-Content-Sha256` 头，并用它作为 payload hash；
+    ///   - 该头同样参与签名（参与签名的头集合必须与实际发送的一致）。
+    ///
+    /// 缺少这个头时，华为云网关会返回
+    /// `APIG.0301 verify ak sk signature fail`。
+    pub fn sign_full(
+        &self,
+        method: &str,
+        url: &str,
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+        security_token: Option<&str>,
+    ) -> SignedRequest {
+        let (canonical_uri, canonical_query, host) = split_url(url);
+
+        let mut headers: Vec<(String, String)> = Vec::new();
+        for (k, v) in extra_headers {
+            headers.push((k.to_ascii_lowercase(), v.trim().to_string()));
+        }
+        let has = |name: &str, list: &[(String, String)]| list.iter().any(|(k, _)| k == name);
+
+        if !has("host", &headers) {
+            headers.push(("host".to_string(), host));
+        }
+        if !has("content-type", &headers) {
+            headers.push(("content-type".to_string(), "application/json".to_string()));
+        }
+        if let Some(tok) = security_token {
+            if !tok.is_empty() && !has("x-security-token", &headers) {
+                headers.push(("x-security-token".to_string(), tok.to_string()));
+            }
+        }
+
+        let payload_hash = sha256_hex(body);
+        headers.retain(|(k, _)| !matches!(k.as_str(), "x-sdk-date" | "x-sdk-content-sha256"));
+        headers.push(("x-sdk-content-sha256".to_string(), payload_hash.clone()));
+
+        let date = sdk_date();
+        headers.push(("x-sdk-date".to_string(), date.clone()));
+        headers.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let canonical_headers: String = headers
+            .iter()
+            .map(|(k, v)| format!("{k}:{}
+", v.trim()))
+            .collect();
+        let signed_headers = headers
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>()
+            .join(";");
+
+        let canonical_request = format!(
+            "{}
+{}
+{}
+{}
+{}
+{}",
+            method.to_ascii_uppercase(),
+            canonical_uri,
+            canonical_query,
+            canonical_headers,
+            signed_headers,
+            payload_hash
+        );
+        let string_to_sign = format!(
+            "SDK-HMAC-SHA256
+{}
+{}",
+            date,
+            sha256_hex(canonical_request.as_bytes())
+        );
+        let signature = hmac_hex(self.sk.as_bytes(), &string_to_sign);
+
+        let authorization = format!(
+            "SDK-HMAC-SHA256 Access={}, SignedHeaders={}, Signature={}",
+            self.ak, signed_headers, signature
+        );
+
+        // 实际发送时保留友好的头名大小写
+        let mut out: Vec<(String, String)> = headers
+            .into_iter()
+            .filter(|(k, _)| k != "host")
+            .map(|(k, v)| {
+                let name = match k.as_str() {
+                    "x-sdk-date" => "X-Sdk-Date".to_string(),
+                    "x-sdk-content-sha256" => "X-Sdk-Content-Sha256".to_string(),
+                    "x-security-token" => "X-Security-Token".to_string(),
+                    "content-type" => "Content-Type".to_string(),
+                    "agent-type" => "Agent-Type".to_string(),
+                    "x-language" => "X-Language".to_string(),
+                    _ => k.clone(),
+                };
+                (name, v)
+            })
+            .collect();
+        out.push(("Authorization".to_string(), authorization));
+
+        SignedRequest { headers: out }
+    }
+
     /// 对任意请求签名。`extra_headers` 的值必须与真正发送时完全一致。
     pub fn sign(
         &self,

@@ -50,7 +50,6 @@ pub fn router() -> axum::Router<WebState> {
         .route("/api/refresh", post(refresh_models))
         .route("/api/test", post(test_model))
         .route("/api/checkin/status", get(checkin_status))
-        .route("/api/checkin/login", post(start_login))
         .route("/api/checkin/run", post(run_checkin))
         .route("/api/checkin/last", get(last_checkin))
         .route("/api/quota", get(quota))
@@ -598,77 +597,101 @@ pub async fn usage_recent(
     .into_response()
 }
 
-// ── 每日签到（浏览器自动化） ────────────────────────────────
+// ── 每日签到（AK/SK） ──────────────────────────────────────
 
-/// GET /api/checkin/status —— 环境就绪情况 + 登录态 + 活动列表。
+#[derive(Serialize)]
+struct AccountCheckin {
+    account: String,
+    ok: bool,
+    message: String,
+    claimed_today: bool,
+    benefit_amount: f64,
+    activities: Vec<crate::checkin::Activity>,
+}
+
+/// GET /api/checkin/status —— 各账号签到状态。
 pub async fn checkin_status(State(state): State<WebState>) -> Response {
     let cfg = state.config();
-    let ready = crate::checkin::check_ready(&cfg.env_dir);
+    let mut accounts = Vec::new();
+    let mut any_claimed = false;
+    let mut all_ok = true;
 
-    if !ready.ok {
-        return Json(json!({
-            "ready": false,
-            "logged_in": false,
-            "message": ready.detail,
-            "node": ready.node,
-            "playwright": ready.playwright,
-            "script": ready.script,
-            "profile": ready.profile,
-        }))
-        .into_response();
+    for account in cfg.accounts.iter().filter(|a| a.enabled) {
+        match crate::checkin::fetch_activities(&state.http, &account.ak, &account.sk, None).await {
+            Ok(activities) => {
+                let daily = activities.iter().find(|a| a.is_daily());
+                let claimed = daily.map(|a| a.claimed()).unwrap_or(false);
+                if claimed {
+                    any_claimed = true;
+                }
+                accounts.push(AccountCheckin {
+                    account: account.id.clone(),
+                    ok: true,
+                    message: if claimed { "今日已签到" } else { "今日未签到" }.to_string(),
+                    claimed_today: claimed,
+                    benefit_amount: daily.map(|a| a.benefit_amount).unwrap_or(0.0),
+                    activities,
+                });
+            }
+            Err(e) => {
+                all_ok = false;
+                accounts.push(AccountCheckin {
+                    account: account.id.clone(),
+                    ok: false,
+                    message: e,
+                    claimed_today: false,
+                    benefit_amount: 0.0,
+                    activities: Vec::new(),
+                });
+            }
+        }
     }
 
-    let outcome = crate::checkin::fetch_status(&cfg.env_dir).await;
     Json(json!({
-        "ready": true,
-        "logged_in": !outcome.needs_login && outcome.ok,
-        "needs_login": outcome.needs_login,
-        "claimed_today": outcome.claimed_today,
-        "activities": outcome.activities,
-        "message": outcome.message,
-        "profile_exists": ready.profile,
+        "ok": all_ok,
+        "claimed_today": any_claimed,
+        "accounts": accounts,
+        "account_count": cfg.accounts.iter().filter(|a| a.enabled).count(),
     }))
     .into_response()
 }
 
-/// POST /api/checkin/login —— 打开有界面的浏览器供用户登录一次。
-pub async fn start_login(State(state): State<WebState>) -> Response {
-    let cfg = state.config();
-    let ready = crate::checkin::check_ready(&cfg.env_dir);
-    if !ready.ok {
-        return err(StatusCode::BAD_REQUEST, ready.detail);
-    }
-    match crate::checkin::start_login(&cfg.env_dir).await {
-        Ok(()) => Json(json!({
-            "ok": true,
-            "message": "登录窗口已打开，请在浏览器里完成华为云登录。登录成功后关闭窗口即可。",
-        }))
-        .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
-    }
-}
-
-/// POST /api/checkin/run —— 立即签到。
+/// POST /api/checkin/run —— 对所有启用账号执行签到。
 pub async fn run_checkin(State(state): State<WebState>) -> Response {
     let cfg = state.config();
-    let ready = crate::checkin::check_ready(&cfg.env_dir);
-    if !ready.ok {
-        return err(StatusCode::BAD_REQUEST, ready.detail);
+    let mut accounts = Vec::new();
+    let mut all_ok = true;
+    let mut any_claimed = false;
+
+    for account in cfg.accounts.iter().filter(|a| a.enabled) {
+        let outcome =
+            crate::checkin::run(&state.http, &account.ak, &account.sk, None).await;
+        println!(
+            "[checkin] account={} ok={} claimed={} {}",
+            account.id, outcome.ok, outcome.claimed_today, outcome.message
+        );
+        if outcome.ok {
+            any_claimed = any_claimed || outcome.claimed_today;
+        } else {
+            all_ok = false;
+        }
+        accounts.push(AccountCheckin {
+            account: account.id.clone(),
+            ok: outcome.ok,
+            message: outcome.message.clone(),
+            claimed_today: outcome.claimed_today,
+            benefit_amount: outcome.benefit_amount,
+            activities: outcome.activities.clone(),
+        });
+        *state.last_checkin.write().await = Some(outcome);
     }
 
-    let outcome = crate::checkin::run_checkin(&cfg.env_dir).await;
-    println!(
-        "[checkin] ok={} needs_login={} {}",
-        outcome.ok, outcome.needs_login, outcome.message
-    );
-    *state.last_checkin.write().await = Some(outcome.clone());
-
-    let status = if outcome.ok || outcome.needs_login {
-        StatusCode::OK
-    } else {
-        StatusCode::BAD_REQUEST
-    };
-    (status, Json(json!(outcome))).into_response()
+    Json(json!({
+        "ok": all_ok,
+        "claimed_today": any_claimed,
+        "accounts": accounts,
+    }))
+    .into_response()
 }
 
 /// GET /api/checkin/last —— 最近一次结果。
@@ -677,24 +700,32 @@ pub async fn last_checkin(State(state): State<WebState>) -> Response {
     Json(json!({ "last": last })).into_response()
 }
 
-/// 后台每日签到：启动后 15 秒检查，之后每 30 分钟一轮。
+/// 后台每日签到：启动后 15 秒检查一次，之后每 30 分钟一轮。
 pub fn spawn_checkin_scheduler(state: WebState) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         loop {
             let cfg = state.config();
-            let ready = crate::checkin::check_ready(&cfg.env_dir);
-            if ready.ok {
-                let status = crate::checkin::fetch_status(&cfg.env_dir).await;
-                if status.ok && !status.needs_login && !status.claimed_today {
-                    let outcome = crate::checkin::run_checkin(&cfg.env_dir).await;
-                    println!(
-                        "[checkin] 自动签到 ok={} {}",
-                        outcome.ok, outcome.message
-                    );
-                    *state.last_checkin.write().await = Some(outcome);
-                } else if status.needs_login {
-                    eprintln!("[checkin] 登录已过期，跳过自动签到");
+            for account in cfg.accounts.iter().filter(|a| a.enabled) {
+                match crate::checkin::fetch_activities(&state.http, &account.ak, &account.sk, None)
+                    .await
+                {
+                    Ok(activities) => {
+                        let daily: Vec<_> = activities.iter().filter(|a| a.is_daily()).collect();
+                        if daily.is_empty() || daily.iter().all(|a| a.claimed()) {
+                            continue;
+                        }
+                        let outcome =
+                            crate::checkin::run(&state.http, &account.ak, &account.sk, None).await;
+                        println!(
+                            "[checkin] 自动签到 account={} ok={} {}",
+                            account.id, outcome.ok, outcome.message
+                        );
+                        *state.last_checkin.write().await = Some(outcome);
+                    }
+                    Err(e) => {
+                        eprintln!("[checkin] account={} 状态检查失败: {e}", account.id);
+                    }
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(1800)).await;

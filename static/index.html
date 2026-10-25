@@ -25,7 +25,7 @@
 <link rel="stylesheet" href="/vendor/components/empty.css">
 <link rel="stylesheet" href="/vendor/components/tag.css">
 <link rel="stylesheet" href="/vendor/components/tooltip.css">
-<link rel="stylesheet" href="/app.css?v=1792912715">
+<link rel="stylesheet" href="/app.css?v=1792914746">
 </head>
 <body>
 <div class="mx-app">
@@ -382,7 +382,7 @@
     <section class="route" id="route-checkin" hidden>
       <div class="mx-page-head">
         <h1 class="mx-page-title">每日签到</h1>
-        <p class="mx-page-sub">登录一次后全自动领取「活动福利」积分</p>
+        <p class="mx-page-sub">自动领取「活动福利」的每日积分，使用账号 AK/SK 鉴权</p>
       </div>
 
       <div class="mx-card">
@@ -394,36 +394,27 @@
           </div>
         </div>
         <div class="mx-card-body">
-          <div id="checkinMessage" class="helper-block">正在检查环境…</div>
-          <div id="checkinActions" style="display:none;gap:8px;flex-wrap:wrap;margin-top:12px">
-            <button class="mx-btn mx-btn-primary" id="openLoginBtn" data-ripple>打开登录窗口</button>
-            <span class="mx-helper" id="loginHint"></span>
-          </div>
-          <div class="mx-table-wrap" id="checkinTableWrap" hidden style="margin-top:12px">
-            <table class="mx-table">
-              <thead><tr><th>活动</th><th>类型</th><th>奖励</th><th>状态</th></tr></thead>
-              <tbody id="checkinRows"></tbody>
-            </table>
-          </div>
+          <div id="checkinMessage" class="helper-block">正在查询…</div>
+          <div id="checkinAccounts"></div>
         </div>
       </div>
 
       <div class="mx-card" style="margin-top:16px">
-        <div class="mx-card-head"><span class="mx-card-title">工作原理</span></div>
+        <div class="mx-card-head"><span class="mx-card-title">说明</span></div>
         <div class="mx-card-body">
           <p class="helper-block">
-            CodeArts 签到接口会拦截非浏览器请求（返回 200 但响应体为空），
-            因此后端无法用 AK/SK 直接调用。本功能驱动真实浏览器完成签到。
+            签到接口走 <code>snap-access</code> 网关的 <code>/v1/ops/*</code>，
+            使用与聊天相同的 AK/SK 签名鉴权，无需浏览器或额外登录。
           </p>
           <ol class="steps">
-            <li><strong>首次使用</strong>：点「打开登录窗口」，在弹出的浏览器里完成华为云登录（扫码或密码都行）</li>
-            <li>登录态保存在 <code>tools/profile/</code>，之后无需再登录</li>
-            <li>服务每 30 分钟检查一次，当天未签到会自动领取</li>
-            <li>会话过期后，重新点一次「打开登录窗口」即可</li>
+            <li>服务启动 15 秒后检查一次，之后每 30 分钟一轮</li>
+            <li>当天尚未签到时自动领取（claim + confirm），已签到则跳过</li>
+            <li>领取失败会记录原因，不会重复请求</li>
           </ol>
           <p class="helper-block" style="margin-top:10px">
-            <strong>为什么不能用 AK/SK：</strong>签到接口的鉴权依赖浏览器会话 Cookie，
-            与聊天代理使用的 AK/SK 是两套体系。聊天代理仍走 AK/SK，互不影响。
+            <strong>签名要点：</strong>该接口要求携带 <code>X-Sdk-Content-Sha256</code>
+            头并参与签名；缺少时华为云返回 <code>APIG.0301</code> 签名校验失败。
+            channel 必须用 <code>IDE</code>（<code>WEB</code> 走浏览器会话，不认 AK/SK）。
           </p>
         </div>
       </div>
@@ -526,6 +517,6 @@
     try { if (window.MxSmoothCorner && MxSmoothCorner.init) MxSmoothCorner.init(); } catch (_) {}
   })();
 </script>
-<script src="/app.js?v=1792912715"></script>
+<script src="/app.js?v=1792914746"></script>
 </body>
 </html>

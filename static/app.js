@@ -601,7 +601,7 @@
     if (retained) retained.textContent = '保留 ' + (recent.retained || 0) + ' 条';
   }
 
-  // ── 签到（浏览器自动化） ────────────────────────────────
+  // ── 签到（AK/SK） ───────────────────────────────────────
   const KIND_LABEL = {
     USER_LOGIN: '每日签到',
     DAILY_CLAIM: '每日签到',
@@ -612,128 +612,107 @@
 
   async function loadCheckin() {
     const msg = $('#checkinMessage');
-    if (msg) msg.textContent = '正在检查环境与登录状态…';
+    if (msg) msg.textContent = '正在查询各账号签到状态…';
     try {
       const data = await api('/api/checkin/status');
       renderCheckin(data);
     } catch (e) {
-      if (msg) msg.textContent = '读取失败：' + e.message;
+      if (msg) msg.textContent = '查询失败：' + e.message;
     }
   }
 
   function statusBadge(status) {
     if (status === 'CONFIRMED') return ['已到账', 'mx-badge mx-badge-success'];
     if (status === 'CLAIMED') return ['已领取', 'mx-badge mx-badge-success'];
-    if (status === 'CONSUME') return ['已使用', 'mx-badge'];
+    if (status === 'CONSUME' || status === 'CONSUMED') return ['已使用', 'mx-badge'];
     return ['待领取', 'mx-badge mx-badge-warning'];
   }
 
   function renderCheckin(data) {
     const badge = $('#checkinBadge');
     const msg = $('#checkinMessage');
-    const actions = $('#checkinActions');
-    const wrap = $('#checkinTableWrap');
-    const rows = $('#checkinRows');
+    const box = $('#checkinAccounts');
     const runBtn = $('#runCheckinBtn');
 
-    if (!data.ready) {
-      if (badge) { badge.textContent = '环境未就绪'; badge.className = 'mx-badge mx-badge-error'; }
-      if (msg) msg.textContent = data.message || '缺少运行依赖';
-      if (actions) actions.style.display = 'none';
-      if (wrap) wrap.hidden = true;
-      if (runBtn) runBtn.disabled = true;
-      return;
-    }
-
-    if (!data.logged_in) {
-      if (badge) { badge.textContent = '未登录'; badge.className = 'mx-badge mx-badge-warning'; }
-      if (msg) msg.textContent = data.message || '请先完成一次登录';
-      if (actions) actions.style.display = 'flex';
-      if (wrap) wrap.hidden = true;
-      if (runBtn) runBtn.disabled = true;
-      return;
-    }
-
-    if (actions) actions.style.display = 'none';
-    if (runBtn) runBtn.disabled = false;
-
+    const accounts = data.accounts || [];
+    const okAccounts = accounts.filter((a) => a.ok);
     const claimed = !!data.claimed_today;
+
     if (badge) {
-      badge.textContent = claimed ? '今日已签到' : '可签到';
-      badge.className = 'mx-badge ' + (claimed ? 'mx-badge-success' : 'mx-badge-warning');
+      if (!accounts.length) {
+        badge.textContent = '无账号';
+        badge.className = 'mx-badge mx-badge-error';
+      } else if (!okAccounts.length) {
+        badge.textContent = '查询失败';
+        badge.className = 'mx-badge mx-badge-error';
+      } else {
+        badge.textContent = claimed ? '今日已签到' : '可签到';
+        badge.className = 'mx-badge ' + (claimed ? 'mx-badge-success' : 'mx-badge-warning');
+      }
     }
+    if (runBtn) runBtn.disabled = accounts.length === 0;
     if (msg) {
-      msg.textContent = claimed
-        ? '今天已经签到过了，明天会自动领取。'
-        : '今天还未签到，点「立即签到」或等待自动执行。';
+      msg.textContent = !accounts.length
+        ? '还没有配置账号，请先到「账号」页添加。'
+        : (claimed ? '今天已经签到过了，明天会自动领取。' : '今天还未签到，点「立即签到」或等待自动执行。');
     }
 
-    const list = data.activities || [];
-    if (wrap) wrap.hidden = list.length === 0;
-    if (rows) {
-      rows.innerHTML = list.length
-        ? list.map((a) => {
-            const pair = statusBadge(a.status);
-            const kind = KIND_LABEL[a.type] || a.type;
-            const amount = a.benefitAmount ? (a.benefitAmount + ' 积分') : '—';
-            return '<tr>' +
-              '<td data-label="活动">' + escapeHtml(a.title || '') + '</td>' +
-              '<td data-label="类型">' + escapeHtml(kind) + '</td>' +
-              '<td data-label="奖励">' + escapeHtml(amount) + '</td>' +
-              '<td data-label="状态"><span class="' + pair[1] + '">' + pair[0] + '</span></td>' +
-              '</tr>';
-          }).join('')
-        : '<tr><td colspan="4" class="empty-cell">没有活动数据</td></tr>';
-    }
+    if (!box) return;
+    if (!accounts.length) { box.innerHTML = ''; return; }
+
+    box.innerHTML = accounts.map((acc) => {
+      if (!acc.ok) {
+        return '<div class="quota-account">' +
+          '<div class="quota-head"><span class="quota-name">' + escapeHtml(acc.account) + '</span>' +
+          '<span class="mx-badge mx-badge-error">查询失败</span></div>' +
+          '<p class="helper-block" style="margin-top:8px">' + escapeHtml(acc.message || '') + '</p>' +
+          '</div>';
+      }
+      const rows = (acc.activities || []).map((a) => {
+        const pair = statusBadge(a.status);
+        const kind = KIND_LABEL[a.type] || a.type;
+        const amount = a.benefitAmount ? (a.benefitAmount + ' 积分') : '—';
+        return '<tr>' +
+          '<td data-label="活动">' + escapeHtml(a.title || '') + '</td>' +
+          '<td data-label="类型">' + escapeHtml(kind) + '</td>' +
+          '<td data-label="奖励">' + escapeHtml(amount) + '</td>' +
+          '<td data-label="状态"><span class="' + pair[1] + '">' + pair[0] + '</span></td>' +
+          '</tr>';
+      }).join('');
+
+      return '<div class="quota-account">' +
+        '<div class="quota-head">' +
+        '<span class="quota-name">' + escapeHtml(acc.account) + '</span>' +
+        '<span class="quota-nums">' +
+        (acc.claimed_today ? '今日已签到' : '今日未签到') +
+        (acc.benefit_amount ? ' · 每日 ' + acc.benefit_amount + ' 积分' : '') +
+        '</span>' +
+        '</div>' +
+        '<div class="mx-table-wrap" style="margin-top:10px">' +
+        '<table class="mx-table"><thead><tr>' +
+        '<th>活动</th><th>类型</th><th>奖励</th><th>状态</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table>' +
+        '</div></div>';
+    }).join('');
   }
 
   async function runCheckin() {
     const btn = $('#runCheckinBtn');
     const msg = $('#checkinMessage');
-    if (btn) { btn.disabled = true; btn.textContent = '执行中…'; }
-    if (msg) msg.textContent = '正在启动浏览器执行签到，请稍候（最长约 1 分钟）…';
+    if (btn) { btn.disabled = true; btn.textContent = '签到中…'; }
+    if (msg) msg.textContent = '正在提交签到…';
     try {
       const data = await api('/api/checkin/run', { method: 'POST' });
-      toast(data.ok ? 'success' : 'error', data.message || (data.ok ? '签到成功' : '签到失败'));
-      if (msg) msg.textContent = data.message || '';
+      const accounts = data.accounts || [];
+      const first = accounts[0];
+      toast(data.ok ? 'success' : 'error', (first && first.message) || (data.ok ? '签到完成' : '签到失败'));
+      if (msg && first) msg.textContent = first.message;
       await loadCheckin();
     } catch (e) {
       toast('error', e.message);
       if (msg) msg.textContent = '签到失败：' + e.message;
     } finally {
       if (btn) { btn.disabled = false; btn.textContent = '立即签到'; }
-    }
-  }
-
-  async function openLoginWindow() {
-    const hint = $('#loginHint');
-    const btn = $('#openLoginBtn');
-    if (btn) btn.disabled = true;
-    if (hint) hint.textContent = '正在打开浏览器…';
-    try {
-      const data = await api('/api/checkin/login', { method: 'POST' });
-      if (hint) hint.textContent = data.message || '登录窗口已打开，请在弹出的浏览器里完成登录';
-      toast('success', '登录窗口已打开');
-      // 轮询检查登录是否完成
-      let tries = 0;
-      const timer = setInterval(async () => {
-        tries += 1;
-        if (tries > 40) { clearInterval(timer); if (btn) btn.disabled = false; return; }
-        try {
-          const st = await api('/api/checkin/status');
-          if (st.logged_in) {
-            clearInterval(timer);
-            if (btn) btn.disabled = false;
-            if (hint) hint.textContent = '登录成功';
-            toast('success', '登录成功');
-            renderCheckin(st);
-          }
-        } catch (_) {}
-      }, 3000);
-    } catch (e) {
-      if (hint) hint.textContent = '打开失败：' + e.message;
-      if (btn) btn.disabled = false;
-      toast('error', e.message);
     }
   }
 
@@ -778,9 +757,6 @@
 
     const runCkBtn = $('#runCheckinBtn');
     if (runCkBtn) runCkBtn.addEventListener('click', runCheckin);
-
-    const openLogin = $('#openLoginBtn');
-    if (openLogin) openLogin.addEventListener('click', openLoginWindow);
 
     const quotaBtn = $('#refreshQuotaBtn');
     if (quotaBtn) quotaBtn.addEventListener('click', () => loadQuota(true));

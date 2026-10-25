@@ -160,30 +160,33 @@ OpenAI Base URL: http://127.0.0.1:8787/v1
 
 ### 每日签到
 
-CodeArts 的签到入口在 **devcloud 控制台 → 活动福利**，接口为
-`/chat/PromptCenterService/v1/ops/{delivery,claim,confirm}`。
+签到入口在 devcloud「活动福利」，实际接口位于 **snap-access 网关**：
 
-**关键限制**：该接口会拦截非浏览器客户端——即使补齐所有请求头、带上有效
-Cookie，只要不是真实浏览器发出的请求，服务端都返回 `HTTP 200` + **空响应体**
-（实测：reqwest、curl、Python requests 均失败）。这是 TLS/HTTP2 指纹级别的检测。
-
-因此签到通过**驱动真实浏览器**完成：
-
-1. 面板「签到」页点「打开登录窗口」，在弹出的浏览器里完成华为云登录
-2. 登录态持久化到 `tools/profile/`，之后无需重复登录
-3. 后端每 30 分钟检查一次，当天未签到则自动执行 claim + confirm
-
-首次使用需安装依赖：
-
-```cmd
-cd tools
-npm install playwright
-npx playwright install chromium-headless-shell
+```
+GET  /v1/ops/delivery?channel=IDE            活动列表
+POST /v1/ops/claim   {campaignId, channel, idempotentKey}
+POST /v1/ops/confirm {campaignId}
 ```
 
-**为什么不能用 AK/SK**：签到接口鉴权依赖浏览器会话 Cookie（含 `cftk` 做 CSRF
-校验），与聊天代理使用的 AK/SK 是两套独立体系。聊天代理仍走 AK/SK，不受影响。
-这也是「省略 AK/SK」在签到这一环做不到的原因——不是实现问题，是上游设计如此。
+**使用与聊天相同的 AK/SK 签名**，不需要浏览器、不需要额外登录。
+
+实测发现两个关键细节，缺一个都会得到 `APIG.0301 verify ak sk signature fail`：
+
+1. **必须携带 `X-Sdk-Content-Sha256` 头**，并用它的值作为 payload hash；
+2. **参与签名的头集合必须与实际发送的完全一致**（华为云 SDK 会签名所有请求头）。
+
+另一个容易踩的点：`channel` 要用 **`IDE`** 而不是 `WEB`。`WEB` 渠道走浏览器会话
+鉴权，`IDE` 渠道才认 AK/SK 签名。
+
+行为：
+
+- 服务启动 15 秒后检查一次，之后每 30 分钟一轮
+- 当天未签到时自动 claim + confirm，已签到则跳过
+- 领取失败会记录原因（"尚未到达权益刷新时间" 视为今日已完成，不重复请求）
+- 多账号时逐账号检查与领取
+
+> 早期版本曾判断签到必须用浏览器（因为 devcloud 域名的接口确实会拦截非浏览器
+> 请求）。那个结论是错的：正确做法是换到 snap-access 域名 + 补全签名头。
 
 ## 客户端接入
 
@@ -228,10 +231,9 @@ codearts2api.exe benefit claim backup  对指定账号签到（追加账号 id�
 | `POST /api/quota/refresh` | 立即刷新额度 |
 | `GET /api/usage?hours=&bucket=` | 用量汇总与时间序列 |
 | `GET /api/usage/recent?hours=` | 最近请求明细 |
-| `GET /api/checkin/status` | 环境就绪、登录态与活动列表 |
-| `POST /api/checkin/login` | 打开浏览器供用户登录一次 |
+| `GET /api/checkin/status` | 各账号签到状态与活动列表 |
 
-| `POST /api/checkin/run` | 立即执行签到（驱动浏览器） |
+| `POST /api/checkin/run` | 立即对所有启用账号签到 |
 
 | `GET /api/checkin/last` | 最近一次签到结果 |
 
