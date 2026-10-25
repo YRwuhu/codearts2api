@@ -601,55 +601,61 @@
     if (retained) retained.textContent = '保留 ' + (recent.retained || 0) + ' 条';
   }
 
-  // ── 签到 ────────────────────────────────────────────────
+  // ── 签到（浏览器自动化） ────────────────────────────────
   const KIND_LABEL = {
-    daily_claim: '每日签到',
-    login: '登录福利',
-    invite: '邀请好友',
-    student_certify: '学生认证',
-    register: '新用户注册',
+    USER_LOGIN: '每日签到',
+    DAILY_CLAIM: '每日签到',
+    NEW_USER_REGISTER: '新用户注册',
+    INVITE_USER: '邀请好友',
+    STUDENT_CERTIFIED: '学生认证',
   };
 
   async function loadCheckin() {
     const msg = $('#checkinMessage');
+    if (msg) msg.textContent = '正在检查环境与登录状态…';
     try {
       const data = await api('/api/checkin/status');
       renderCheckin(data);
     } catch (e) {
-      if (msg) msg.textContent = '读取状态失败：' + e.message;
-      toast('error', '签到状态读取失败');
+      if (msg) msg.textContent = '读取失败：' + e.message;
     }
+  }
+
+  function statusBadge(status) {
+    if (status === 'CONFIRMED') return ['已到账', 'mx-badge mx-badge-success'];
+    if (status === 'CLAIMED') return ['已领取', 'mx-badge mx-badge-success'];
+    if (status === 'CONSUME') return ['已使用', 'mx-badge'];
+    return ['待领取', 'mx-badge mx-badge-warning'];
   }
 
   function renderCheckin(data) {
     const badge = $('#checkinBadge');
     const msg = $('#checkinMessage');
+    const actions = $('#checkinActions');
     const wrap = $('#checkinTableWrap');
     const rows = $('#checkinRows');
-    const credsBadge = $('#credsBadge');
     const runBtn = $('#runCheckinBtn');
 
-    if (!data.configured) {
-      if (badge) { badge.textContent = '未配置'; badge.className = 'mx-badge'; }
-      if (msg) msg.textContent = data.message || '尚未配置 Cookie。';
+    if (!data.ready) {
+      if (badge) { badge.textContent = '环境未就绪'; badge.className = 'mx-badge mx-badge-error'; }
+      if (msg) msg.textContent = data.message || '缺少运行依赖';
+      if (actions) actions.style.display = 'none';
       if (wrap) wrap.hidden = true;
-      if (credsBadge) { credsBadge.textContent = '未配置'; credsBadge.className = 'mx-badge'; }
       if (runBtn) runBtn.disabled = true;
       return;
     }
 
-    if (credsBadge) {
-      credsBadge.textContent = data.valid ? '已配置' : '已过期';
-      credsBadge.className = 'mx-badge ' + (data.valid ? 'mx-badge-success' : 'mx-badge-error');
-    }
-    if (runBtn) runBtn.disabled = !data.valid;
-
-    if (!data.valid) {
-      if (badge) { badge.textContent = '凭证失效'; badge.className = 'mx-badge mx-badge-error'; }
-      if (msg) msg.textContent = data.message || 'Cookie 已失效，请重新配置。';
+    if (!data.logged_in) {
+      if (badge) { badge.textContent = '未登录'; badge.className = 'mx-badge mx-badge-warning'; }
+      if (msg) msg.textContent = data.message || '请先完成一次登录';
+      if (actions) actions.style.display = 'flex';
       if (wrap) wrap.hidden = true;
+      if (runBtn) runBtn.disabled = true;
       return;
     }
+
+    if (actions) actions.style.display = 'none';
+    if (runBtn) runBtn.disabled = false;
 
     const claimed = !!data.claimed_today;
     if (badge) {
@@ -658,8 +664,8 @@
     }
     if (msg) {
       msg.textContent = claimed
-        ? '今天已经签到过了，明天再来。'
-        : '今天还没有签到，点击右上角「立即签到」领取。';
+        ? '今天已经签到过了，明天会自动领取。'
+        : '今天还未签到，点「立即签到」或等待自动执行。';
     }
 
     const list = data.activities || [];
@@ -667,94 +673,28 @@
     if (rows) {
       rows.innerHTML = list.length
         ? list.map((a) => {
-            const kindLabel = KIND_LABEL[a.kind] || a.kind;
-            let statusText = '未领取';
-            let statusCls = 'mx-badge mx-badge-warning';
-            if (a.claimed || a.status === 'CLAIMED' || a.status === 'CONFIRM' || a.status === 'CONSUME') {
-              statusText = '已领取';
-              statusCls = 'mx-badge mx-badge-success';
-            } else if (a.status === 'ELIGIBLE') {
-              statusText = '进行中';
-              statusCls = 'mx-badge';
-            }
-            const amount = (a.benefit_amount && a.benefit_amount > 0)
-              ? a.benefit_amount + ' 积分'
-              : '—';
+            const pair = statusBadge(a.status);
+            const kind = KIND_LABEL[a.type] || a.type;
+            const amount = a.benefitAmount ? (a.benefitAmount + ' 积分') : '—';
             return '<tr>' +
-              '<td data-label="活动">' + escapeHtml(a.title || a.campaign_id) + '</td>' +
-              '<td data-label="类型">' + escapeHtml(kindLabel) + '</td>' +
-              '<td data-label="状态"><span class="' + statusCls + '">' + statusText + '</span></td>' +
+              '<td data-label="活动">' + escapeHtml(a.title || '') + '</td>' +
+              '<td data-label="类型">' + escapeHtml(kind) + '</td>' +
               '<td data-label="奖励">' + escapeHtml(amount) + '</td>' +
+              '<td data-label="状态"><span class="' + pair[1] + '">' + pair[0] + '</span></td>' +
               '</tr>';
           }).join('')
         : '<tr><td colspan="4" class="empty-cell">没有活动数据</td></tr>';
     }
   }
 
-  async function copyCheckinScript() {
-    const hint = $('#copyCkHint');
-    try {
-      const resp = await fetch('/checkin-browser.js?t=' + Date.now());
-      const script = await resp.text();
-      await navigator.clipboard.writeText(script);
-      if (hint) hint.textContent = '已复制，粘贴到 CodeArts 页面的 Console 即可';
-      toast('success', '脚本已复制');
-    } catch (e) {
-      if (hint) hint.textContent = '复制失败：' + e.message;
-      toast('error', '复制失败，请改用「下载脚本」');
-    }
-  }
-
-  function downloadCheckinScript() {
-    const a = document.createElement('a');
-    a.href = '/checkin-browser.js';
-    a.download = 'codearts-checkin.js';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    toast('success', '脚本已下载');
-  }
-
-  async function submitCheckinResult() {
-    const box = $('#ckResult');
-    const hint = $('#ckResultHint');
-    const raw = (box && box.value || '').trim();
-    if (!raw) { toast('warning', '请先粘贴脚本输出'); return; }
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (e) {
-      if (hint) hint.textContent = '不是合法 JSON';
-      toast('error', 'JSON 解析失败');
-      return;
-    }
-    try {
-      await api('/api/checkin/report', {
-        method: 'POST',
-        body: JSON.stringify(parsed),
-      });
-      if (hint) hint.textContent = '已记录';
-      if (box) box.value = '';
-      toast(parsed.ok ? 'success' : 'error', parsed.message || (parsed.ok ? '签到成功' : '签到失败'));
-      await loadCheckin();
-    } catch (e) {
-      if (hint) hint.textContent = '提交失败：' + e.message;
-      toast('error', e.message);
-    }
-  }
-
   async function runCheckin() {
     const btn = $('#runCheckinBtn');
     const msg = $('#checkinMessage');
-    if (btn) { btn.disabled = true; btn.textContent = '签到中…'; }
-    if (msg) msg.textContent = '正在向华为云提交签到…';
+    if (btn) { btn.disabled = true; btn.textContent = '执行中…'; }
+    if (msg) msg.textContent = '正在启动浏览器执行签到，请稍候（最长约 1 分钟）…';
     try {
       const data = await api('/api/checkin/run', { method: 'POST' });
-      if (data.ok) {
-        toast('success', data.message || '签到成功');
-      } else {
-        toast('error', data.message || '签到失败');
-      }
+      toast(data.ok ? 'success' : 'error', data.message || (data.ok ? '签到成功' : '签到失败'));
       if (msg) msg.textContent = data.message || '';
       await loadCheckin();
     } catch (e) {
@@ -765,39 +705,38 @@
     }
   }
 
-  async function saveCheckinCreds() {
-    const cookie = ($('#ckCookie') && $('#ckCookie').value || '').trim();
-    const cftk = ($('#ckCftk') && $('#ckCftk').value || '').trim();
-    const hint = $('#ckHint');
-    const btn = $('#saveCkBtn');
-
-    if (!cookie) { toast('warning', '请先粘贴 Cookie'); return; }
-    if (btn) { btn.disabled = true; btn.textContent = '验证中…'; }
-    if (hint) hint.textContent = '正在验证凭证…';
-
+  async function openLoginWindow() {
+    const hint = $('#loginHint');
+    const btn = $('#openLoginBtn');
+    if (btn) btn.disabled = true;
+    if (hint) hint.textContent = '正在打开浏览器…';
     try {
-      const data = await api('/api/checkin/credentials', {
-        method: 'POST',
-        body: JSON.stringify({ cookie, cftk }),
-      });
-      if (data.verified) {
-        if (hint) hint.textContent = '凭证有效，已找到 ' + data.activity_count + ' 个活动';
-        toast('success', '凭证已验证并保存');
-        if ($('#ckCookie')) $('#ckCookie').value = '';
-        if ($('#ckCftk')) $('#ckCftk').value = '';
-        await loadCheckin();
-      } else {
-        if (hint) hint.textContent = data.warning || '凭证已保存，但验证未通过';
-        toast('warning', '已保存，但验证未通过');
-        await loadCheckin();
-      }
+      const data = await api('/api/checkin/login', { method: 'POST' });
+      if (hint) hint.textContent = data.message || '登录窗口已打开，请在弹出的浏览器里完成登录';
+      toast('success', '登录窗口已打开');
+      // 轮询检查登录是否完成
+      let tries = 0;
+      const timer = setInterval(async () => {
+        tries += 1;
+        if (tries > 40) { clearInterval(timer); if (btn) btn.disabled = false; return; }
+        try {
+          const st = await api('/api/checkin/status');
+          if (st.logged_in) {
+            clearInterval(timer);
+            if (btn) btn.disabled = false;
+            if (hint) hint.textContent = '登录成功';
+            toast('success', '登录成功');
+            renderCheckin(st);
+          }
+        } catch (_) {}
+      }, 3000);
     } catch (e) {
-      if (hint) hint.textContent = '保存失败：' + e.message;
+      if (hint) hint.textContent = '打开失败：' + e.message;
+      if (btn) btn.disabled = false;
       toast('error', e.message);
-    } finally {
-      if (btn) { btn.disabled = false; btn.textContent = '保存并验证'; }
     }
   }
+
 
   // ── 事件绑定 ────────────────────────────────────────────
   function bindEvents() {
@@ -840,17 +779,8 @@
     const runCkBtn = $('#runCheckinBtn');
     if (runCkBtn) runCkBtn.addEventListener('click', runCheckin);
 
-    const copyBtn = $('#copyCkScriptBtn');
-    if (copyBtn) copyBtn.addEventListener('click', copyCheckinScript);
-
-    const dlBtn = $('#downloadCkScriptBtn');
-    if (dlBtn) dlBtn.addEventListener('click', downloadCheckinScript);
-
-    const submitBtn = $('#submitCkResultBtn');
-    if (submitBtn) submitBtn.addEventListener('click', submitCheckinResult);
-
-    const saveCkBtn = $('#saveCkBtn');
-    if (saveCkBtn) saveCkBtn.addEventListener('click', saveCheckinCreds);
+    const openLogin = $('#openLoginBtn');
+    if (openLogin) openLogin.addEventListener('click', openLoginWindow);
 
     const quotaBtn = $('#refreshQuotaBtn');
     if (quotaBtn) quotaBtn.addEventListener('click', () => loadQuota(true));

@@ -23,3 +23,8 @@ Thumbs.db
 desktop.ini
 usage.jsonl
 checkin.json
+
+# 签到用浏览器 profile（含登录态）与依赖
+tools/profile/
+tools/node_modules/
+tools/package-lock.json

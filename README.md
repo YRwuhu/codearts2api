@@ -161,24 +161,29 @@ OpenAI Base URL: http://127.0.0.1:8787/v1
 ### 每日签到
 
 CodeArts 的签到入口在 **devcloud 控制台 → 活动福利**，接口为
-`/PromptCenterService/v1/ops/{delivery,claim,confirm}`。它使用**浏览器登录
-Cookie** 鉴权（关键 cookie 是 HttpOnly），并且用 `cftk` 做 CSRF 校验，
-因此**无法用 AK/SK 代替**。
+`/chat/PromptCenterService/v1/ops/{delivery,claim,confirm}`。
 
-本项目的做法是「浏览器内签到 + 结果回传」：
+**关键限制**：该接口会拦截非浏览器客户端——即使补齐所有请求头、带上有效
+Cookie，只要不是真实浏览器发出的请求，服务端都返回 `HTTP 200` + **空响应体**
+（实测：reqwest、curl、Python requests 均失败）。这是 TLS/HTTP2 指纹级别的检测。
 
-1. 打开面板「签到」页，点「复制签到脚本」
-2. 在已登录的 [码道 CodeArts](https://devcloud.cn-north-4.huaweicloud.com/chat/home)
-   页面按 `F12` 打开 Console，粘贴回车
-3. 脚本会在页面上下文里查活动 → 领取 → 确认，并打印一行 JSON
-4. 把 JSON 粘贴回面板「粘贴脚本输出的结果 JSON」，点「记录结果」
+因此签到通过**驱动真实浏览器**完成：
 
-为什么不让代理直接签到：实测从 `https://devcloud...` 页面发起对
-`http://127.0.0.1` 的请求会被浏览器的私有网络访问（PNA）策略拦截，
-所以回传环节改为「复制一行 JSON」，稳定且不依赖跨域。
+1. 面板「签到」页点「打开登录窗口」，在弹出的浏览器里完成华为云登录
+2. 登录态持久化到 `tools/profile/`，之后无需重复登录
+3. 后端每 30 分钟检查一次，当天未签到则自动执行 claim + confirm
 
-也可以在面板里直接粘贴完整 Cookie（「配置登录凭证」卡片），配置后
-后台每 30 分钟检查一次，未签到则自动执行。Cookie 会过期，届时页面会提示。
+首次使用需安装依赖：
+
+```cmd
+cd tools
+npm install playwright
+npx playwright install chromium-headless-shell
+```
+
+**为什么不能用 AK/SK**：签到接口鉴权依赖浏览器会话 Cookie（含 `cftk` 做 CSRF
+校验），与聊天代理使用的 AK/SK 是两套独立体系。聊天代理仍走 AK/SK，不受影响。
+这也是「省略 AK/SK」在签到这一环做不到的原因——不是实现问题，是上游设计如此。
 
 ## 客户端接入
 
@@ -223,10 +228,11 @@ codearts2api.exe benefit claim backup  对指定账号签到（追加账号 id�
 | `POST /api/quota/refresh` | 立即刷新额度 |
 | `GET /api/usage?hours=&bucket=` | 用量汇总与时间序列 |
 | `GET /api/usage/recent?hours=` | 最近请求明细 |
-| `GET /api/checkin/status` | 签到状态与活动列表 |
-| `POST /api/checkin/credentials` | 保存浏览器 Cookie 并验证 |
-| `POST /api/checkin/run` | 立即签到（需已配置 Cookie） |
-| `POST /api/checkin/report` | 记录浏览器脚本回传的签到结果 |
+| `GET /api/checkin/status` | 环境就绪、登录态与活动列表 |
+| `POST /api/checkin/login` | 打开浏览器供用户登录一次 |
+
+| `POST /api/checkin/run` | 立即执行签到（驱动浏览器） |
+
 | `GET /api/checkin/last` | 最近一次签到结果 |
 
 ## 相对上游做的兼容处理

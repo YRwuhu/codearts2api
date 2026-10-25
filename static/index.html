@@ -25,7 +25,7 @@
 <link rel="stylesheet" href="/vendor/components/empty.css">
 <link rel="stylesheet" href="/vendor/components/tag.css">
 <link rel="stylesheet" href="/vendor/components/tooltip.css">
-<link rel="stylesheet" href="/app.css?v=1792910704">
+<link rel="stylesheet" href="/app.css?v=1792912715">
 </head>
 <body>
 <div class="mx-app">
@@ -382,7 +382,7 @@
     <section class="route" id="route-checkin" hidden>
       <div class="mx-page-head">
         <h1 class="mx-page-title">每日签到</h1>
-        <p class="mx-page-sub">领取 CodeArts「活动福利」的每日签到积分</p>
+        <p class="mx-page-sub">登录一次后全自动领取「活动福利」积分</p>
       </div>
 
       <div class="mx-card">
@@ -394,10 +394,14 @@
           </div>
         </div>
         <div class="mx-card-body">
-          <div id="checkinMessage" class="helper-block">正在读取状态…</div>
-          <div class="mx-table-wrap" id="checkinTableWrap" hidden>
+          <div id="checkinMessage" class="helper-block">正在检查环境…</div>
+          <div id="checkinActions" style="display:none;gap:8px;flex-wrap:wrap;margin-top:12px">
+            <button class="mx-btn mx-btn-primary" id="openLoginBtn" data-ripple>打开登录窗口</button>
+            <span class="mx-helper" id="loginHint"></span>
+          </div>
+          <div class="mx-table-wrap" id="checkinTableWrap" hidden style="margin-top:12px">
             <table class="mx-table">
-              <thead><tr><th>活动</th><th>类型</th><th>状态</th><th>奖励</th></tr></thead>
+              <thead><tr><th>活动</th><th>类型</th><th>奖励</th><th>状态</th></tr></thead>
               <tbody id="checkinRows"></tbody>
             </table>
           </div>
@@ -405,88 +409,21 @@
       </div>
 
       <div class="mx-card" style="margin-top:16px">
-        <div class="mx-card-head">
-          <span class="mx-card-title">配置登录凭证</span>
-          <span class="mx-badge" id="credsBadge">未配置</span>
-        </div>
+        <div class="mx-card-head"><span class="mx-card-title">工作原理</span></div>
         <div class="mx-card-body">
           <p class="helper-block">
-            签到接口使用<strong>浏览器登录 Cookie</strong>鉴权，无法用 AK/SK 代替。
-            需要你从已登录的浏览器里复制一次 Cookie，之后本服务会每天自动签到。
+            CodeArts 签到接口会拦截非浏览器请求（返回 200 但响应体为空），
+            因此后端无法用 AK/SK 直接调用。本功能驱动真实浏览器完成签到。
           </p>
           <ol class="steps">
-            <li>打开 <a href="https://devcloud.cn-north-4.huaweicloud.com/chat/home" target="_blank" rel="noopener noreferrer">码道 CodeArts 首页</a> 并确认已登录</li>
-            <li>按 <code>F12</code> 打开开发者工具 → <strong>Network</strong> 标签</li>
-            <li>点一下页面里的「活动福利」，找到任意 <code>ops/</code> 请求</li>
-            <li>在请求头里复制完整的 <strong>Cookie</strong> 值（整行）</li>
-            <li>粘贴到下方，点击「保存并验证」</li>
+            <li><strong>首次使用</strong>：点「打开登录窗口」，在弹出的浏览器里完成华为云登录（扫码或密码都行）</li>
+            <li>登录态保存在 <code>tools/profile/</code>，之后无需再登录</li>
+            <li>服务每 30 分钟检查一次，当天未签到会自动领取</li>
+            <li>会话过期后，重新点一次「打开登录窗口」即可</li>
           </ol>
-
-          <label class="mx-label" style="margin-top:12px">Cookie</label>
-          <div class="mx-textarea-wrap">
-            <textarea class="mx-input" id="ckCookie" rows="3" placeholder="cftk=...; session=..."></textarea>
-          </div>
-
-          <label class="mx-label" style="margin-top:12px">cftk（留空则从 Cookie 里自动提取）</label>
-          <div class="mx-input-wrap">
-            <input class="mx-input" id="ckCftk" placeholder="可选">
-          </div>
-
-          <div style="display:flex;gap:8px;align-items:center;margin-top:12px">
-            <button class="mx-btn mx-btn-primary" id="saveCkBtn" data-ripple>保存并验证</button>
-            <span class="mx-helper" id="ckHint"></span>
-          </div>
-        </div>
-      </div>
-
-      <div class="mx-card" style="margin-top:16px">
-        <div class="mx-card-head">
-          <span class="mx-card-title">推荐：浏览器内一键签到</span>
-          <span class="mx-badge mx-badge-success">无需导出 Cookie</span>
-        </div>
-        <div class="mx-card-body">
-          <p class="helper-block">
-            华为云的登录 Cookie 是 <code>HttpOnly</code>，脚本读不到，因此本地代理无法直接签到。
-            最稳妥的做法是让签到请求在你已登录的浏览器里发出，再把结果回传给本服务。
-          </p>
-          <ol class="steps">
-            <li>在浏览器打开 <a href="https://devcloud.cn-north-4.huaweicloud.com/chat/home" target="_blank" rel="noopener noreferrer">码道 CodeArts 首页</a>（确认已登录）</li>
-            <li>按 <code>F12</code> → <strong>Console</strong> 标签</li>
-            <li>点击下方「复制签到脚本」，粘贴到 Console 回车</li>
-            <li>脚本会自动领取当日签到并把结果回传到这里</li>
-          </ol>
-          <div style="display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap">
-            <button class="mx-btn mx-btn-primary" id="copyCkScriptBtn" data-ripple>复制签到脚本</button>
-            <button class="mx-btn mx-btn-secondary" id="downloadCkScriptBtn" data-ripple>下载脚本</button>
-            <span class="mx-helper" id="copyCkHint"></span>
-          </div>
-
-          <label class="mx-label" style="margin-top:16px">粘贴脚本输出的结果 JSON</label>
-          <div class="mx-textarea-wrap">
-            <textarea class="mx-input" id="ckResult" rows="3" placeholder='{"ok":true,"message":"签到成功","campaign_id":"...","benefit_amount":10}'></textarea>
-          </div>
-          <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
-            <button class="mx-btn mx-btn-primary mx-btn-sm" id="submitCkResultBtn" data-ripple>记录结果</button>
-            <span class="mx-helper" id="ckResultHint"></span>
-          </div>
-
-          <p class="helper-block" style="margin-top:12px">
-            脚本只在你的浏览器里发起官方请求，不会保存密码，也不会上传任何数据到第三方。
-            由于浏览器的跨域限制，结果需要你复制一行 JSON 贴回这里。
-          </p>
-        </div>
-      </div>
-
-      <div class="mx-card" style="margin-top:16px">
-        <div class="mx-card-head"><span class="mx-card-title">自动签到说明</span></div>
-        <div class="mx-card-body">
-          <p class="helper-block">
-            配置好 Cookie 后，服务会在启动 20 秒后检查一次，之后每 30 分钟检查一次；
-            当天尚未签到时自动执行，已签到则跳过，不会重复领取。
-          </p>
-          <p class="helper-block">
-            凭证保存在项目目录的 <code>checkin.json</code>（已在 <code>.gitignore</code> 中）。
-            Cookie 会过期，届时页面会提示重新配置。
+          <p class="helper-block" style="margin-top:10px">
+            <strong>为什么不能用 AK/SK：</strong>签到接口的鉴权依赖浏览器会话 Cookie，
+            与聊天代理使用的 AK/SK 是两套体系。聊天代理仍走 AK/SK，互不影响。
           </p>
         </div>
       </div>
@@ -589,6 +526,6 @@
     try { if (window.MxSmoothCorner && MxSmoothCorner.init) MxSmoothCorner.init(); } catch (_) {}
   })();
 </script>
-<script src="/app.js?v=1792910704"></script>
+<script src="/app.js?v=1792912715"></script>
 </body>
 </html>

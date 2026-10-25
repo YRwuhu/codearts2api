@@ -29,7 +29,7 @@ pub struct WebState {
     /// 最近一次额度查询结果（按账号缓存），由定时任务或 WebUI 触发更新。
     pub quota: Arc<RwLock<HashMap<String, Quota>>>,
     /// 最近一次签到结果，供页面展示。
-    pub last_checkin: Arc<RwLock<Option<crate::checkin::CheckinResult>>>,
+    pub last_checkin: Arc<RwLock<Option<crate::checkin::Outcome>>>,
 }
 
 impl WebState {
