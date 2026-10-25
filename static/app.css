@@ -277,3 +277,21 @@ td.empty-cell {
   justify-content: flex-start;
 }
 .usage-chart { gap: 4px; }
+
+/* ── 签到页 ── */
+.steps {
+  margin: 0 0 12px;
+  padding-left: 20px;
+  color: var(--mx-t2);
+  font-size: 13px;
+  line-height: 2;
+}
+.steps a { color: var(--mx-primary); }
+.steps code,
+.helper-block code {
+  font-family: var(--mx-mono);
+  font-size: 12px;
+  background: var(--mx-s3);
+  padding: 1px 5px;
+  border-radius: var(--mx-r-xs);
+}

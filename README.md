@@ -118,6 +118,7 @@ OpenAI Base URL: http://127.0.0.1:8787/v1
 - **模型** —— 合并后的模型列表，可按名称筛选，点「测试」直接发起一次真实请求验证
 - **额度** —— 套餐 credit 总额 / 已用 / 剩余、分套餐明细、累计 token，附华为云控制台跳转
 - **用量** —— 请求数、token、平均耗时、失败数，含趋势图、按模型汇总与最近请求明细
+- **签到** —— 每日签到（浏览器脚本 + 结果回传），含活动列表与自动签到配置
 - **客户端接入** —— 一键查看 Base URL、API Key 与推荐模型
 
 界面基于 [miuix-console](https://github.com/bmbxwbh/miuix-console)（Apache 2.0，零依赖纯 CSS/JS），
@@ -157,17 +158,27 @@ OpenAI Base URL: http://127.0.0.1:8787/v1
 **关于缓存统计**：CodeArts 上游不返回 prompt cache 命中字段，
 因此这里不提供"缓存命中率"——那只能是编造的数字。
 
-### 关于自动签到
+### 每日签到
 
-CodeArts **没有**每日签到领额度的机制，因此本面板不提供签到按钮：
+CodeArts 的签到入口在 **devcloud 控制台 → 活动福利**，接口为
+`/PromptCenterService/v1/ops/{delivery,claim,confirm}`。它使用**浏览器登录
+Cookie** 鉴权（关键 cookie 是 HttpOnly），并且用 `cftk` 做 CSRF 校验，
+因此**无法用 AK/SK 代替**。
 
-- 额度来自套餐订阅（credit），不是签到发放
-- `benefit/claim`、`welfare`、`checkin` 等路径在网关返回 404
-- 免费额度通道（opengw）需账号在华为云侧单独开通，本项目账号未开通，
-  调用会返回 `invalid channel, group not found`
+本项目的做法是「浏览器内签到 + 结果回传」：
 
-如果你确实需要免费额度，请到华为云控制台开通对应权益；
-相关跳转链接已放在「额度」页。
+1. 打开面板「签到」页，点「复制签到脚本」
+2. 在已登录的 [码道 CodeArts](https://devcloud.cn-north-4.huaweicloud.com/chat/home)
+   页面按 `F12` 打开 Console，粘贴回车
+3. 脚本会在页面上下文里查活动 → 领取 → 确认，并打印一行 JSON
+4. 把 JSON 粘贴回面板「粘贴脚本输出的结果 JSON」，点「记录结果」
+
+为什么不让代理直接签到：实测从 `https://devcloud...` 页面发起对
+`http://127.0.0.1` 的请求会被浏览器的私有网络访问（PNA）策略拦截，
+所以回传环节改为「复制一行 JSON」，稳定且不依赖跨域。
+
+也可以在面板里直接粘贴完整 Cookie（「配置登录凭证」卡片），配置后
+后台每 30 分钟检查一次，未签到则自动执行。Cookie 会过期，届时页面会提示。
 
 ## 客户端接入
 
@@ -212,6 +223,11 @@ codearts2api.exe benefit claim backup  对指定账号签到（追加账号 id�
 | `POST /api/quota/refresh` | 立即刷新额度 |
 | `GET /api/usage?hours=&bucket=` | 用量汇总与时间序列 |
 | `GET /api/usage/recent?hours=` | 最近请求明细 |
+| `GET /api/checkin/status` | 签到状态与活动列表 |
+| `POST /api/checkin/credentials` | 保存浏览器 Cookie 并验证 |
+| `POST /api/checkin/run` | 立即签到（需已配置 Cookie） |
+| `POST /api/checkin/report` | 记录浏览器脚本回传的签到结果 |
+| `GET /api/checkin/last` | 最近一次签到结果 |
 
 ## 相对上游做的兼容处理
 

@@ -30,6 +30,14 @@ pub fn router() -> axum::Router<WebState> {
         .route("/api/quota/refresh", post(quota_refresh))
         .route("/api/usage", get(usage_summary))
         .route("/api/usage/recent", get(usage_recent))
+        .route("/api/checkin/status", get(checkin_status))
+        .route(
+            "/api/checkin/credentials",
+            post(save_checkin_credentials),
+        )
+        .route("/api/checkin/run", post(run_checkin))
+        .route("/api/checkin/last", get(last_checkin))
+        .route("/api/checkin/report", post(report_checkin))
         .route("/api/test", post(test_model))
 }
 
@@ -592,4 +600,244 @@ pub async fn usage_recent(
             .collect::<serde_json::Map<_, _>>(),
     }))
     .into_response()
+}
+
+// ── 每日签到 ────────────────────────────────────────────────
+
+fn checkin_creds_path(cfg: &Config) -> PathBuf {
+    cfg.env_dir.join("checkin.json")
+}
+
+fn read_checkin_creds(cfg: &Config) -> crate::checkin::CheckinCredentials {
+    let path = checkin_creds_path(cfg);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn write_checkin_creds(
+    cfg: &Config,
+    creds: &crate::checkin::CheckinCredentials,
+) -> Result<(), String> {
+    let path = checkin_creds_path(cfg);
+    let text = serde_json::to_string_pretty(creds).map_err(|e| format!("序列化失败: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("写入 {} 失败: {e}", path.display()))
+}
+
+#[derive(Deserialize)]
+pub struct SaveCheckinCreds {
+    pub cookie: String,
+    #[serde(default)]
+    pub cftk: String,
+}
+
+/// POST /api/checkin/credentials —— 保存浏览器导出的 Cookie 与 cftk。
+pub async fn save_checkin_credentials(
+    State(state): State<WebState>,
+    Json(req): Json<SaveCheckinCreds>,
+) -> Response {
+    let cfg = state.config();
+    let cookie = req.cookie.trim().to_string();
+    if cookie.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "Cookie 不能为空");
+    }
+
+    // cookie 里通常本身就含 cftk，允许用户只贴 cookie
+    let mut cftk = req.cftk.trim().to_string();
+    if cftk.is_empty() {
+        for part in cookie.split(';') {
+            let part = part.trim();
+            if let Some(v) = part.strip_prefix("cftk=") {
+                cftk = v.to_string();
+                break;
+            }
+        }
+    }
+
+    let creds = crate::checkin::CheckinCredentials {
+        cookie,
+        cftk,
+        updated_at: chrono::Utc::now().timestamp(),
+    };
+
+    if let Err(e) = write_checkin_creds(&cfg, &creds) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+
+    // 保存后立即验证一次，让用户马上知道能不能用
+    let result = crate::checkin::fetch_activities(&state.http, &creds).await;
+    match result {
+        Ok(activities) => Json(json!({
+            "ok": true,
+            "verified": true,
+            "activity_count": activities.len(),
+            "activities": activities,
+        }))
+        .into_response(),
+        Err(e) => Json(json!({
+            "ok": true,
+            "verified": false,
+            "warning": e,
+        }))
+        .into_response(),
+    }
+}
+
+/// GET /api/checkin/status —— 签到状态与活动列表。
+pub async fn checkin_status(State(state): State<WebState>) -> Response {
+    let cfg = state.config();
+    let creds = read_checkin_creds(&cfg);
+
+    if !creds.is_configured() {
+        return Json(json!({
+            "configured": false,
+            "activities": [],
+            "message": "尚未配置 Cookie。请在已登录的浏览器里打开签到页，导出 Cookie 后粘贴到下方。",
+            "signin_url": "https://devcloud.cn-north-4.huaweicloud.com/chat/home",
+        }))
+        .into_response();
+    }
+
+    match crate::checkin::fetch_activities(&state.http, &creds).await {
+        Ok(activities) => Json(json!({
+            "configured": true,
+            "valid": true,
+            "activities": activities,
+            "claimed_today": crate::checkin::all_daily_claimed(&activities),
+            "updated_at": creds.updated_at,
+        }))
+        .into_response(),
+        Err(e) => Json(json!({
+            "configured": true,
+            "valid": false,
+            "activities": [],
+            "message": e,
+            "updated_at": creds.updated_at,
+        }))
+        .into_response(),
+    }
+}
+
+/// POST /api/checkin/run —— 立即签到一次。
+pub async fn run_checkin(State(state): State<WebState>) -> Response {
+    let cfg = state.config();
+    let creds = read_checkin_creds(&cfg);
+    if !creds.is_configured() {
+        return err(StatusCode::BAD_REQUEST, "尚未配置 Cookie");
+    }
+    let result = crate::checkin::do_checkin(&state.http, &creds).await;
+    *state.last_checkin.write().await = Some(result.clone());
+    let status = if result.ok {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (status, Json(json!(result))).into_response()
+}
+
+/// GET /api/checkin/last —— 最近一次签到结果。
+pub async fn last_checkin(State(state): State<WebState>) -> Response {
+    let last = state.last_checkin.read().await.clone();
+    Json(json!({ "last": last })).into_response()
+}
+
+/// 后台每日签到：启动后检查一次，之后每 30 分钟检查（未签到才执行）。
+pub fn spawn_checkin_scheduler(state: WebState) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        loop {
+            let cfg = state.config();
+            let creds = read_checkin_creds(&cfg);
+            if creds.is_configured() {
+                // 只在今天还没签到时执行，避免无谓请求
+                match crate::checkin::fetch_activities(&state.http, &creds).await {
+                    Ok(activities) => {
+                        if !crate::checkin::all_daily_claimed(&activities)
+                            && crate::checkin::find_daily_candidate(&activities).is_some()
+                        {
+                            let result = crate::checkin::do_checkin(&state.http, &creds).await;
+                            println!(
+                                "[checkin] 自动签到: ok={} {}",
+                                result.ok, result.message
+                            );
+                            *state.last_checkin.write().await = Some(result);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[checkin] 状态检查失败: {e}");
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
+        }
+    });
+}
+
+#[derive(Deserialize)]
+pub struct ReportCheckin {
+    pub ok: bool,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub campaign_id: Option<String>,
+    #[serde(default)]
+    pub benefit_amount: Option<f64>,
+    /// 页面里读到的 cookie（可能不含 HttpOnly 部分，仅用于后续自动签到）
+    #[serde(default)]
+    pub cookie: Option<String>,
+    #[serde(default)]
+    pub cftk: Option<String>,
+}
+
+/// POST /api/checkin/report —— 浏览器内脚本执行完签到后回传结果。
+///
+/// 这条路径用于绕过 HttpOnly cookie：签到在已登录页面里发起（浏览器自动带
+/// Cookie），本服务只负责记录结果，并在脚本顺带提供了 cookie 时保存下来供
+/// 后续自动签到尝试。
+pub async fn report_checkin(
+    State(state): State<WebState>,
+    body: axum::body::Bytes,
+) -> Response {
+    // 浏览器端用 text/plain 规避预检，这里手动解析，不依赖 Content-Type。
+    let req: ReportCheckin = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::BAD_REQUEST, format!("JSON 解析失败: {e}")),
+    };
+    let cfg = state.config();
+
+    if let (Some(cookie), Some(cftk)) = (req.cookie.as_ref(), req.cftk.as_ref()) {
+        let cookie = cookie.trim().to_string();
+        if !cookie.is_empty() {
+            let creds = crate::checkin::CheckinCredentials {
+                cookie,
+                cftk: cftk.trim().to_string(),
+                updated_at: chrono::Utc::now().timestamp(),
+            };
+            let _ = write_checkin_creds(&cfg, &creds);
+        }
+    }
+
+    let result = crate::checkin::CheckinResult {
+        ok: req.ok,
+        action: "browser".to_string(),
+        message: if req.message.is_empty() {
+            if req.ok { "签到成功".to_string() } else { "签到失败".to_string() }
+        } else {
+            req.message.clone()
+        },
+        campaign_id: req.campaign_id.clone(),
+        benefit_amount: req.benefit_amount,
+        claimed_today: req.ok,
+        activities: Vec::new(),
+        at: chrono::Utc::now().timestamp(),
+    };
+
+    println!(
+        "[checkin] 浏览器回传: ok={} {}",
+        result.ok, result.message
+    );
+    *state.last_checkin.write().await = Some(result.clone());
+
+    Json(json!({ "ok": true, "recorded": result })).into_response()
 }

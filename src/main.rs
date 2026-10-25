@@ -1,5 +1,6 @@
 mod admin;
 mod api;
+mod checkin;
 mod config;
 mod models;
 mod params;
@@ -157,6 +158,7 @@ fn serve() -> ExitCode {
 
         // 后台定时任务：定期刷新额度并落盘，供 WebUI 与 /api/quota 使用
         admin::spawn_quota_refresher(state.clone());
+        admin::spawn_checkin_scheduler(state.clone());
 
         let app = api::router(state);
         if let Err(e) = axum::serve(listener, app).await {

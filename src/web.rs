@@ -28,6 +28,8 @@ pub struct WebState {
     pub usage: Arc<UsageStore>,
     /// 最近一次额度查询结果（按账号缓存），由定时任务或 WebUI 触发更新。
     pub quota: Arc<RwLock<HashMap<String, Quota>>>,
+    /// 最近一次签到结果，供页面展示。
+    pub last_checkin: Arc<RwLock<Option<crate::checkin::CheckinResult>>>,
 }
 
 impl WebState {
@@ -43,6 +45,7 @@ impl WebState {
             http,
             usage,
             quota: Arc::new(RwLock::new(HashMap::new())),
+            last_checkin: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -109,12 +112,35 @@ pub async fn static_handler(uri: Uri) -> Response {
     }
 }
 
+/// 浏览器端签到脚本从 devcloud 页面跨域回传结果，需要放开该端点的预检。
+async fn checkin_report_options() -> impl IntoResponse {
+    (
+        StatusCode::NO_CONTENT,
+        [
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            (
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                "POST, OPTIONS",
+            ),
+            (
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                "content-type",
+            ),
+        ],
+    )
+}
+
 pub fn router() -> Router<WebState> {
     Router::new()
+        .route(
+            "/api/checkin/report",
+            axum::routing::options(checkin_report_options),
+        )
         .route("/", get(static_handler))
         .route("/accounts", get(static_handler))
         .route("/models", get(static_handler))
         .route("/quota", get(static_handler))
         .route("/usage", get(static_handler))
+        .route("/checkin", get(static_handler))
         .fallback(static_handler)
 }
