@@ -1,0 +1,22 @@
+.env
+.env.local
+.env.*.local
+
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Python (legacy archive)
+legacy-python/.venv/
+__pycache__/
+*.py[cod]
+
+# Runtime/cache
+models-cache.json
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
