@@ -1,22 +1,11 @@
-# CodeArts2API (Rust)
+# CodeArts2API
 
 把华为云 CodeArts 的模型接口包装成标准 **OpenAI Chat Completions API** 的本地代理。
-Rust 重写版，行为与仓库根目录的 Python 版（`server.py`）保持一致。
 
-底层走华为云 `SDK-HMAC-SHA256` 请求签名，AK/SK 从 `.env` 读取。
+Rust 实现，编译为单文件可执行程序，**不依赖 Python 或任何运行时**。
 
-## 与 Python 版的关系
-
-本目录是独立实现，**不依赖 Python**，可直接编译为单文件可执行程序：
-
-| 项 | Python 版 | Rust 版 |
-|---|---|---|
-| 运行时 | Python 3.12 + Flask | 无（静态链接） |
-| 启动 | `python server.py` | `target\release\codearts2api.exe serve` |
-| 分发 | 需装依赖 | 单个 exe，约 6 MB |
-| 行为 | 基准 | 逐项对齐（见下文验证章节） |
-
-两版共用同一个 `.env` 和 `models-cache.json`，可以互换使用，但**不要同时启动**——都默认监听 8787。
+底层走华为云 `SDK-HMAC-SHA256` 请求签名。凭证有两种来源：
+OAuth 登录（推荐，无需手填）或 `.env` / `accounts.json` 里的 AK/SK。
 
 ## 构建
 

@@ -7,23 +7,18 @@ accounts.json
 /target
 **/*.rs.bk
 
-# Python (legacy archive)
-legacy-python/.venv/
-__pycache__/
-*.py[cod]
-
 # Runtime/cache
 models-cache.json
 models-cache.*.json
 *.log
+usage.jsonl
+checkin.json
+
+# OAuth 登录凭证（含 refresh_token 与 DPoP 私钥）
+auths/
 
 # Editor / OS
 .vscode/
 .idea/
 Thumbs.db
 desktop.ini
-usage.jsonl
-checkin.json
-
-# OAuth 登录凭证（含 refresh_token 与 DPoP 私钥）
-auths/
