@@ -26,6 +26,10 @@ pub fn router() -> axum::Router<WebState> {
             patch(update_account).delete(delete_account),
         )
         .route("/api/refresh", post(refresh_models))
+        .route("/api/quota", get(quota))
+        .route("/api/quota/refresh", post(quota_refresh))
+        .route("/api/usage", get(usage_summary))
+        .route("/api/usage/recent", get(usage_recent))
         .route("/api/test", post(test_model))
 }
 
@@ -475,4 +479,117 @@ pub async fn test_model(
         }))
         .into_response(),
     }
+}
+
+// ── 额度与用量 ──────────────────────────────────────────────
+
+/// 后台定时刷新每个账号的额度。
+pub fn spawn_quota_refresher(state: WebState) {
+    tokio::spawn(async move {
+        // 启动后先等一会儿，避免和模型同步抢占上游连接
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        loop {
+            refresh_all_quota(&state).await;
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        }
+    });
+}
+
+async fn refresh_all_quota(state: &WebState) -> usize {
+    let cfg = state.config();
+    let mut success = 0;
+    for account in cfg.accounts.iter().filter(|a| a.enabled) {
+        let quota = crate::quota::fetch_quota(&state.http, &account.ak, &account.sk).await;
+        if quota.ok {
+            success += 1;
+        }
+        state
+            .quota
+            .write()
+            .await
+            .insert(account.id.clone(), quota);
+    }
+    success
+}
+
+/// GET /api/quota —— 各账号额度（credit / token / 分套餐）。
+pub async fn quota(State(state): State<WebState>) -> Response {
+    // 缓存为空说明还没刷过，立即拉一次
+    let empty = state.quota.read().await.is_empty();
+    if empty {
+        refresh_all_quota(&state).await;
+    }
+
+    let cfg = state.config();
+    let cache = state.quota.read().await;
+    let mut accounts = Vec::new();
+    for account in &cfg.accounts {
+        match cache.get(&account.id) {
+            Some(q) => {
+                let mut v = serde_json::to_value(q).unwrap_or_else(|_| json!({}));
+                v["id"] = json!(account.id);
+                v["enabled"] = json!(account.enabled);
+                accounts.push(v);
+            }
+            None => accounts.push(json!({
+                "id": account.id,
+                "enabled": account.enabled,
+                "ok": false,
+                "error": "尚未获取",
+            })),
+        }
+    }
+    drop(cache);
+
+    Json(json!({
+        "accounts": accounts,
+        "links": crate::quota::console_links(),
+    }))
+    .into_response()
+}
+
+/// POST /api/quota/refresh —— 立即刷新额度。
+pub async fn quota_refresh(State(state): State<WebState>) -> Response {
+    let n = refresh_all_quota(&state).await;
+    Json(json!({"ok": true, "refreshed": n})).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct UsageQuery {
+    #[serde(default)]
+    pub hours: Option<i64>,
+    #[serde(default)]
+    pub bucket: Option<String>,
+}
+
+/// GET /api/usage —— 用量汇总与趋势。
+pub async fn usage_summary(
+    State(state): State<WebState>,
+    axum::extract::Query(q): axum::extract::Query<UsageQuery>,
+) -> Response {
+    let hours = q.hours.unwrap_or(24).clamp(1, 24 * 90);
+    let bucket = q.bucket.as_deref().unwrap_or("hour");
+    let since = chrono::Utc::now().timestamp() - hours * 3600;
+    let summary = state.usage.summarize(since, bucket).await;
+    Json(summary).into_response()
+}
+
+/// GET /api/usage/recent —— 最近请求明细。
+pub async fn usage_recent(
+    State(state): State<WebState>,
+    axum::extract::Query(q): axum::extract::Query<UsageQuery>,
+) -> Response {
+    let hours = q.hours.unwrap_or(24).clamp(1, 24 * 90);
+    let since = chrono::Utc::now().timestamp() - hours * 3600;
+    let records = state.usage.recent(200, since).await;
+    let activity = state.usage.activity_by_model().await;
+    Json(json!({
+        "records": records,
+        "retained": state.usage.len().await,
+        "activity": activity
+            .into_iter()
+            .map(|(model, (last_ts, count))| (model, json!({"last_ts": last_ts, "count": count})))
+            .collect::<serde_json::Map<_, _>>(),
+    }))
+    .into_response()
 }

@@ -159,6 +159,7 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         }
     }
 
+    let started = std::time::Instant::now();
     let candidates = pool.accounts_for(&model).await;
     if candidates.is_empty() {
         return error_response(StatusCode::NOT_FOUND, format!("model '{model}' 无可用账号"));
@@ -216,6 +217,16 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
                 switched += 1;
                 continue;
             }
+            catalog.note_failure();
+            state
+                .usage
+                .record(crate::usage::UsageRecord::failed(
+                    &model,
+                    catalog.account_id(),
+                    started.elapsed().as_millis() as i64,
+                    format!("HTTP {status}"),
+                ))
+                .await;
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({"error": {"message": format!("upstream {status}: {text}")}})),
@@ -228,6 +239,16 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
             if switched > 0 {
                 println!("[pool] {model}: 已切换到账号 {}", catalog.account_id());
             }
+            state
+                .usage
+                .record(crate::usage::UsageRecord::from_upstream(
+                    &model,
+                    catalog.account_id(),
+                    started.elapsed().as_millis() as i64,
+                    true,
+                    None,
+                ))
+                .await;
             return stream_response(upstream, model).await;
         }
 
@@ -278,6 +299,16 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         if switched > 0 {
             println!("[pool] {model}: 已切换到账号 {}", catalog.account_id());
         }
+        state
+            .usage
+            .record(crate::usage::UsageRecord::from_upstream(
+                &model,
+                catalog.account_id(),
+                started.elapsed().as_millis() as i64,
+                false,
+                result.get("usage"),
+            ))
+            .await;
         return Json(result).into_response();
     }
 

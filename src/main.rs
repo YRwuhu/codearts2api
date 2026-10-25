@@ -3,8 +3,10 @@ mod api;
 mod config;
 mod models;
 mod params;
+mod quota;
 mod signer;
 mod stream;
+mod usage;
 mod web;
 
 use std::process::ExitCode;
@@ -149,7 +151,12 @@ fn serve() -> ExitCode {
         println!("管理界面: http://{addr}/");
         println!("按 Ctrl+C 停止");
 
-        let state = web::WebState::new(cfg.clone(), pool, http);
+        let archive = cfg.env_dir.join("usage.jsonl");
+        let usage = std::sync::Arc::new(usage::UsageStore::new(Some(archive)));
+        let state = web::WebState::new(cfg.clone(), pool, http, usage);
+
+        // 后台定时任务：定期刷新额度并落盘，供 WebUI 与 /api/quota 使用
+        admin::spawn_quota_refresher(state.clone());
 
         let app = api::router(state);
         if let Err(e) = axum::serve(listener, app).await {

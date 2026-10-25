@@ -25,7 +25,7 @@
 <link rel="stylesheet" href="/vendor/components/empty.css">
 <link rel="stylesheet" href="/vendor/components/tag.css">
 <link rel="stylesheet" href="/vendor/components/tooltip.css">
-<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/app.css?v=2">
 </head>
 <body>
 <div class="mx-app">
@@ -76,6 +76,18 @@
       <span class="mx-nav-label">模型</span>
     </div>
     <div class="mx-sidebar-section" style="margin-top:auto">接入</div>
+    <div class="mx-nav-item" data-route="quota">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"/><path d="M12 6v12M9 9h5a2 2 0 0 1 0 4H9"/>
+      </svg>
+      <span class="mx-nav-label">额度</span>
+    </div>
+    <div class="mx-nav-item" data-route="usage">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 4-7"/>
+      </svg>
+      <span class="mx-nav-label">用量</span>
+    </div>
     <div class="mx-nav-item" data-route="connect">
       <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
@@ -227,6 +239,139 @@
       </div>
     </section>
 
+    <!-- 额度 -->
+    <section class="route" id="route-quota" hidden>
+      <div class="mx-page-head">
+        <h1 class="mx-page-title">额度</h1>
+        <p class="mx-page-sub">华为云 CodeArts 套餐 credit 与 token 消耗（数据来自官方统计接口）</p>
+      </div>
+
+      <div class="mx-stat-grid">
+        <div class="mx-stat" style="--mx-stat-accent: var(--mx-primary)">
+          <div class="mx-stat-label">套餐总额度</div>
+          <div class="mx-stat-value" id="qTotal">—</div>
+        </div>
+        <div class="mx-stat" style="--mx-stat-accent: var(--mx-green)">
+          <div class="mx-stat-label">剩余额度</div>
+          <div class="mx-stat-value" id="qRemain">—</div>
+        </div>
+        <div class="mx-stat" style="--mx-stat-accent: var(--mx-amber)">
+          <div class="mx-stat-label">已消耗</div>
+          <div class="mx-stat-value" id="qUsed">—</div>
+        </div>
+        <div class="mx-stat" style="--mx-stat-accent: var(--mx-blue)">
+          <div class="mx-stat-label">累计 Tokens</div>
+          <div class="mx-stat-value" id="qTokens">—</div>
+        </div>
+      </div>
+
+      <div class="mx-card" style="margin-top:16px">
+        <div class="mx-card-head">
+          <span class="mx-card-title">各账号额度</span>
+          <button class="mx-btn mx-btn-secondary mx-btn-sm" id="refreshQuotaBtn" data-ripple>刷新额度</button>
+        </div>
+        <div class="mx-card-body">
+          <div id="quotaAccounts"></div>
+        </div>
+      </div>
+
+      <div class="mx-card" style="margin-top:16px">
+        <div class="mx-card-head">
+          <span class="mx-card-title">华为云控制台</span>
+        </div>
+        <div class="mx-card-body">
+          <div id="quotaLinks"></div>
+          <p class="mx-helper">CodeArts 采用订阅套餐 + credit 计费，额度变动请以控制台为准。</p>
+        </div>
+      </div>
+
+      <div class="mx-card" style="margin-top:16px">
+        <div class="mx-card-head">
+          <span class="mx-card-title">关于自动签到</span>
+        </div>
+        <div class="mx-card-body">
+          <p class="helper-block">
+            CodeArts 侧没有「每日签到领取额度」的接口：官方额度来自套餐订阅，
+            <code>benefit/claim</code>、<code>welfare</code> 等路径在网关返回 404，
+            免费额度通道需账号在华为云侧开通（当前账号未开通）。
+            因此本面板不提供签到按钮，避免显示一个必然失败的操作。
+          </p>
+          <p class="helper-block">
+            本服务已自动为你做两件事：每 10 分钟刷新一次额度缓存，并将每次请求的
+            token 用量记录到本地 <code>usage.jsonl</code>，在「用量」页可查。
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 用量 -->
+    <section class="route" id="route-usage" hidden>
+      <div class="mx-page-head">
+        <h1 class="mx-page-title">用量</h1>
+        <p class="mx-page-sub">经本代理转发的请求统计，数据来自本地记录</p>
+      </div>
+
+      <div class="mx-stat-grid">
+        <div class="mx-stat" style="--mx-stat-accent: var(--mx-primary)">
+          <div class="mx-stat-label">请求数</div>
+          <div class="mx-stat-value" id="uRequests">0</div>
+        </div>
+        <div class="mx-stat" style="--mx-stat-accent: var(--mx-green)">
+          <div class="mx-stat-label">总 Tokens</div>
+          <div class="mx-stat-value" id="uTokens">0</div>
+        </div>
+        <div class="mx-stat" style="--mx-stat-accent: var(--mx-blue)">
+          <div class="mx-stat-label">平均耗时</div>
+          <div class="mx-stat-value" id="uLatency">0</div>
+        </div>
+        <div class="mx-stat" style="--mx-stat-accent: var(--mx-error)">
+          <div class="mx-stat-label">失败数</div>
+          <div class="mx-stat-value" id="uFailed">0</div>
+        </div>
+      </div>
+
+      <div class="mx-card" style="margin-top:16px">
+        <div class="mx-card-head">
+          <span class="mx-card-title">趋势</span>
+          <div class="range-picker" id="usageRange">
+            <button class="mx-btn mx-btn-sm mx-btn-secondary active" data-hours="24">24 小时</button>
+            <button class="mx-btn mx-btn-sm mx-btn-secondary" data-hours="168">7 天</button>
+            <button class="mx-btn mx-btn-sm mx-btn-secondary" data-hours="720">30 天</button>
+          </div>
+        </div>
+        <div class="mx-card-body">
+          <div id="usageChart" class="usage-chart"></div>
+        </div>
+      </div>
+
+      <div class="mx-card" style="margin-top:16px">
+        <div class="mx-card-head"><span class="mx-card-title">按模型</span></div>
+        <div class="mx-card-body">
+          <div class="mx-table-wrap">
+            <table class="mx-table">
+              <thead><tr><th>模型</th><th>请求</th><th>Tokens</th><th>平均耗时</th></tr></thead>
+              <tbody id="usageByModel"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="mx-card" style="margin-top:16px">
+        <div class="mx-card-head">
+          <span class="mx-card-title">最近请求</span>
+          <span class="mx-badge" id="usageRetained">0</span>
+        </div>
+        <div class="mx-card-body">
+          <div class="mx-table-wrap">
+            <table class="mx-table">
+              <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>Tokens</th><th>耗时</th><th>结果</th></tr></thead>
+              <tbody id="usageRecent"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- 客户端接入 -->
     <section class="route" id="route-connect" hidden>
       <div class="mx-page-head">
@@ -262,6 +407,8 @@
       <li class="mx-btm-item active" data-route="overview"><span>概览</span></li>
       <li class="mx-btm-item" data-route="accounts"><span>账号</span></li>
       <li class="mx-btm-item" data-route="models"><span>模型</span></li>
+      <li class="mx-btm-item" data-route="quota"><span>额度</span></li>
+      <li class="mx-btm-item" data-route="usage"><span>用量</span></li>
       <li class="mx-btm-item" data-route="connect"><span>接入</span></li>
     </ul>
   </nav>
@@ -321,6 +468,6 @@
     try { if (window.MxSmoothCorner && MxSmoothCorner.init) MxSmoothCorner.init(); } catch (_) {}
   })();
 </script>
-<script src="/app.js"></script>
+<script src="/app.js?v=2"></script>
 </body>
 </html>

@@ -12,6 +12,8 @@
     route: 'overview',
     editing: null,   // 正在编辑的账号 id；null 表示新增
     selectedModel: '',
+    usageHours: 24,
+    quota: null,
   };
 
   const $ = (sel) => document.querySelector(sel);
@@ -59,6 +61,8 @@
     overview: '概览',
     accounts: '账号',
     models: '模型',
+    quota: '额度',
+    usage: '用量',
     connect: '客户端接入',
   };
 
@@ -76,6 +80,8 @@
     });
     const crumb = $('#crumb');
     if (crumb) crumb.textContent = ROUTE_LABELS[route];
+    if (route === 'quota') loadQuota(false);
+    if (route === 'usage') loadUsage();
     // 桌面端顶栏的"刷新模型"只在概览/模型页有意义
     const refreshBtn = $('#refreshBtn');
     if (refreshBtn) refreshBtn.style.visibility = (route === 'connect') ? 'hidden' : 'visible';
@@ -421,6 +427,178 @@
     }
   }
 
+  // ── 额度 ────────────────────────────────────────────────
+  function fmtCredit(n) {
+    if (typeof n !== 'number' || !isFinite(n)) return '—';
+    return n.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+  }
+
+  async function loadQuota(forceRefresh) {
+    try {
+      if (forceRefresh) {
+        const btn = $('#refreshQuotaBtn');
+        if (btn) { btn.disabled = true; btn.textContent = '刷新中…'; }
+        await api('/api/quota/refresh', { method: 'POST' });
+        if (btn) { btn.disabled = false; btn.textContent = '刷新额度'; }
+        toast('success', '额度已刷新');
+      }
+      const data = await api('/api/quota');
+      state.quota = data;
+      renderQuota(data);
+    } catch (e) {
+      toast('error', '额度加载失败：' + e.message);
+    }
+  }
+
+  function renderQuota(data) {
+    const accounts = data.accounts || [];
+    const okAccounts = accounts.filter((a) => a.ok);
+
+    const total = okAccounts.reduce((sum, a) => sum + (a.total_amount || 0), 0);
+    const remain = okAccounts.reduce((sum, a) => sum + (a.total_remain || 0), 0);
+    const used = okAccounts.reduce((sum, a) => sum + (a.total_used || 0), 0);
+    const tokens = okAccounts.reduce((sum, a) => sum + (a.used_tokens || 0), 0);
+
+    const setText = (sel, text) => { const el = $(sel); if (el) el.textContent = text; };
+    setText('#qTotal', okAccounts.length ? fmtCredit(total) : '—');
+    setText('#qRemain', okAccounts.length ? fmtCredit(remain) : '—');
+    setText('#qUsed', okAccounts.length ? fmtCredit(used) : '—');
+    setText('#qTokens', okAccounts.length ? fmtNumber(tokens) : '—');
+
+    const box = $('#quotaAccounts');
+    if (box) {
+      if (!accounts.length) {
+        box.innerHTML = '<p class="helper-block">还没有账号。</p>';
+      } else {
+        box.innerHTML = accounts.map((a) => {
+          if (!a.ok) {
+            return '<div class="quota-account">' +
+              '<div class="quota-head"><span class="quota-name">' + escapeHtml(a.id) + '</span>' +
+              '<span class="mx-badge mx-badge-error">获取失败</span></div>' +
+              '<p class="helper-block" style="margin-top:8px">' + escapeHtml(a.error || '未知错误') + '</p>' +
+              '</div>';
+          }
+          const pct = a.total_amount > 0 ? (a.total_remain / a.total_amount) * 100 : 0;
+          const cls = pct < 10 ? 'danger' : (pct < 30 ? 'warn' : '');
+          const pkgs = (a.packages || []).map((p) => {
+            const ppct = p.amount > 0 ? (p.remain / p.amount) * 100 : 0;
+            return '<div class="pkg-row">' +
+              '<span class="pkg-name">' + escapeHtml(p.name) + '</span>' +
+              '<span>' + fmtCredit(p.remain) + ' / ' + fmtCredit(p.amount) + '</span>' +
+              '<span>' + ppct.toFixed(0) + '%</span></div>';
+          }).join('');
+          return '<div class="quota-account">' +
+            '<div class="quota-head">' +
+            '<span class="quota-name">' + escapeHtml(a.id) + '</span>' +
+            '<span class="quota-nums">剩余 <strong>' + fmtCredit(a.total_remain) + '</strong> / ' +
+            fmtCredit(a.total_amount) + ' · 已用 ' + fmtCredit(a.total_used) +
+            ' · ' + fmtNumber(a.used_tokens) + ' tokens</span>' +
+            '</div>' +
+            '<div class="credit-bar ' + cls + '"><span style="width:' +
+            Math.max(0, Math.min(100, pct)).toFixed(1) + '%"></span></div>' +
+            (pkgs ? '<div class="quota-pkgs">' + pkgs + '</div>' : '') +
+            '</div>';
+        }).join('');
+      }
+    }
+
+    const linksBox = $('#quotaLinks');
+    if (linksBox) {
+      linksBox.innerHTML = (data.links || []).map((l) =>
+        '<div class="link-row">' +
+          '<div class="link-main">' +
+            '<a class="link-title" href="' + escapeHtml(l.url) + '" target="_blank" rel="noopener noreferrer">' +
+              escapeHtml(l.name) + '</a>' +
+            '<span class="link-desc">' + escapeHtml(l.desc || '') + '</span>' +
+          '</div>' +
+          '<span class="mx-badge">打开</span>' +
+        '</div>').join('');
+    }
+  }
+
+  // ── 用量 ────────────────────────────────────────────────
+  async function loadUsage() {
+    try {
+      const hours = state.usageHours;
+      const bucket = hours <= 48 ? 'hour' : 'day';
+      const summary = await api('/api/usage?hours=' + hours + '&bucket=' + bucket);
+      const recent = await api('/api/usage/recent?hours=' + hours);
+      renderUsage(summary, recent);
+    } catch (e) {
+      toast('error', '用量加载失败：' + e.message);
+    }
+  }
+
+  function renderUsage(summary, recent) {
+    const s = summary.summary || {};
+    const setText = (sel, text) => { const el = $(sel); if (el) el.textContent = text; };
+    setText('#uRequests', fmtNumber(s.requests || 0));
+    setText('#uTokens', fmtNumber(s.total_tokens || 0));
+    setText('#uLatency', (s.avg_elapsed_ms || 0) + ' ms');
+    setText('#uFailed', fmtNumber(s.failed_requests || 0));
+
+    const chart = $('#usageChart');
+    if (chart) {
+      const series = summary.series || [];
+      if (!series.length) {
+        chart.innerHTML = '<div class="chart-empty">该时间段内没有请求记录</div>';
+      } else {
+        const max = Math.max.apply(null, series.map((x) => x.total_tokens || 0).concat([1]));
+        // 点位很少时不要 flex 拉伸（否则一根柱子会占满整行），
+        // 改为固定宽度左对齐；点位多时再均分宽度。
+        const dense = series.length >= 12;
+        const wrapStyle = dense ? '' : ' style="flex:0 0 56px"';
+        chart.innerHTML = series.map((x) => {
+          const h = Math.max(2, ((x.total_tokens || 0) / max) * 100);
+          const d = new Date((x.ts || 0) * 1000);
+          const label = d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit' });
+          const tip = label + ' · ' + fmtNumber(x.total_tokens || 0) + ' tokens · ' + (x.requests || 0) + ' 次';
+          return '<div class="bar-wrap"' + wrapStyle + ' data-tip="' + escapeHtml(tip) + '">' +
+                 '<div class="bar" style="height:' + h.toFixed(1) + '%"></div></div>';
+        }).join('');
+      }
+    }
+
+    const byModel = $('#usageByModel');
+    if (byModel) {
+      const rows = summary.by_model || [];
+      byModel.innerHTML = rows.length
+        ? rows.map((m) =>
+            '<tr>' +
+            '<td data-label="模型" class="mono">' + escapeHtml(m.model) + '</td>' +
+            '<td data-label="请求">' + fmtNumber(m.requests || 0) + '</td>' +
+            '<td data-label="Tokens">' + fmtNumber(m.total_tokens || 0) + '</td>' +
+            '<td data-label="平均耗时">' + (m.avg_elapsed_ms || 0) + ' ms</td>' +
+            '</tr>').join('')
+        : '<tr><td colspan="4" class="empty-cell">暂无数据</td></tr>';
+    }
+
+    const recentBody = $('#usageRecent');
+    if (recentBody) {
+      const records = recent.records || [];
+      recentBody.innerHTML = records.length
+        ? records.map((r) => {
+            const d = new Date((r.ts || 0) * 1000);
+            const time = d.toLocaleString('zh-CN', { hour12: false });
+            const result = r.ok
+              ? '<span class="mx-badge mx-badge-success">成功</span>'
+              : '<span class="mx-badge mx-badge-error">' + escapeHtml(r.error || '失败') + '</span>';
+            return '<tr>' +
+              '<td data-label="时间">' + escapeHtml(time) + '</td>' +
+              '<td data-label="模型" class="mono">' + escapeHtml(r.model) + '</td>' +
+              '<td data-label="账号" class="mono">' + escapeHtml(r.account || '—') + '</td>' +
+              '<td data-label="Tokens">' + fmtNumber(r.total_tokens || 0) + '</td>' +
+              '<td data-label="耗时">' + (r.elapsed_ms || 0) + ' ms</td>' +
+              '<td data-label="结果">' + result + '</td>' +
+              '</tr>';
+          }).join('')
+        : '<tr><td colspan="6" class="empty-cell">暂无请求记录</td></tr>';
+    }
+
+    const retained = $('#usageRetained');
+    if (retained) retained.textContent = '保留 ' + (recent.retained || 0) + ' 条';
+  }
+
   // ── 事件绑定 ────────────────────────────────────────────
   function bindEvents() {
     $$('.mx-nav-item, .mx-btm-item').forEach((el) => {
@@ -458,6 +636,22 @@
       const toggle = ev.target.closest('[data-toggle]');
       if (toggle) toggleAccount(toggle.dataset.toggle, toggle.checked);
     });
+
+    const quotaBtn = $('#refreshQuotaBtn');
+    if (quotaBtn) quotaBtn.addEventListener('click', () => loadQuota(true));
+
+    const rangePicker = $('#usageRange');
+    if (rangePicker) {
+      rangePicker.addEventListener('click', (ev) => {
+        const btn = ev.target.closest('[data-hours]');
+        if (!btn) return;
+        state.usageHours = Number(btn.dataset.hours) || 24;
+        rangePicker.querySelectorAll('[data-hours]').forEach((b) => {
+          b.classList.toggle('active', b === btn);
+        });
+        loadUsage();
+      });
+    }
 
     const filter = $('#modelFilter');
     if (filter) filter.addEventListener('input', renderModelRows);

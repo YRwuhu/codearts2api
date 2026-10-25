@@ -3,6 +3,7 @@
 //! 前端资源在编译期嵌入二进制（include_dir），因此单个 exe 即可完整运行，
 //! 不依赖部署目录里的 static/ 文件夹。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::http::{header, StatusCode, Uri};
@@ -14,6 +15,8 @@ use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::models::Pool;
+use crate::quota::Quota;
+use crate::usage::UsageStore;
 
 static ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/static");
 
@@ -22,14 +25,24 @@ pub struct WebState {
     pub config: Arc<RwLock<Config>>,
     pub pool: Arc<RwLock<Pool>>,
     pub http: reqwest::Client,
+    pub usage: Arc<UsageStore>,
+    /// 最近一次额度查询结果（按账号缓存），由定时任务或 WebUI 触发更新。
+    pub quota: Arc<RwLock<HashMap<String, Quota>>>,
 }
 
 impl WebState {
-    pub fn new(config: Config, pool: Pool, http: reqwest::Client) -> Self {
+    pub fn new(
+        config: Config,
+        pool: Pool,
+        http: reqwest::Client,
+        usage: Arc<UsageStore>,
+    ) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
             pool: Arc::new(RwLock::new(pool)),
             http,
+            usage,
+            quota: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -101,5 +114,7 @@ pub fn router() -> Router<WebState> {
         .route("/", get(static_handler))
         .route("/accounts", get(static_handler))
         .route("/models", get(static_handler))
+        .route("/quota", get(static_handler))
+        .route("/usage", get(static_handler))
         .fallback(static_handler)
 }

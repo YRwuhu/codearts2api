@@ -126,3 +126,154 @@ td.empty-cell {
 @media (min-width: 1440px) {
   .mx-app { grid-template-columns: 260px minmax(0, 1fr); }
 }
+
+/* ── 额度页 ── */
+.helper-block {
+  margin: 0 0 10px;
+  color: var(--mx-t2);
+  font-size: 13px;
+  line-height: 1.85;
+}
+.helper-block:last-child { margin-bottom: 0; }
+.helper-block code {
+  font-family: var(--mx-mono);
+  font-size: 12px;
+  background: var(--mx-s3);
+  padding: 1px 5px;
+  border-radius: var(--mx-r-xs);
+}
+
+/* 华为云链接列表 */
+.link-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--mx-divider);
+}
+.link-row:last-child { border-bottom: none; }
+.link-main { min-width: 0; }
+.link-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--mx-text);
+  text-decoration: none;
+}
+.link-title:hover { color: var(--mx-primary); }
+.link-desc {
+  display: block;
+  margin-top: 3px;
+  font-size: 12px;
+  color: var(--mx-t3);
+}
+
+/* 额度进度条 */
+.credit-bar {
+  height: 6px;
+  border-radius: var(--mx-r-pill);
+  background: var(--mx-s3);
+  overflow: hidden;
+  margin-top: 8px;
+}
+.credit-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: var(--mx-r-pill);
+  background: var(--mx-green);
+  transition: width var(--mx-d3) var(--mx-ease);
+}
+.credit-bar.warn > span { background: var(--mx-amber); }
+.credit-bar.danger > span { background: var(--mx-error); }
+
+.quota-account {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--mx-divider);
+}
+.quota-account:last-child { border-bottom: none; }
+.quota-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.quota-name { font-family: var(--mx-mono); font-size: 14px; }
+.quota-nums { font-size: 13px; color: var(--mx-t2); }
+.quota-pkgs {
+  margin-top: 10px;
+  display: grid;
+  gap: 8px;
+}
+.pkg-row {
+  display: grid;
+  grid-template-columns: 84px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--mx-t2);
+}
+.pkg-name { color: var(--mx-t3); }
+
+/* ── 用量页 ── */
+.range-picker { display: flex; gap: 6px; }
+.range-picker .mx-btn.active {
+  background: var(--mx-primary);
+  color: #fff;
+}
+
+.usage-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 160px;
+  padding-top: 8px;
+}
+.usage-chart .bar-wrap {
+  flex: 1 1 0;
+  min-width: 2px;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  position: relative;
+}
+.usage-chart .bar {
+  width: 100%;
+  min-height: 2px;
+  border-radius: 2px 2px 0 0;
+  background: var(--mx-primary);
+  opacity: 0.85;
+  transition: opacity var(--mx-d2) var(--mx-ease);
+}
+.usage-chart .bar-wrap:hover .bar { opacity: 1; }
+.usage-chart .bar-wrap:hover::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  background: var(--mx-s4);
+  color: var(--mx-text);
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: var(--mx-r-xs);
+  z-index: 2;
+  box-shadow: var(--mx-sh2);
+}
+.chart-empty {
+  height: 160px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--mx-t3);
+  font-size: 13px;
+}
+
+/* 数据点很少时（例如刚启动只有一个小时桶），避免柱子被拉成整屏色块：
+   给柱宽设上限并左对齐，保持条形图的观感。 */
+.usage-chart .bar-wrap {
+  max-width: 56px;
+  justify-content: flex-start;
+}
+.usage-chart { gap: 4px; }
