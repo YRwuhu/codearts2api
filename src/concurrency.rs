@@ -57,32 +57,17 @@ impl AccountGate {
         }
     }
 
-    /// 剩余冷却秒数。
-    pub async fn cooldown_remaining(&self) -> u64 {
-        let st = self.state.read().await;
-        match st.cooldown_until {
-            Some(until) => {
-                let now = Instant::now();
-                if now >= until {
-                    0
-                } else {
-                    (until - now).as_secs()
-                }
-            }
-            None => 0,
-        }
-    }
-
     /// 获取一个并发槽位（必要时排队等待）。
+    ///
+    /// 冷却期内会**等待冷却结束**再取槽位，而不是立刻失败——只有一个账号时
+    /// 立即失败等于把请求拒掉。只有等待超时（由调用方控制）才返回错误。
     ///
     /// 返回 guard 时 in_flight 已加 1；drop 时自动释放。
     pub async fn acquire(&self) -> Result<OwnedPermitGuard, String> {
-        // 冷却期内直接判定不可用，让调用方去换号
-        if !self.available().await {
-            return Err(format!(
-                "账号冷却中（剩余 {} 秒）",
-                self.cooldown_remaining().await
-            ));
+        if let Some(secs) = self.cooldown_secs_if_any().await {
+            if secs > 0 {
+                tokio::time::sleep(Duration::from_secs(secs.min(30))).await;
+            }
         }
 
         let permit = self
@@ -126,6 +111,19 @@ impl AccountGate {
             let secs = (10u64 * st.consecutive_failures as u64).min(300);
             st.cooldown_until = Some(Instant::now() + Duration::from_secs(secs));
         }
+    }
+
+    /// 若在冷却中返回剩余秒数。
+    pub async fn cooldown_secs_if_any(&self) -> Option<u64> {
+        let st = self.state.read().await;
+        st.cooldown_until.map(|until| {
+            let now = Instant::now();
+            if now >= until {
+                0
+            } else {
+                (until - now).as_secs() + 1
+            }
+        })
     }
 
     /// 快照，供 WebUI 展示。
@@ -231,6 +229,27 @@ impl SessionPins {
     }
 }
 
+/// 把本地会话键转成稳定的上游 chat_id。
+///
+/// 上游用它识别"这是同一个会话"，从而复用同一个并发槽位而不是新开一个。
+pub fn upstream_chat_id(session_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"codearts-chat:");
+    hasher.update(session_key.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!("chat-{}", &digest[..24])
+}
+
+/// 由 chat_id 派生稳定的 Session-Id（prompt cache 亲和）。
+pub fn upstream_session_id(chat_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"codearts-session:");
+    hasher.update(chat_id.as_bytes());
+    hex::encode(&hasher.finalize()[..16])
+}
+
 /// 从 OpenAI 请求体里提取会话键。
 ///
 /// 优先用客户端显式传入的标识（`user` 字段、`X-Codearts-Chat-Id` 头），
@@ -302,7 +321,7 @@ mod tests {
         assert!(gate.available().await);
         gate.note_failure("TM.00001041 并发会话数已达上限").await;
         assert!(!gate.available().await);
-        assert!(gate.cooldown_remaining().await > 0);
+        assert!(gate.cooldown_secs_if_any().await.unwrap_or(0) > 0);
     }
 
     #[tokio::test]
@@ -334,6 +353,20 @@ mod tests {
             {"role":"user","content":"换成降序"}
         ]});
         assert_eq!(session_key(&a, None), session_key(&b, None));
+    }
+
+    #[test]
+    fn upstream_ids_are_stable_and_distinct() {
+        let a = upstream_chat_id("msg:abc");
+        let b = upstream_chat_id("msg:abc");
+        let c = upstream_chat_id("msg:def");
+        assert_eq!(a, b, "同一会话键必须得到同一 chat_id");
+        assert_ne!(a, c, "不同会话必须得到不同 chat_id");
+        assert!(a.starts_with("chat-"));
+
+        let sid = upstream_session_id(&a);
+        assert_eq!(sid.len(), 32); // 16 字节 hex
+        assert_eq!(sid, upstream_session_id(&a));
     }
 
     #[test]

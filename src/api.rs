@@ -172,19 +172,32 @@ async fn chat_completions(
         }
     }
 
-    let started = std::time::Instant::now();
-    let mut candidates = pool.accounts_for(&model).await;
-    if candidates.is_empty() {
-        return error_response(StatusCode::NOT_FOUND, format!("model '{model}' 无可用账号"));
-    }
-
-    // 会话钉号：同一对话固定到同一账号，避免上游把每轮都当成新会话占用槽位。
+    // 会话键：优先请求头，其次请求体 user 字段，最后首条 user 消息哈希。
     let header_hint = headers
         .get("x-codearts-chat-id")
         .or_else(|| headers.get("x-conversation-id"))
         .and_then(|v| v.to_str().ok());
     let sess_key = crate::concurrency::session_key(&req_json, header_hint);
 
+    // 上游按「会话」计并发：同一对话必须复用同一个 chat_id，否则每轮都被当成
+    // 新会话，3 个槽位很快耗尽（TM.00001041）。这里把本地会话键传给上游。
+    let upstream_chat_id = sess_key
+        .as_ref()
+        .map(|k| crate::concurrency::upstream_chat_id(k));
+    if let Some(cid) = upstream_chat_id.as_ref() {
+        if let Some(obj) = prepared.as_object_mut() {
+            obj.insert("chat_id".to_string(), json!(cid));
+            obj.insert("prompt_cache_key".to_string(), json!(cid));
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let mut candidates = pool.accounts_for(&model).await;
+    if candidates.is_empty() {
+        return error_response(StatusCode::NOT_FOUND, format!("model '{model}' 无可用账号"));
+    }
+
+    // 会话钉号：同一对话固定到同一账号。
     if let Some(key) = sess_key.as_ref() {
         if let Some(pinned) = state.pins.get(key).await {
             // 把钉住的账号排到最前；若它已不可用则释放钉号重新选
@@ -198,24 +211,18 @@ async fn chat_completions(
         }
     }
 
-    // 过滤掉冷却中的账号（除非全都在冷却）
-    let usable: Vec<_> = {
-        let mut v = Vec::new();
+    // 有多个账号时，优先挑不在冷却中的；单账号则直接等待（acquire 内处理）。
+    if candidates.len() > 1 {
+        let mut ready = Vec::new();
         for c in &candidates {
             let gate = state.gate(c.account_id(), upstream_concurrency_limit()).await;
             if gate.available().await {
-                v.push(c.clone());
+                ready.push(c.clone());
             }
         }
-        if v.is_empty() {
-            candidates.clone()
-        } else {
-            v
+        if !ready.is_empty() {
+            candidates = ready;
         }
-    };
-    let candidates = usable;
-    if candidates.is_empty() {
-        return error_response(StatusCode::NOT_FOUND, format!("model '{model}' 无可用账号"));
     }
 
     // 依次尝试各账号；只有"账号级"错误才继续下一个。
@@ -234,7 +241,8 @@ async fn chat_completions(
         {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => {
-                println!("[{}] {model}: 跳过（{e}）", catalog.account_id());
+                // 只有真的无法获取槽位才记录，避免并发时刷屏
+                eprintln!("[{}] {model}: {e}", catalog.account_id());
                 last = Some(error_response(StatusCode::SERVICE_UNAVAILABLE, e));
                 continue;
             }
@@ -258,6 +266,7 @@ async fn chat_completions(
         let headers = catalog.sign_headers(&body_bytes, benefit, &model).await;
 
         let mut request = state.http.post(TARGET).body(body_bytes);
+        // Chat-Id / Session-Id 不参与签名（在签名头之后追加）
         for (k, v) in headers {
             if let (Ok(name), Ok(value)) = (
                 header::HeaderName::from_bytes(k.as_bytes()),
@@ -265,6 +274,11 @@ async fn chat_completions(
             ) {
                 request = request.header(name, value);
             }
+        }
+        if let Some(cid) = upstream_chat_id.as_ref() {
+            request = request
+                .header("Chat-Id", cid)
+                .header("Session-Id", crate::concurrency::upstream_session_id(cid));
         }
 
         let upstream = match request.send().await {
