@@ -1,0 +1,106 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Tree Component
+   ═══════════════════════════════════════════ */
+
+.mx-tree{
+  font-size:13px;
+}
+
+/* Node */
+.mx-tree-node{
+  user-select:none;
+}
+
+/* Row */
+.mx-tree-row{
+  display:flex;align-items:center;gap:4px;
+  padding:6px 8px;border-radius:var(--mx-r-xs);
+  cursor:pointer;
+  transition:all var(--mx-d1) var(--mx-ease);
+}
+.mx-tree-row:hover{background:var(--mx-s-hover)}
+.mx-tree-row:active{background:var(--mx-s-active)}
+.mx-tree-row.selected{
+  background:var(--mx-primary-glow);color:var(--mx-primary);
+}
+
+/* Indent */
+.mx-tree-indent{
+  width:20px;flex-shrink:0;
+}
+
+/* Expand toggle */
+.mx-tree-toggle{
+  width:20px;height:20px;
+  display:flex;align-items:center;justify-content:center;
+  border-radius:var(--mx-r-xs);
+  color:var(--mx-t3);flex-shrink:0;
+  transition:all var(--mx-d1);
+}
+.mx-tree-toggle:hover{background:var(--mx-s-hover);color:var(--mx-text)}
+.mx-tree-toggle svg{
+  transition:transform var(--mx-d2) var(--mx-spring);
+}
+.mx-tree-node.open > .mx-tree-row .mx-tree-toggle svg{
+  transform:rotate(90deg);
+}
+
+/* Leaf — no toggle */
+.mx-tree-leaf .mx-tree-toggle{visibility:hidden}
+
+/* Icon */
+.mx-tree-icon{
+  width:18px;height:18px;
+  display:flex;align-items:center;justify-content:center;
+  color:var(--mx-t2);flex-shrink:0;
+}
+
+/* Label */
+.mx-tree-label{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Actions (right side) */
+.mx-tree-actions{
+  display:flex;align-items:center;gap:2px;
+  opacity:0;transition:opacity var(--mx-d1);
+}
+.mx-tree-row:hover .mx-tree-actions{opacity:1}
+.mx-tree-action{
+  width:22px;height:22px;
+  display:flex;align-items:center;justify-content:center;
+  border-radius:var(--mx-r-xs);
+  cursor:pointer;color:var(--mx-t3);
+  transition:all var(--mx-d1);
+}
+.mx-tree-action:hover{background:var(--mx-s-hover);color:var(--mx-text)}
+
+/* Children container */
+.mx-tree-children{
+  overflow:hidden;
+  max-height:0;
+  transition:max-height var(--mx-d3) var(--mx-ease);
+}
+.mx-tree-node.open > .mx-tree-children{
+  max-height:2000px;
+}
+
+/* Checkbox */
+.mx-tree-checkbox{
+  width:16px;height:16px;flex-shrink:0;
+}
+
+/* Drag indicator */
+.mx-tree-row.dragging{opacity:0.5}
+.mx-tree-row.drag-over{
+  border-top:2px solid var(--mx-primary);
+}
+
+/* Compact */
+.mx-tree-compact .mx-tree-row{padding:4px 6px}
+.mx-tree-compact .mx-tree-toggle{width:16px;height:16px}
+
+/* Mobile */
+@media(max-width:767px){
+  .mx-tree-row{padding:8px 8px;min-height:44px}
+  .mx-tree-toggle{width:24px;height:24px}
+  .mx-tree-actions{opacity:1}
+}

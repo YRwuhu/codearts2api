@@ -1,0 +1,212 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Navigation Components
+   TopBar + Sidebar + BottomNav
+   ═══════════════════════════════════════════ */
+
+/* ── TopBar — Miuix frosted glass ── */
+.mx-topbar{
+  position:sticky;top:0;z-index:100;
+  display:flex;align-items:center;justify-content:space-between;
+  height:52px;padding:0 16px;
+  padding-top:var(--mx-safe-t);
+  border-bottom:1px solid var(--mx-divider);
+  backdrop-filter:blur(24px) saturate(1.8);
+  -webkit-backdrop-filter:blur(24px) saturate(1.8);
+  flex-shrink:0;
+}
+[data-theme="dark"] .mx-topbar{background:rgba(0,0,0,0.6)}
+[data-theme="light"] .mx-topbar{background:rgba(247,247,247,0.65)}
+
+.mx-topbar-left{display:flex;align-items:center;gap:10px}
+.mx-topbar-right{display:flex;align-items:center;gap:4px}
+
+/* Logo */
+.mx-logo{
+  display:flex;align-items:center;gap:10px;
+}
+.mx-logo-icon{
+  width:32px;height:32px;
+  background:linear-gradient(135deg,var(--mx-primary),var(--mx-accent));
+  border-radius:10px;
+  display:flex;align-items:center;justify-content:center;
+  transition:transform var(--mx-d2) var(--mx-ease);
+  box-shadow:0 2px 8px rgba(76,139,245,0.2);
+  flex-shrink:0;
+}
+.mx-logo-icon:active{transform:scale(0.92)}
+.mx-logo-icon svg{color:#fff}
+.mx-logo-text{font-size:16px;font-weight:700}
+
+/* ── Sidebar ── */
+.mx-sidebar{
+  width:240px;flex-shrink:0;
+  background:var(--mx-s1);
+  border-right:1px solid var(--mx-divider);
+  padding:12px;
+  overflow-y:auto;scrollbar-width:none;
+}
+.mx-sidebar::-webkit-scrollbar{display:none}
+
+.mx-sidebar-section{
+  font-size:11px;font-weight:700;color:var(--mx-t3);
+  text-transform:uppercase;letter-spacing:0.06em;
+  padding:0 10px;margin:16px 0 4px;
+}
+.mx-sidebar-section:first-child{margin-top:4px}
+
+.mx-nav-item{
+  display:flex;align-items:center;gap:10px;
+  padding:8px 10px;border-radius:var(--mx-r-sm);
+  cursor:pointer;color:var(--mx-t2);
+  font-size:13px;font-weight:500;
+  transition:all var(--mx-d1) var(--mx-ease);
+  position:relative;
+  -webkit-tap-highlight-color:transparent;
+}
+.mx-nav-item::before{
+  content:'';position:absolute;left:0;top:50%;
+  width:3px;height:0;
+  background:var(--mx-primary);
+  border-radius:0 3px 3px 0;
+  transform:translateY(-50%);
+  transition:height var(--mx-d2) var(--mx-spring);
+}
+.mx-nav-item:hover{background:var(--mx-s-hover);color:var(--mx-text)}
+.mx-nav-item.active{background:var(--mx-primary-glow);color:var(--mx-primary)}
+.mx-nav-item.active::before{height:18px}
+.mx-nav-item:active{transform:scale(0.97)}
+.mx-nav-item svg{flex-shrink:0}
+.mx-nav-label{flex:1}
+
+.mx-sidebar-bottom{
+  margin-top:auto;padding-top:12px;
+  border-top:1px solid var(--mx-divider);
+}
+
+/* ── BottomNav — mobile only ── */
+.mx-bottom-nav{
+  position:fixed;bottom:0;left:0;right:0;z-index:200;
+  border-top:1px solid var(--mx-divider);
+  backdrop-filter:blur(24px) saturate(1.8);
+  -webkit-backdrop-filter:blur(24px) saturate(1.8);
+  padding:4px 0;
+  padding-bottom:calc(4px + var(--mx-safe-b));
+}
+[data-theme="dark"] .mx-bottom-nav{background:rgba(0,0,0,0.6)}
+[data-theme="light"] .mx-bottom-nav{background:rgba(247,247,247,0.65)}
+
+.mx-bottom-nav-items{
+  display:flex;justify-content:space-around;
+}
+
+.mx-btm-item{
+  display:flex;flex-direction:column;align-items:center;gap:2px;
+  padding:6px 16px;border-radius:var(--mx-r-sm);
+  cursor:pointer;color:var(--mx-t3);
+  transition:all var(--mx-d2) var(--mx-spring);
+  -webkit-tap-highlight-color:transparent;
+  position:relative;
+}
+.mx-btm-item.active{color:var(--mx-primary)}
+.mx-btm-item.active::before{
+  content:'';position:absolute;top:2px;left:50%;
+  width:5px;height:5px;
+  background:var(--mx-primary);
+  border-radius:50%;transform:translateX(-50%);
+  animation:mx-dot-in var(--mx-d2) var(--mx-spring);
+}
+.mx-btm-item span{font-size:10px;font-weight:600}
+.mx-btm-item:active{transform:scale(0.88)}
+
+@keyframes mx-dot-in{
+  from{transform:translateX(-50%) scale(0);opacity:0}
+  to{transform:translateX(-50%) scale(1);opacity:1}
+}
+
+/* ── Breadcrumb ── */
+.mx-breadcrumb{
+  display:flex;align-items:center;gap:8px;
+  font-size:13px;color:var(--mx-t3);
+}
+.mx-breadcrumb span{transition:color var(--mx-d1)}
+.mx-breadcrumb span:last-child{color:var(--mx-t2);font-weight:500}
+.mx-breadcrumb .mx-breadcrumb-sep{color:var(--mx-t3);font-size:11px}
+
+/* ── Pill Group — density/theme toggle ── */
+.mx-pill-group{
+  display:inline-flex;
+  background:var(--mx-s3);
+  border-radius:var(--mx-r-pill);
+  padding:3px;gap:2px;
+}
+.mx-pill-group button{
+  padding:5px 14px;border-radius:var(--mx-r-pill);
+  font-size:12px;font-weight:600;cursor:pointer;
+  color:var(--mx-t3);
+  transition:all var(--mx-d2) var(--mx-ease);
+}
+.mx-pill-group button.active{
+  background:var(--mx-primary);color:#fff;
+  box-shadow:0 2px 8px rgba(76,139,245,0.25);
+}
+.mx-pill-group button:hover:not(.active){color:var(--mx-text)}
+
+/* ── Avatar ── */
+.mx-avatar{
+  width:32px;height:32px;border-radius:50%;
+  background:linear-gradient(135deg,var(--mx-primary),var(--mx-accent));
+  display:flex;align-items:center;justify-content:center;
+  font-size:13px;font-weight:700;color:#fff;
+  cursor:pointer;flex-shrink:0;
+  transition:all var(--mx-d2) var(--mx-ease);
+  box-shadow:0 0 0 0 var(--mx-primary-glow);
+}
+.mx-avatar:hover{box-shadow:0 0 0 4px var(--mx-primary-glow)}
+.mx-avatar:active{transform:scale(0.9)}
+
+/* ── Notification Dot ── */
+.mx-notify{
+  position:relative;
+}
+.mx-notify .mx-notify-dot{
+  position:absolute;top:7px;right:7px;
+  width:7px;height:7px;
+  background:var(--mx-red);
+  border-radius:50%;
+  border:2px solid var(--mx-s1);
+  animation:mx-pulse 2s infinite;
+}
+
+/* ═══ MOBILE ADAPTATIONS ═══ */
+@media(max-width:767px){
+  /* TopBar 更紧凑 */
+  .mx-topbar{height:48px;padding:0 12px}
+  .mx-logo-icon{width:28px;height:28px;border-radius:8px}
+  .mx-logo-text{font-size:14px}
+  .mx-avatar{width:28px;height:28px;font-size:12px}
+
+  /* BottomNav 加大触控区 */
+  .mx-btm-item{padding:8px 16px;min-width:56px}
+  .mx-btm-item span{font-size:11px}
+  .mx-btm-item svg{width:24px;height:24px}
+
+  /* Sidebar section */
+  .mx-sidebar-section{font-size:10px}
+  .mx-nav-item{padding:11px 10px;min-height:44px}
+
+  /* Breadcrumb 滚动 */
+  .mx-breadcrumb{overflow-x:auto;white-space:nowrap;-webkit-overflow-scrolling:touch}
+
+  /* Pill group */
+  .mx-pill-group button{padding:6px 12px;font-size:11px}
+
+  /* Notification dot */
+  .mx-notify .mx-notify-dot{top:5px;right:5px;width:6px;height:6px}
+}
+
+/* ═══ TABLET ADAPTATIONS ═══ */
+@media(min-width:768px) and (max-width:1023px){
+  .mx-topbar{height:50px}
+  .mx-bottom-nav{padding:6px 0}
+  .mx-btm-item span{font-size:10px}
+}

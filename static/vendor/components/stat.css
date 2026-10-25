@@ -1,0 +1,79 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Stat Card Component
+   ═══════════════════════════════════════════ */
+
+.mx-stat{
+  background:var(--mx-s2);
+  border-radius:var(--mx-r);
+  padding:16px;
+  position:relative;overflow:hidden;
+  cursor:pointer;
+  box-shadow:var(--mx-sh1);
+  transition:all var(--mx-d3) var(--mx-ease);
+}
+.mx-stat:hover{transition-duration:var(--mx-d2)}
+.mx-stat:active{transform:scale(0.97)}
+
+/* 顶部 accent 线 */
+.mx-stat::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:2px;
+  background:var(--mx-stat-accent,var(--mx-primary));
+  opacity:0;transition:opacity var(--mx-d2);
+}
+.mx-stat:hover::before{opacity:1}
+
+/* 右上角柔光晕 */
+.mx-stat::after{
+  content:'';position:absolute;top:-40%;right:-20%;
+  width:100px;height:100px;
+  background:var(--mx-stat-accent,var(--mx-primary));
+  border-radius:50%;opacity:0.04;
+  transition:opacity var(--mx-d2);
+}
+.mx-stat:hover::after{opacity:0.08}
+
+.mx-stat-label{
+  font-size:11px;font-weight:600;color:var(--mx-t3);
+  text-transform:uppercase;letter-spacing:0.06em;
+  margin-bottom:10px;display:flex;align-items:center;gap:8px;
+}
+
+.mx-stat-icon{
+  width:26px;height:26px;border-radius:var(--mx-r-xs);
+  display:flex;align-items:center;justify-content:center;
+  transition:transform var(--mx-d2) var(--mx-ease);
+}
+.mx-stat:hover .mx-stat-icon{transform:scale(1.12) rotate(-3deg)}
+
+.mx-stat-value{
+  font-size:28px;font-weight:800;
+  letter-spacing:-0.03em;
+  font-variant-numeric:tabular-nums;
+  line-height:1;margin-bottom:8px;
+}
+
+.mx-stat-delta{
+  display:inline-flex;align-items:center;gap:4px;
+  font-size:11px;font-weight:600;
+  padding:2px 8px;border-radius:var(--mx-r-pill);
+}
+.mx-stat-delta.up{background:rgba(52,211,153,0.1);color:var(--mx-green)}
+.mx-stat-delta.down{background:rgba(248,113,113,0.1);color:var(--mx-red)}
+
+/* Grid layout */
+.mx-stat-grid{
+  display:grid;grid-template-columns:repeat(2,1fr);gap:12px;
+}
+@media(min-width:768px){
+  .mx-stat-grid{grid-template-columns:repeat(4,1fr)}
+}
+
+/* Mobile */
+@media(max-width:767px){
+  .mx-stat{padding:14px}
+  .mx-stat-value{font-size:22px}
+  .mx-stat-icon{width:24px;height:24px}
+  .mx-stat-icon svg{width:12px;height:12px}
+  .mx-stat-label{font-size:10px}
+  .mx-stat-delta{font-size:10px;padding:2px 6px}
+}

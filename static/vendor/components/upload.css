@@ -1,0 +1,114 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Upload / Dropzone Component
+   ═══════════════════════════════════════════ */
+
+/* Dropzone */
+.mx-upload{
+  border:2px dashed var(--mx-border);
+  border-radius:var(--mx-r);
+  padding:32px 24px;
+  text-align:center;
+  cursor:pointer;
+  transition:all var(--mx-d2) var(--mx-ease);
+  background:var(--mx-s2);
+}
+.mx-upload:hover{
+  border-color:var(--mx-primary);
+  background:var(--mx-primary-glow);
+}
+.mx-upload.dragover{
+  border-color:var(--mx-primary);
+  background:var(--mx-primary-glow);
+  transform:scale(1.01);
+}
+
+.mx-upload-icon{
+  width:40px;height:40px;margin:0 auto 12px;
+  border-radius:var(--mx-r-sm);
+  background:var(--mx-primary-glow);
+  display:flex;align-items:center;justify-content:center;
+  color:var(--mx-primary);
+}
+.mx-upload-text{font-size:14px;font-weight:600;color:var(--mx-text);margin-bottom:4px}
+.mx-upload-hint{font-size:12px;color:var(--mx-t3)}
+.mx-upload-hint b{color:var(--mx-primary);cursor:pointer}
+
+/* Compact variant */
+.mx-upload-compact{
+  display:flex;align-items:center;gap:12px;
+  padding:14px 16px;text-align:left;
+}
+.mx-upload-compact .mx-upload-icon{margin:0}
+
+/* File list */
+.mx-upload-files{
+  display:flex;flex-direction:column;gap:8px;
+  margin-top:12px;
+}
+.mx-upload-file{
+  display:flex;align-items:center;gap:10px;
+  padding:10px 12px;
+  background:var(--mx-s3);
+  border-radius:var(--mx-r-sm);
+  transition:all var(--mx-d1);
+}
+.mx-upload-file:hover{background:var(--mx-s4)}
+
+.mx-upload-file-icon{
+  width:32px;height:32px;
+  border-radius:var(--mx-r-xs);
+  background:var(--mx-primary-glow);
+  display:flex;align-items:center;justify-content:center;
+  color:var(--mx-primary);flex-shrink:0;
+}
+.mx-upload-file-info{flex:1;min-width:0}
+.mx-upload-file-name{
+  font-size:13px;font-weight:500;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.mx-upload-file-size{font-size:11px;color:var(--mx-t3)}
+
+/* File progress */
+.mx-upload-file-progress{
+  height:2px;background:var(--mx-s3);
+  border-radius:1px;margin-top:6px;overflow:hidden;
+}
+.mx-upload-file-progress-bar{
+  height:100%;background:var(--mx-primary);
+  border-radius:1px;
+  transition:width var(--mx-d2) var(--mx-ease);
+}
+
+/* File status */
+.mx-upload-file-status{
+  font-size:11px;font-weight:600;
+  flex-shrink:0;
+}
+.mx-upload-file-status.success{color:var(--mx-green)}
+.mx-upload-file-status.error{color:var(--mx-red)}
+.mx-upload-file-status.uploading{color:var(--mx-primary)}
+
+/* Remove button */
+.mx-upload-file-remove{
+  width:24px;height:24px;
+  display:flex;align-items:center;justify-content:center;
+  border-radius:var(--mx-r-xs);
+  cursor:pointer;color:var(--mx-t3);
+  transition:all var(--mx-d1);
+  flex-shrink:0;
+}
+.mx-upload-file-remove:hover{background:rgba(248,113,113,0.1);color:var(--mx-red)}
+
+/* Disabled */
+.mx-upload.disabled{
+  opacity:0.4;cursor:not-allowed;pointer-events:none;
+}
+
+/* Mobile */
+@media(max-width:767px){
+  .mx-upload{padding:20px 16px}
+  .mx-upload-icon{width:36px;height:36px}
+  .mx-upload-text{font-size:13px}
+  .mx-upload-file{padding:8px 10px}
+  .mx-upload-file-name{font-size:12px}
+}

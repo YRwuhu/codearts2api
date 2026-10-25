@@ -1,0 +1,128 @@
+/* CodeArts2API 控制台——只补充 miuix 未覆盖的少量布局细节，
+   颜色与圆角一律走 miuix 设计令牌，不硬编码。 */
+
+.desktop-topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.route[hidden] { display: none; }
+
+/* 键值行（接入页） */
+.kv {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--mx-divider);
+}
+.kv:last-of-type { border-bottom: none; }
+.kv-k {
+  flex: 0 0 92px;
+  color: var(--mx-t3);
+  font-size: 13px;
+}
+.kv-v {
+  flex: 1 1 auto;
+  font-family: var(--mx-mono);
+  font-size: 13px;
+  color: var(--mx-text);
+  word-break: break-all;
+  user-select: all;
+}
+
+/* 说明列表 */
+.notes {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--mx-t2);
+  font-size: 13px;
+  line-height: 1.9;
+}
+.notes code {
+  font-family: var(--mx-mono);
+  font-size: 12px;
+  background: var(--mx-s3);
+  padding: 1px 5px;
+  border-radius: var(--mx-r-xs);
+}
+
+/* 表格里的操作按钮组 */
+.row-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* 账号名用等宽字体，便于对齐阅读 */
+.mono { font-family: var(--mx-mono); font-size: 13px; }
+
+/* 空状态在表格里占满一行 */
+td.empty-cell {
+  text-align: center;
+  color: var(--mx-t3);
+  padding: 28px 0;
+}
+
+/* 请求测试的响应区默认隐藏在 style 里，这里只处理滚动条观感 */
+#testPre::-webkit-scrollbar { width: 8px; height: 8px; }
+#testPre::-webkit-scrollbar-thumb {
+  background: var(--mx-s4);
+  border-radius: var(--mx-r-pill);
+}
+
+/* 手机端：统计卡单列、键值行纵向排列 */
+@media (max-width: 767px) {
+  .kv { flex-direction: column; gap: 4px; }
+  .kv-k { flex: none; }
+  .desktop-topbar-right { display: none; }
+}
+
+/* 表格在窄视口下不能被 .mx-body 的 overflow-x:hidden 裁掉：
+   让外层卡片允许横向滚动，并给表格一个可读的最小宽度。
+   miuix 的 .mx-table-wrap 本身是 overflow-x:auto，但父级
+   .mx-card-body 有 padding，需要显式允许收缩。 */
+.mx-card-body { min-width: 0; }
+.mx-table-wrap { min-width: 0; }
+.mx-table { min-width: 620px; }
+
+
+/* ── 修正 miuix 桌面端布局 ──
+   miuix 的 .mx-app 在桌面端是 flex-direction:row（侧边栏与内容并排），
+   但 .mx-desktop-shell 同时带 width:100%，会与 <main> 争抢同一行宽度，
+   把主内容压到几十像素。
+   实际需求是：侧边栏在左，顶栏 + 主内容在右侧纵向堆叠。
+   用 grid 显式定义两列两行即可。 */
+@media (min-width: 1024px) {
+  .mx-app {
+    display: grid;
+    grid-template-columns: 240px minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-areas:
+      "sidebar topbar"
+      "sidebar main";
+    flex-direction: initial;
+  }
+  .mx-app > .mx-sidebar {
+    grid-area: sidebar;
+    height: 100%;
+    overflow-y: auto;
+  }
+  .mx-app > .mx-desktop-shell {
+    grid-area: topbar;
+    display: flex;
+    flex-direction: column;
+    width: auto;
+    min-width: 0;
+  }
+  .mx-app > .mx-desktop-main {
+    grid-area: main;
+    min-width: 0;
+    min-height: 0;
+  }
+}
+
+@media (min-width: 1440px) {
+  .mx-app { grid-template-columns: 260px minmax(0, 1fr); }
+}

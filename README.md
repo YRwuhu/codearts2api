@@ -109,6 +109,25 @@ OpenAI Base URL: http://127.0.0.1:8787/v1
 可用模型: [...]
 ```
 
+## 管理界面 (WebUI)
+
+启动代理后浏览器打开 **http://127.0.0.1:8787/**，即可在网页里管理账号：
+
+- **概览** —— 账号数、可用模型数、启用状态、每个账号的模型数量
+- **账号** —— 添加 / 删除 / 启停 / 轮换密钥，改动即时写入 `accounts.json` 并重建账号池
+- **模型** —— 合并后的模型列表，可按名称筛选，点「测试」直接发起一次真实请求验证
+- **客户端接入** —— 一键查看 Base URL、API Key 与推荐模型
+
+界面基于 [miuix-console](https://github.com/bmbxwbh/miuix-console)（Apache 2.0，零依赖纯 CSS/JS），
+已连同静态资源一起嵌入二进制，单文件部署即可，无需额外的静态目录。
+
+安全说明：
+
+- 账号页只显示打码后的 AK（`HPUA****L2`），完整密钥不会回传到浏览器
+- 编辑账号时密钥输入框留空表示不修改
+- 服务默认只监听 `127.0.0.1`，WebUI 与外网隔离
+- 修改账号会先校验再落盘；校验失败自动回滚，不会留下会让下次启动失败的配置
+
 ## 客户端接入
 
 ```text
@@ -120,7 +139,7 @@ Model    : deepseek-v4.1-flash / glm-5.3 / kimi-k3 / openpangu-2.0-pro ...
 ## 子命令
 
 ```cmd
-codearts2api.exe serve                 启动代理（默认）
+codearts2api.exe serve                 启动代理 + WebUI（默认）
 codearts2api.exe accounts              列出账号、AK（打码）、模型数及模型归属
 codearts2api.exe models                列出合并后的可用模型及通道/上下文/输出上限
 codearts2api.exe selftest [MODEL...]   对运行中的代理做端到端自检（非流式 + 流式）
@@ -141,6 +160,13 @@ codearts2api.exe benefit claim backup  对指定账号签到（追加账号 id�
 | `GET /v1/models` | 模型列表（含 context_window / max_tokens 等能力元数据） |
 | `GET /v1/models/{id}` | 单模型详情 |
 | `OPTIONS *` | CORS 预检 |
+| `GET /api/status` | WebUI 概览数据（账号、模型、配置） |
+| `GET /api/accounts` | 账号列表（密钥打码） |
+| `POST /api/accounts` | 新增账号 |
+| `PATCH /api/accounts/{id}` | 修改账号（启停 / 轮换密钥） |
+| `DELETE /api/accounts/{id}` | 删除账号 |
+| `POST /api/refresh` | 重新同步所有账号的模型 |
+| `POST /api/test` | 用指定模型发起一次真实请求 |
 
 ## 相对上游做的兼容处理
 

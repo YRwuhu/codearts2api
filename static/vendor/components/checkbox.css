@@ -1,0 +1,139 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Checkbox & Radio Component
+   ═══════════════════════════════════════════ */
+
+/* ── Checkbox ── */
+.mx-checkbox{
+  display:inline-flex;align-items:center;gap:8px;
+  cursor:pointer;
+  -webkit-tap-highlight-color:transparent;
+}
+.mx-checkbox input{display:none}
+
+.mx-checkbox-box{
+  width:18px;height:18px;
+  border:2px solid var(--mx-border);
+  border-radius:5px;
+  display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;
+  transition:all var(--mx-d2) var(--mx-spring);
+  background:transparent;
+}
+.mx-checkbox-box svg{
+  width:12px;height:12px;
+  color:#fff;opacity:0;
+  transform:scale(0);
+  transition:all var(--mx-d2) var(--mx-spring);
+}
+
+/* Checked */
+.mx-checkbox input:checked + .mx-checkbox-box{
+  background:var(--mx-primary);
+  border-color:var(--mx-primary);
+}
+.mx-checkbox input:checked + .mx-checkbox-box svg{
+  opacity:1;transform:scale(1);
+}
+
+/* Indeterminate */
+.mx-checkbox input:indeterminate + .mx-checkbox-box{
+  background:var(--mx-primary);
+  border-color:var(--mx-primary);
+}
+.mx-checkbox input:indeterminate + .mx-checkbox-box svg{
+  opacity:1;transform:scale(1);
+}
+
+/* Hover */
+.mx-checkbox:hover .mx-checkbox-box{border-color:var(--mx-primary)}
+
+/* Disabled */
+.mx-checkbox input:disabled + .mx-checkbox-box{
+  opacity:0.4;cursor:not-allowed;
+}
+.mx-checkbox input:disabled ~ .mx-checkbox-label{
+  opacity:0.4;cursor:not-allowed;
+}
+
+/* Focus */
+.mx-checkbox input:focus-visible + .mx-checkbox-box{
+  box-shadow:0 0 0 3px var(--mx-primary-glow);
+}
+
+/* Label */
+.mx-checkbox-label{
+  font-size:14px;color:var(--mx-text);
+  transition:color var(--mx-d1);
+  user-select:none;
+}
+
+/* ── Radio ── */
+.mx-radio{
+  display:inline-flex;align-items:center;gap:8px;
+  cursor:pointer;
+  -webkit-tap-highlight-color:transparent;
+}
+.mx-radio input{display:none}
+
+.mx-radio-dot{
+  width:18px;height:18px;
+  border:2px solid var(--mx-border);
+  border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;
+  transition:all var(--mx-d2) var(--mx-spring);
+}
+.mx-radio-dot::after{
+  content:'';width:8px;height:8px;
+  border-radius:50%;background:#fff;
+  transform:scale(0);
+  transition:transform var(--mx-d2) var(--mx-spring);
+}
+
+/* Checked */
+.mx-radio input:checked + .mx-radio-dot{
+  background:var(--mx-primary);
+  border-color:var(--mx-primary);
+}
+.mx-radio input:checked + .mx-radio-dot::after{
+  transform:scale(1);
+}
+
+/* Hover */
+.mx-radio:hover .mx-radio-dot{border-color:var(--mx-primary)}
+
+/* Disabled */
+.mx-radio input:disabled + .mx-radio-dot{
+  opacity:0.4;cursor:not-allowed;
+}
+.mx-radio input:disabled ~ .mx-radio-label{
+  opacity:0.4;cursor:not-allowed;
+}
+
+/* Focus */
+.mx-radio input:focus-visible + .mx-radio-dot{
+  box-shadow:0 0 0 3px var(--mx-primary-glow);
+}
+
+/* Label */
+.mx-radio-label{
+  font-size:14px;color:var(--mx-text);
+  transition:color var(--mx-d1);
+  user-select:none;
+}
+
+/* ── Checkbox Group / Radio Group layout ── */
+.mx-checkbox-group,.mx-radio-group{
+  display:flex;flex-direction:column;gap:10px;
+}
+.mx-checkbox-group.horizontal,.mx-radio-group.horizontal{
+  flex-direction:row;flex-wrap:wrap;gap:16px;
+}
+
+/* Mobile: 加大触控区 */
+@media(max-width:767px){
+  .mx-checkbox,.mx-radio{min-height:44px;padding:4px 0}
+  .mx-checkbox-box,.mx-radio-dot{width:22px;height:22px}
+  .mx-checkbox-box svg{width:14px;height:14px}
+  .mx-radio-dot::after{width:10px;height:10px}
+}

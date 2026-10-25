@@ -1,0 +1,478 @@
+//! 管理 API：供 WebUI 读取状态、增删改账号、测试模型。
+//!
+//! 账号变更会写回 accounts.json 并重建账号池，无需重启进程。
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use axum::extract::{Path, State};
+use axum::routing::{get, patch, post};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::config::{Account, Config};
+use crate::models::{Catalog, Pool};
+use crate::web::WebState;
+
+pub fn router() -> axum::Router<WebState> {
+    axum::Router::new()
+        .route("/api/status", get(status))
+        .route("/api/accounts", get(list_accounts).post(add_account))
+        .route(
+            "/api/accounts/{id}",
+            patch(update_account).delete(delete_account),
+        )
+        .route("/api/refresh", post(refresh_models))
+        .route("/api/test", post(test_model))
+}
+
+#[derive(Serialize, Deserialize)]
+struct AccountsFile {
+    #[serde(default)]
+    accounts: Vec<AccountRecord>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AccountRecord {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    ak: String,
+    #[serde(default)]
+    sk: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 账号文件位置：优先 CODEARTS_ACCOUNTS，其次 .env 同目录 accounts.json。
+pub fn accounts_file_path(cfg: &Config) -> PathBuf {
+    std::env::var("CODEARTS_ACCOUNTS")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cfg.env_dir.join("accounts.json"))
+}
+
+fn read_accounts(path: &PathBuf) -> Result<Vec<AccountRecord>, String> {
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
+    let parsed: AccountsFile =
+        serde_json::from_str(&text).map_err(|e| format!("解析失败: {e}"))?;
+    Ok(parsed.accounts)
+}
+
+fn write_accounts(path: &PathBuf, accounts: &[AccountRecord]) -> Result<(), String> {
+    let payload = json!({ "accounts": accounts });
+    let text = serde_json::to_string_pretty(&payload).map_err(|e| format!("序列化失败: {e}"))?;
+    std::fs::write(path, text).map_err(|e| format!("写入失败: {e}"))
+}
+
+/// 校验账号列表是否会导致服务不可用。
+fn validate_accounts(accounts: &[AccountRecord]) -> Result<(), String> {
+    if accounts.is_empty() {
+        return Err("至少要保留一个账号".to_string());
+    }
+    if !accounts.iter().any(|a| a.enabled) {
+        return Err("至少要启用一个账号，否则代理无法提供任何模型".to_string());
+    }
+    Ok(())
+}
+
+/// 安全写回：先校验，再写盘，然后重建账号池；
+/// 任一步失败都回滚文件，避免把配置写成下次启动会失败的状态。
+async fn commit_accounts(
+    state: &WebState,
+    path: &PathBuf,
+    old: &[AccountRecord],
+    new: &[AccountRecord],
+) -> Result<usize, Response> {
+    if let Err(e) = validate_accounts(new) {
+        return Err(err(StatusCode::BAD_REQUEST, e));
+    }
+    if let Err(e) = write_accounts(path, new) {
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e));
+    }
+    if let Err(e) = state.reload_config() {
+        // 配置解析失败：回滚文件，恢复原有池
+        let _ = write_accounts(path, old);
+        let _ = state.reload_config();
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("重载配置失败: {e}"),
+        ));
+    }
+    match rebuild_pool(state).await {
+        Ok(n) => Ok(n),
+        Err(e) => {
+            // 新配置无法构建出可用账号池：回滚
+            let _ = write_accounts(path, old);
+            let _ = state.reload_config();
+            let _ = rebuild_pool(state).await;
+            Err(err(StatusCode::BAD_REQUEST, e))
+        }
+    }
+}
+
+fn mask(ak: &str) -> String {
+    if ak.len() <= 8 {
+        return "****".to_string();
+    }
+    format!("{}****{}", &ak[..4], &ak[ak.len() - 2..])
+}
+
+fn err(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(json!({"error": message.into()}))).into_response()
+}
+
+/// 重建账号池（账号变更后调用）。
+pub async fn rebuild_pool(state: &WebState) -> Result<usize, String> {
+    let cfg = state.config();
+    let enabled: Vec<&Account> = cfg.accounts.iter().filter(|a| a.enabled).collect();
+    if enabled.is_empty() {
+        return Err("没有启用的账号".to_string());
+    }
+    let mut catalogs = Vec::new();
+    for account in enabled {
+        let cache_path = cfg.cache_path_for(account);
+        let catalog = Catalog::new(
+            account.clone(),
+            &cache_path,
+            cfg.benefit_fallback,
+            state.http.clone(),
+        );
+        if !catalog.refresh().await {
+            catalog.load_cache().await;
+        }
+        catalogs.push(Arc::new(catalog));
+    }
+    let count = catalogs.len();
+    *state.pool.write().await = Pool::new(catalogs);
+    Ok(count)
+}
+
+/// GET /api/status —— 概览：账号、模型、运行状态。
+pub async fn status(State(state): State<WebState>) -> Response {
+    let pool = state.pool.read().await.clone();
+    let cfg = state.config();
+    let described = pool.describe().await;
+
+    let mut accounts = Vec::new();
+    for account in &cfg.accounts {
+        let catalog = pool
+            .catalogs()
+            .iter()
+            .find(|c| c.account_id() == account.id);
+        let mut models = Vec::new();
+        if let Some(c) = catalog {
+            models = c.models().await.iter().map(|m| m.id.clone()).collect();
+        }
+        accounts.push(json!({
+            "id": account.id,
+            "ak": mask(&account.ak),
+            "enabled": account.enabled,
+            "models": models,
+            "model_count": models.len(),
+        }));
+    }
+
+    let merged = pool.merged_models().await;
+    let model_list: Vec<Value> = merged
+        .iter()
+        .map(|m| {
+            m.to_openai().as_object().map(|o| {
+                let mut v = o.clone();
+                v.insert("channel".to_string(), json!(m.channel));
+                Value::Object(v)
+            })
+            .unwrap_or(Value::Null)
+        })
+        .collect();
+
+    let total_models = model_list.len();
+    Json(json!({
+        "accounts": accounts,
+        "models": model_list,
+        "summary": {
+            "account_count": cfg.accounts.len(),
+            "enabled_count": cfg.accounts.iter().filter(|a| a.enabled).count(),
+            "model_count": total_models,
+            "total_account_models": described.iter().map(|(_, _, n)| *n).sum::<usize>(),
+            "listen": format!("{}:{}", cfg.host, cfg.port),
+        },
+        "config": {
+            "host": cfg.host,
+            "port": cfg.port,
+            "max_tokens_cap": cfg.max_tokens_cap,
+            "benefit_fallback": cfg.benefit_fallback,
+            "accounts_file": accounts_file_path(&cfg).display().to_string(),
+        }
+    }))
+    .into_response()
+}
+
+/// GET /api/accounts —— 账号列表（密钥打码）。
+pub async fn list_accounts(State(state): State<WebState>) -> Response {
+    let cfg = state.config();
+    let pool = state.pool.read().await.clone();
+    let described = pool.describe().await;
+
+    let items: Vec<Value> = cfg
+        .accounts
+        .iter()
+        .map(|a| {
+            let count = described
+                .iter()
+                .find(|(id, _, _)| id == &a.id)
+                .map(|(_, _, n)| *n)
+                .unwrap_or(0);
+            json!({
+                "id": a.id,
+                "ak": mask(&a.ak),
+                "enabled": a.enabled,
+                "model_count": count,
+            })
+        })
+        .collect();
+    Json(json!({ "accounts": items })).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct AddAccountRequest {
+    pub id: Option<String>,
+    pub ak: String,
+    pub sk: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// POST /api/accounts —— 新增账号。
+pub async fn add_account(
+    State(state): State<WebState>,
+    Json(req): Json<AddAccountRequest>,
+) -> Response {
+    let ak = req.ak.trim().to_string();
+    let sk = req.sk.trim().to_string();
+    if ak.is_empty() || sk.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "ak 和 sk 不能为空");
+    }
+    // 防呆：华为云 AK 通常是 20 位大写字母数字
+    if ak.len() < 16 || sk.len() < 16 {
+        return err(StatusCode::BAD_REQUEST, "ak / sk 长度异常，请确认没有复制漏");
+    }
+
+    let path = accounts_file_path(&state.config());
+    let mut accounts = match read_accounts(&path) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    if accounts.iter().any(|a| a.ak == ak) {
+        return err(StatusCode::CONFLICT, "该 AK 已存在");
+    }
+
+    let mut id = req.id.unwrap_or_default().trim().to_string();
+    if id.is_empty() {
+        id = format!("account{}", accounts.len() + 1);
+    }
+    while accounts.iter().any(|a| a.id == id) {
+        id.push('_');
+    }
+
+    let old = accounts.clone();
+    accounts.push(AccountRecord {
+        id: id.clone(),
+        ak,
+        sk,
+        enabled: req.enabled,
+    });
+
+    match commit_accounts(&state, &path, &old, &accounts).await {
+        Ok(n) => Json(json!({"ok": true, "id": id, "active_accounts": n})).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UpdateAccountRequest {
+    pub ak: Option<String>,
+    pub sk: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+/// PATCH /api/accounts/{id} —— 修改账号（启用状态 / 密钥轮换）。
+pub async fn update_account(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateAccountRequest>,
+) -> Response {
+    let path = accounts_file_path(&state.config());
+    let mut accounts = match read_accounts(&path) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let old = accounts.clone();
+
+    if !accounts.iter().any(|a| a.id == id) {
+        return err(StatusCode::NOT_FOUND, format!("账号 {id} 不存在"));
+    }
+
+    if let Some(enabled) = req.enabled {
+        if let Some(t) = accounts.iter_mut().find(|a| a.id == id) {
+            t.enabled = enabled;
+        }
+    }
+    if let Some(ak) = req.ak {
+        let ak = ak.trim().to_string();
+        if ak.is_empty() {
+            return err(StatusCode::BAD_REQUEST, "ak 不能为空");
+        }
+        if let Some(t) = accounts.iter_mut().find(|a| a.id == id) {
+            t.ak = ak;
+        }
+    }
+    if let Some(sk) = req.sk {
+        let sk = sk.trim().to_string();
+        if sk.is_empty() {
+            return err(StatusCode::BAD_REQUEST, "sk 不能为空");
+        }
+        if let Some(t) = accounts.iter_mut().find(|a| a.id == id) {
+            t.sk = sk;
+        }
+    }
+
+    match commit_accounts(&state, &path, &old, &accounts).await {
+        Ok(n) => Json(json!({"ok": true, "active_accounts": n})).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// DELETE /api/accounts/{id} —— 删除账号。
+pub async fn delete_account(
+    State(state): State<WebState>,
+    Path(id): Path<String>,
+) -> Response {
+    let path = accounts_file_path(&state.config());
+    let mut accounts = match read_accounts(&path) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let old = accounts.clone();
+    let before = accounts.len();
+    accounts.retain(|a| a.id != id);
+    if accounts.len() == before {
+        return err(StatusCode::NOT_FOUND, format!("账号 {id} 不存在"));
+    }
+
+    match commit_accounts(&state, &path, &old, &accounts).await {
+        Ok(n) => Json(json!({"ok": true, "active_accounts": n})).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// POST /api/refresh —— 重新同步所有账号的模型。
+pub async fn refresh_models(State(state): State<WebState>) -> Response {
+    let pool = state.pool.read().await.clone();
+    let mut report = Vec::new();
+    for catalog in pool.catalogs() {
+        let ok = catalog.refresh().await;
+        report.push(json!({
+            "account": catalog.account_id(),
+            "ok": ok,
+            "model_count": catalog.models().await.len(),
+        }));
+    }
+    Json(json!({"ok": true, "accounts": report})).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct TestRequest {
+    pub model: String,
+    pub prompt: Option<String>,
+    pub max_tokens: Option<i64>,
+}
+
+/// POST /api/test —— 用指定模型发一次真实请求，验证端到端可用。
+pub async fn test_model(
+    State(state): State<WebState>,
+    Json(req): Json<TestRequest>,
+) -> Response {
+    let pool = state.pool.read().await.clone();
+    let model = req.model.trim().to_string();
+    if model.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "model 不能为空");
+    }
+    if !pool.contains(&model).await {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("模型 {model} 不在可用列表中"),
+        );
+    }
+
+    let prompt = req
+        .prompt
+        .unwrap_or_else(|| "只回复两个字：成功".to_string());
+    let max_tokens = req.max_tokens.unwrap_or(512).clamp(16, 8192);
+
+    // 用与正式请求相同的路径打一次自己的代理，确保测的是真实链路。
+    let url = format!(
+        "http://127.0.0.1:{}/v1/chat/completions",
+        state.config().port
+    );
+    let payload = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": false,
+        "max_tokens": max_tokens,
+    });
+
+    let started = std::time::Instant::now();
+    let resp = state
+        .http
+        .post(&url)
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(180))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let text = r.text().await.unwrap_or_default();
+            let elapsed = started.elapsed().as_millis();
+            let value: Value = serde_json::from_str(&text).unwrap_or(json!({"raw": text}));
+            let content = value["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let reasoning = value["choices"][0]["message"]["reasoning_content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            Json(json!({
+                "ok": status == 200 && value.get("choices").is_some(),
+                "status": status,
+                "elapsed_ms": elapsed,
+                "content": content,
+                "reasoning": reasoning,
+                "usage": value.get("usage").cloned().unwrap_or(Value::Null),
+                "error": value.get("error").cloned().unwrap_or(Value::Null),
+            }))
+            .into_response()
+        }
+        Err(e) => Json(json!({
+            "ok": false,
+            "error": format!("请求失败: {e}"),
+        }))
+        .into_response(),
+    }
+}

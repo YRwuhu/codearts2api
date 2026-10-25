@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>CodeArts2API 控制台</title>
+<link href="https://cdn.jsdelivr.net/npm/misans@4.1/lib/Normal/MiSans-Regular.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/misans@4.1/lib/Normal/MiSans-Medium.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/misans@4.1/lib/Normal/MiSans-Semibold.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/misans@4.1/lib/Normal/MiSans-Bold.min.css" rel="stylesheet">
+<link rel="stylesheet" href="/vendor/core/tokens.css">
+<link rel="stylesheet" href="/vendor/core/base.css">
+<link rel="stylesheet" href="/vendor/core/animations.css">
+<link rel="stylesheet" href="/vendor/components/layout.css">
+<link rel="stylesheet" href="/vendor/components/navigation.css">
+<link rel="stylesheet" href="/vendor/components/card.css">
+<link rel="stylesheet" href="/vendor/components/button.css">
+<link rel="stylesheet" href="/vendor/components/switch.css">
+<link rel="stylesheet" href="/vendor/components/badge.css">
+<link rel="stylesheet" href="/vendor/components/input.css">
+<link rel="stylesheet" href="/vendor/components/table.css">
+<link rel="stylesheet" href="/vendor/components/stat.css">
+<link rel="stylesheet" href="/vendor/components/modal.css">
+<link rel="stylesheet" href="/vendor/components/toast.css">
+<link rel="stylesheet" href="/vendor/components/empty.css">
+<link rel="stylesheet" href="/vendor/components/tag.css">
+<link rel="stylesheet" href="/vendor/components/tooltip.css">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="mx-app">
+
+  <!-- 手机端顶栏 -->
+  <header class="mx-topbar">
+    <div class="mx-topbar-left">
+      <div class="mx-logo">
+        <div class="mx-logo-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 17l6-6-6-6"/><path d="M12 19h8"/>
+          </svg>
+        </div>
+        <span class="mx-logo-text">CodeArts2API</span>
+      </div>
+    </div>
+    <div class="mx-topbar-right">
+      <button class="mx-btn-icon" data-theme-toggle title="切换主题" aria-label="切换主题">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- 侧边栏（桌面端） -->
+  <aside class="mx-sidebar">
+    <div class="mx-sidebar-section">控制台</div>
+    <div class="mx-nav-item active" data-route="overview">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/>
+        <rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>
+      </svg>
+      <span class="mx-nav-label">概览</span>
+    </div>
+    <div class="mx-nav-item" data-route="accounts">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>
+        <path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+      </svg>
+      <span class="mx-nav-label">账号</span>
+    </div>
+    <div class="mx-nav-item" data-route="models">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+        <path d="M3.27 6.96L12 12.01l8.73-5.05"/><path d="M12 22.08V12"/>
+      </svg>
+      <span class="mx-nav-label">模型</span>
+    </div>
+    <div class="mx-sidebar-section" style="margin-top:auto">接入</div>
+    <div class="mx-nav-item" data-route="connect">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+        <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+      </svg>
+      <span class="mx-nav-label">客户端接入</span>
+    </div>
+  </aside>
+
+  <!-- 桌面端顶栏 -->
+  <div class="mx-desktop-shell">
+    <header class="mx-desktop-topbar">
+      <div class="mx-breadcrumb">
+        <span>CodeArts2API</span>
+        <span class="mx-breadcrumb-sep">›</span>
+        <span id="crumb">概览</span>
+      </div>
+      <div class="mx-desktop-topbar-right">
+        <span class="mx-badge" id="poolBadge">连接中…</span>
+        <button class="mx-btn mx-btn-secondary mx-btn-sm" id="refreshBtn" data-ripple>刷新模型</button>
+      </div>
+    </header>
+  </div>
+
+  <!-- 主内容区：必须是 .mx-app 的直接子元素 -->
+  <main class="mx-desktop-main mx-body">
+
+    <!-- 概览 -->
+    <section class="route" id="route-overview">
+      <div class="mx-page-head">
+        <h1 class="mx-page-title">概览</h1>
+        <p class="mx-page-sub">多账号池的实时状态与模型可用性</p>
+      </div>
+
+      <div class="mx-stat-grid" id="statGrid">
+        <div class="mx-stat" style="--mx-stat-accent: var(--mx-primary)">
+          <div class="mx-stat-label"><div class="mx-stat-icon">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+          </div>账号</div>
+          <div class="mx-stat-value" id="statAccounts">0</div>
+        </div>
+        <div class="mx-stat" style="--mx-stat-accent: var(--mx-green)">
+          <div class="mx-stat-label"><div class="mx-stat-icon">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+          </div>可用模型</div>
+          <div class="mx-stat-value" id="statModels">0</div>
+        </div>
+        <div class="mx-stat" style="--mx-stat-accent: var(--mx-blue)">
+          <div class="mx-stat-label"><div class="mx-stat-icon">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+          </div>启用账号</div>
+          <div class="mx-stat-value" id="statEnabled">0</div>
+        </div>
+        <div class="mx-stat" style="--mx-stat-accent: var(--mx-amber)">
+          <div class="mx-stat-label"><div class="mx-stat-icon">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+          </div>监听地址</div>
+          <div class="mx-stat-value" id="statListen" style="font-size:15px">—</div>
+        </div>
+      </div>
+
+      <div class="mx-card" style="margin-top:16px">
+        <div class="mx-card-head">
+          <span class="mx-card-title">账号状态</span>
+          <span class="mx-badge" id="accountsHint">—</span>
+        </div>
+        <div class="mx-card-body">
+          <div class="mx-table-wrap">
+            <table class="mx-table">
+              <thead><tr><th>账号</th><th>AK</th><th>状态</th><th>模型数</th></tr></thead>
+              <tbody id="overviewAccounts"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 账号管理 -->
+    <section class="route" id="route-accounts" hidden>
+      <div class="mx-page-head">
+        <h1 class="mx-page-title">账号管理</h1>
+        <p class="mx-page-sub">增删账号、启用停用、密钥轮换。变更会立即写入accounts.json并重建账号池。</p>
+      </div>
+
+      <div class="mx-card">
+        <div class="mx-card-head">
+          <span class="mx-card-title">已配置账号</span>
+          <button class="mx-btn mx-btn-primary mx-btn-sm" id="addAccountBtn" data-ripple>添加账号</button>
+        </div>
+        <div class="mx-card-body">
+          <div class="mx-table-wrap">
+            <table class="mx-table">
+              <thead><tr><th>账号</th><th>AK</th><th>模型数</th><th>启用</th><th>操作</th></tr></thead>
+              <tbody id="accountRows"></tbody>
+            </table>
+          </div>
+          <p class="mx-helper" id="accountsFileHint"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- 模型 -->
+    <section class="route" id="route-models" hidden>
+      <div class="mx-page-head">
+        <h1 class="mx-page-title">模型</h1>
+        <p class="mx-page-sub">合并去重后的可用模型，可在右侧直接发起真实请求验证</p>
+      </div>
+
+      <div class="mx-card">
+        <div class="mx-card-head">
+          <span class="mx-card-title">模型列表</span>
+          <span class="mx-badge" id="modelCount">0</span>
+        </div>
+        <div class="mx-card-body">
+          <div class="mx-input-wrap" style="margin-bottom:12px">
+            <span class="mx-input-icon">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+            </span>
+            <input class="mx-input" id="modelFilter" placeholder="筛选模型名称…">
+          </div>
+          <div class="mx-table-wrap">
+            <table class="mx-table">
+              <thead><tr><th>模型</th><th>通道</th><th>上下文</th><th>最大输出</th><th>可用账号</th><th>操作</th></tr></thead>
+              <tbody id="modelRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="mx-card" style="margin-top:16px" id="testCard">
+        <div class="mx-card-head">
+          <span class="mx-card-title">请求测试</span>
+          <span class="mx-badge" id="testModelBadge">未选择</span>
+        </div>
+        <div class="mx-card-body">
+          <label class="mx-label">提示词</label>
+          <div class="mx-textarea-wrap">
+            <textarea class="mx-input" id="testPrompt" rows="3">只回复两个字：成功</textarea>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:12px">
+            <button class="mx-btn mx-btn-primary" id="runTestBtn" data-ripple>发送测试</button>
+            <span class="mx-helper" id="testMeta"></span>
+          </div>
+          <div id="testOutput" hidden style="margin-top:12px">
+            <label class="mx-label">响应</label>
+            <pre id="testPre" style="background:var(--mx-s3);padding:12px;border-radius:var(--mx-r-sm);white-space:pre-wrap;word-break:break-word;font-family:var(--mx-mono);font-size:13px;max-height:340px;overflow:auto"></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 客户端接入 -->
+    <section class="route" id="route-connect" hidden>
+      <div class="mx-page-head">
+        <h1 class="mx-page-title">客户端接入</h1>
+        <p class="mx-page-sub">任何支持自定义 OpenAI 端点的工具都能直接连接</p>
+      </div>
+      <div class="mx-card">
+        <div class="mx-card-head"><span class="mx-card-title">连接参数</span></div>
+        <div class="mx-card-body">
+          <div class="kv"><span class="kv-k">Base URL</span><code class="kv-v" id="connBase">—</code></div>
+          <div class="kv"><span class="kv-k">API Key</span><code class="kv-v">codearts</code></div>
+          <div class="kv"><span class="kv-k">Model</span><code class="kv-v" id="connModel">—</code></div>
+          <p class="mx-helper">API Key 可填任意非空字符串；代理不校验它，实际鉴权由华为云 AK/SK 完成。</p>
+        </div>
+      </div>
+      <div class="mx-card" style="margin-top:16px">
+        <div class="mx-card-head"><span class="mx-card-title">注意事项</span></div>
+        <div class="mx-card-body">
+          <ul class="notes">
+            <li>单账号套餐并发上限约为 3；多账号模式下超出会自动切换账号重试。</li>
+            <li>强推理模型的思维链会占用输出额度，<code>max_tokens</code> 建议不低于 2000。</li>
+            <li>本服务仅绑定 <code>127.0.0.1</code>，同网段其他机器默认无法访问。</li>
+            <li>每次调用都会消耗华为云 CodeArts 额度。</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <nav class="mx-bottom-nav">
+    <ul class="mx-bottom-nav-items">
+      <li class="mx-btm-item active" data-route="overview"><span>概览</span></li>
+      <li class="mx-btm-item" data-route="accounts"><span>账号</span></li>
+      <li class="mx-btm-item" data-route="models"><span>模型</span></li>
+      <li class="mx-btm-item" data-route="connect"><span>接入</span></li>
+    </ul>
+  </nav>
+</div>
+
+<!-- 添加/编辑账号弹窗 -->
+<div class="mx-modal-overlay" id="accountModal">
+  <div class="mx-modal">
+    <div class="mx-modal-head">
+      <span class="mx-modal-title" id="accountModalTitle">添加账号</span>
+      <button class="mx-modal-close" data-close-modal>✕</button>
+    </div>
+    <div class="mx-modal-body">
+      <label class="mx-label">账号标识</label>
+      <div class="mx-input-wrap">
+        <input class="mx-input" id="fId" placeholder="例如 main、backup">
+      </div>
+      <span class="mx-helper">留空自动生成；用于日志和缓存文件名</span>
+
+      <label class="mx-label" style="margin-top:12px">Access Key</label>
+      <div class="mx-input-wrap">
+        <input class="mx-input" id="fAk" placeholder="华为云 Access Key">
+      </div>
+
+      <label class="mx-label" style="margin-top:12px">Secret Key</label>
+      <div class="mx-input-wrap">
+        <input class="mx-input" id="fSk" type="password" placeholder="华为云 Secret Key">
+      </div>
+      <span class="mx-helper" id="editHint" hidden>留空表示不修改原有密钥</span>
+    </div>
+    <div class="mx-modal-foot">
+      <button class="mx-btn mx-btn-ghost" data-close-modal>取消</button>
+      <button class="mx-btn mx-btn-primary" id="saveAccountBtn" data-ripple>保存</button>
+    </div>
+  </div>
+</div>
+
+<script src="/vendor/utils/smooth-corner.js"></script>
+<script src="/vendor/utils/ripple.js"></script>
+<script src="/vendor/utils/counter.js"></script>
+<script src="/vendor/utils/theme.js"></script>
+<script src="/vendor/utils/modal.js"></script>
+<script src="/vendor/utils/toast.js"></script>
+<script>
+  /* miuix 的 utils 用顶层 class 声明：这些绑定在全局词法环境里，
+     可以跨脚本按裸名字访问，但不会自动出现在 window 上。
+     统一挂到 window，后续 app.js 用 window.MxXxx 判断即可。 */
+  (function () {
+    var names = ['MxSmoothCorner', 'MxRipple', 'MxCounter', 'MxTheme', 'MxModal', 'MxToast'];
+    names.forEach(function (name) {
+      try {
+        var ctor = eval(name);
+        if (ctor) window[name] = ctor;
+      } catch (_) { /* 未加载的工具跳过 */ }
+    });
+    try { if (window.MxRipple && MxRipple.init) MxRipple.init(); } catch (_) {}
+    try { if (window.MxSmoothCorner && MxSmoothCorner.init) MxSmoothCorner.init(); } catch (_) {}
+  })();
+</script>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,327 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Layout System
+   全设备适配：手机 / 平板 / 桌面 / 大屏
+   ═══════════════════════════════════════════ */
+
+/* ── App Shell ── */
+.mx-app{display:flex;flex-direction:column;height:100dvh}
+
+/* ── Scrollable Body ── */
+.mx-body{
+  flex:1;overflow-y:auto;overflow-x:hidden;
+  -webkit-overflow-scrolling:touch;
+}
+
+/* ── 自动为手机端主内容区添加底部内边距，防止 fixed 底栏遮挡 ── */
+@media(max-width:1023px){
+  .mx-app > .mx-body,
+  .mx-app > .mx-desktop-main.mx-body{
+    padding-bottom:calc(72px + var(--mx-safe-b));
+  }
+}
+@media(min-width:1024px){
+  .mx-app > .mx-body,
+  .mx-app > .mx-desktop-main.mx-body{
+    padding-bottom:0;
+  }
+}
+
+/* ── Padding utilities ── */
+.mx-pad{padding:12px}
+.mx-pad-b{padding-bottom:calc(72px + var(--mx-safe-b))}
+@media(min-width:768px){.mx-pad{padding:20px}.mx-pad-b{padding-bottom:20px}}
+@media(min-width:1024px){.mx-pad{padding:28px}}
+
+/* ── Page Header ── */
+.mx-page-head{margin-bottom:16px}
+@media(min-width:768px){.mx-page-head{margin-bottom:20px}}
+.mx-page-title{
+  font-size:20px;font-weight:800;letter-spacing:-0.02em;
+  background:linear-gradient(135deg,var(--mx-text),var(--mx-t2));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+}
+@media(min-width:768px){.mx-page-title{font-size:24px}}
+.mx-page-sub{
+  font-size:12px;color:var(--mx-t3);margin-top:4px;
+  display:flex;align-items:center;gap:6px;
+}
+
+/* ── Section ── */
+.mx-section{margin-bottom:12px}
+@media(min-width:768px){.mx-section{margin-bottom:16px}}
+
+/* ══════════════════════════════════════════
+   MOBILE (< 768px) — 触控优先
+   ══════════════════════════════════════════ */
+@media(max-width:767px){
+  /* 触控友好的最小高度 */
+  .mx-btn{height:40px;padding:0 20px;font-size:14px}
+  .mx-btn-sm{height:36px;padding:0 14px;font-size:13px}
+  .mx-btn-lg{height:46px;padding:0 24px;font-size:15px}
+  .mx-btn-icon{width:40px;height:40px}
+
+  /* 输入框加大 */
+  .mx-input-wrap{height:44px;padding:0 16px}
+  .mx-input{font-size:16px} /* 防止 iOS 自动缩放 */
+  .mx-input-sm{height:38px;font-size:15px}
+  .mx-input-lg{height:50px;font-size:16px}
+
+  /* Select 加大 */
+  .mx-select-trigger{height:44px;font-size:16px}
+
+  /* Switch 加大 */
+  .mx-switch-track{width:48px;height:28px}
+  .mx-switch-thumb{width:22px;height:22px;top:3px;left:3px}
+  .mx-switch input:checked + .mx-switch-track .mx-switch-thumb{transform:translateX(20px)}
+
+  /* Checkbox/Radio 加大触控区 */
+  .mx-checkbox-box,.mx-radio-dot{width:20px;height:20px}
+  .mx-checkbox-box svg{width:14px;height:14px}
+  .mx-radio-dot::after{width:9px;height:9px}
+
+  /* Slider 触控加大 */
+  .mx-slider input[type="range"]::-webkit-slider-thumb{width:22px;height:22px}
+  .mx-slider input[type="range"]::-moz-range-thumb{width:22px;height:22px}
+
+  /* Navigation 触控加大 */
+  .mx-nav-item{padding:11px 10px}
+  .mx-btm-item{padding:8px 16px}
+  .mx-btm-item span{font-size:11px}
+
+  /* TopBar */
+  .mx-topbar{height:48px;padding:0 12px}
+
+  /* BottomNav */
+  .mx-bottom-nav{height:auto}
+
+  /* Modal 全屏化 */
+  .mx-modal-overlay{padding:0;align-items:flex-end}
+  .mx-modal{
+    max-width:100%;max-height:90dvh;
+    border-radius:var(--mx-r) var(--mx-r) 0 0;
+    transform:translateY(100%);
+    opacity:1;
+  }
+  .mx-modal-overlay.open .mx-modal{transform:translateY(0)}
+  .mx-modal-sm,.mx-modal-lg,.mx-modal-xl{max-width:100%}
+
+  /* Drawer 全宽 */
+  .mx-drawer{width:100%}
+  .mx-drawer-sm,.mx-drawer-lg,.mx-drawer-xl{width:100%}
+
+  /* Grid 单列降级 */
+  .mx-grid-2,.mx-grid-3{grid-template-columns:1fr}
+  .mx-grid-sidebar{grid-template-columns:1fr}
+
+  /* Stat 单列（窄屏手机） */
+  .mx-stat-grid{grid-template-columns:1fr 1fr}
+
+  /* Table 卡片式响应 */
+  .mx-table{border:0}
+  .mx-table thead{display:none}
+  .mx-table tbody tr{
+    display:block;margin-bottom:12px;
+    border:1px solid var(--mx-divider);
+    border-radius:var(--mx-r-sm);
+    padding:12px;
+    background:var(--mx-s2);
+  }
+  .mx-table tbody td{
+    display:flex;justify-content:space-between;align-items:center;
+    padding:6px 0;border-bottom:1px solid var(--mx-divider);
+    white-space:normal;
+  }
+  .mx-table tbody td:last-child{border-bottom:none}
+  .mx-table tbody td::before{
+    content:attr(data-label);
+    font-size:11px;font-weight:700;color:var(--mx-t3);
+    text-transform:uppercase;letter-spacing:0.04em;
+    flex-shrink:0;margin-right:12px;
+  }
+  .mx-table tbody tr:hover td{padding-left:0}
+
+  /* Tabs 横向滚动 */
+  .mx-tabs{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .mx-tab{padding:10px 14px}
+
+  /* Pagination 精简 */
+  .mx-page-prev span,.mx-page-next span{display:none}
+  .mx-page-info{display:none}
+  .mx-pagination{gap:2px}
+  .mx-page-btn{width:32px;height:32px;font-size:12px}
+
+  /* Popover 全宽 */
+  .mx-popover{
+    position:fixed;left:8px!important;right:8px!important;
+    bottom:8px!important;top:auto!important;
+    width:auto!important;max-width:none;
+    transform:translateY(100%)!important;
+    transform-origin:bottom center;
+    border-radius:var(--mx-r);
+  }
+  .mx-popover.open{transform:translateY(0)!important}
+
+  /* Select dropdown 全宽 */
+  .mx-select-dropdown{
+    position:fixed;left:8px!important;right:8px!important;
+    bottom:8px!important;top:auto!important;
+    max-height:50dvh;
+    transform:translateY(100%)!important;
+    transform-origin:bottom center;
+    border-radius:var(--mx-r);
+  }
+  .mx-select-dropdown.open{transform:translateY(0)!important}
+
+  /* Datepicker dropdown 全宽 */
+  .mx-datepicker-dropdown{
+    position:fixed;left:8px!important;right:8px!important;
+    bottom:8px!important;top:auto!important;
+    transform:translateY(100%)!important;
+    transform-origin:bottom center;
+    border-radius:var(--mx-r);
+  }
+  .mx-datepicker-dropdown.open{transform:translateY(0)!important}
+
+  /* Accordion */
+  .mx-accordion-header{padding:12px 14px}
+
+  /* Upload */
+  .mx-upload{padding:24px 16px}
+
+  /* Avatar group */
+  .mx-avatar-group .mx-avatar,
+  .mx-avatar-group .mx-avatar-img{margin-left:-10px}
+}
+
+/* ══════════════════════════════════════════
+   TABLET (768px — 1023px)
+   ══════════════════════════════════════════ */
+@media(min-width:768px) and (max-width:1023px){
+  .mx-grid-3{grid-template-columns:1fr 1fr}
+  .mx-grid-sidebar{grid-template-columns:1fr}
+  .mx-stat-grid{grid-template-columns:repeat(4,1fr)}
+
+  /* Modal 稍宽 */
+  .mx-modal{max-width:480px}
+
+  /* Drawer */
+  .mx-drawer{width:360px}
+  .mx-drawer-sm{width:300px}
+  .mx-drawer-lg{width:420px}
+
+  /* Tabs 横向滚动 */
+  .mx-tabs{overflow-x:auto;-webkit-overflow-scrolling:touch}
+}
+
+/* ══════════════════════════════════════════
+   DESKTOP (≥ 1024px)
+   ══════════════════════════════════════════ */
+@media(min-width:1024px){
+  .mx-app{flex-direction:row}
+  .mx-app>.mx-topbar{display:none}
+  .mx-app>.mx-bottom-nav{display:none!important}
+
+  .mx-desktop-shell{
+    display:flex;flex-direction:column;width:100%;
+  }
+  .mx-desktop-topbar{
+    display:flex;align-items:center;justify-content:space-between;
+    height:52px;padding:0 24px;
+    border-bottom:1px solid var(--mx-divider);
+    backdrop-filter:blur(24px) saturate(1.8);
+    -webkit-backdrop-filter:blur(24px) saturate(1.8);
+    flex-shrink:0;
+  }
+  [data-theme="dark"] .mx-desktop-topbar{background:rgba(0,0,0,0.6)}
+  [data-theme="light"] .mx-desktop-topbar{background:rgba(247,247,247,0.65)}
+
+  .mx-desktop-main{
+    flex:1;padding:28px;overflow-y:auto;background:var(--mx-bg);
+  }
+
+  .mx-sidebar{display:block}
+  .mx-bottom-nav{display:none!important}
+
+  /* Grid 正常 */
+  .mx-grid-2{grid-template-columns:1fr 1fr}
+  .mx-grid-3{grid-template-columns:1fr 1fr 1fr}
+  .mx-grid-sidebar{display:grid;grid-template-columns:1fr 320px;gap:16px}
+  .mx-stat-grid{grid-template-columns:repeat(4,1fr)}
+}
+
+/* Hide desktop elements on mobile */
+@media(max-width:1023px){
+  .mx-sidebar{display:none}
+  .mx-desktop-shell{display:none}
+}
+
+/* ── Wide (≥1440px) ── */
+@media(min-width:1440px){
+  .mx-sidebar{width:260px}
+  .mx-desktop-main{padding:28px 32px}
+}
+
+/* ══════════════════════════════════════════
+   TOUCH DETECTION — 精确触控增强
+   ══════════════════════════════════════════ */
+@media(hover:none) and (pointer:coarse){
+  /* 触控设备额外加大可交互区域 */
+  .mx-tab{min-height:44px}
+  .mx-nav-item{min-height:44px}
+  .mx-accordion-header{min-height:48px}
+  .mx-popover-item{min-height:44px}
+  .mx-select-option{min-height:44px}
+  .mx-page-btn{min-height:36px}
+  .mx-tag{min-height:32px}
+
+  /* 禁用 hover 效果（触控无 hover） */
+  .mx-card:hover{box-shadow:var(--mx-sh1)}
+  .mx-stat:hover::before{opacity:0}
+  .mx-stat:hover::after{opacity:0.04}
+  .mx-stat:hover .mx-stat-icon{transform:none}
+  .mx-table tbody tr:hover{background:transparent}
+  .mx-table tbody tr:hover td{padding-left:14px}
+  .mx-table th:hover::after{transform:scaleX(0)}
+
+  /* 用 :active 替代 */
+  .mx-card:active{box-shadow:var(--mx-sh2)}
+  .mx-stat:active{box-shadow:var(--mx-sh2)}
+  .mx-table tbody tr:active{background:var(--mx-s-hover)}
+
+  /* Tooltip 改为长按触发 */
+  .mx-tooltip::after{
+    transition:none;
+    opacity:0;visibility:hidden;
+  }
+  .mx-tooltip:active::after{
+    opacity:1;visibility:visible;
+  }
+}
+
+/* ══════════════════════════════════════════
+   LANDSCAPE PHONE — 横屏手机
+   ══════════════════════════════════════════ */
+@media(max-height:500px) and (orientation:landscape){
+  .mx-topbar{height:40px}
+  .mx-bottom-nav{display:none!important}
+  .mx-modal{max-height:95dvh;border-radius:var(--mx-r)}
+  .mx-modal-overlay{align-items:center;padding:8px}
+  .mx-drawer{height:100dvh}
+}
+
+/* ══════════════════════════════════════════
+   FLEX utilities
+   ══════════════════════════════════════════ */
+.mx-flex{display:flex}
+.mx-flex-center{display:flex;align-items:center;justify-content:center}
+.mx-flex-between{display:flex;align-items:center;justify-content:space-between}
+.mx-gap-4{gap:4px}.mx-gap-8{gap:8px}.mx-gap-12{gap:12px}.mx-gap-16{gap:16px}
+
+/* ══════════════════════════════════════════
+   SAFE AREA — 全面屏设备
+   ══════════════════════════════════════════ */
+@supports(padding:max(0px)){
+  .mx-pad{padding:max(12px, env(safe-area-inset-left)) max(12px, env(safe-area-inset-right))}
+  @media(min-width:768px){.mx-pad{padding:max(20px, env(safe-area-inset-left)) max(20px, env(safe-area-inset-right))}}
+  .mx-bottom-nav{padding-bottom:max(4px, env(safe-area-inset-bottom))}
+}

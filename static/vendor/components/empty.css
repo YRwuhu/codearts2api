@@ -1,0 +1,46 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Empty State Component
+   ═══════════════════════════════════════════ */
+
+.mx-empty{
+  display:flex;flex-direction:column;
+  align-items:center;justify-content:center;
+  padding:48px 24px;text-align:center;
+}
+
+.mx-empty-icon{
+  width:64px;height:64px;
+  border-radius:var(--mx-r);
+  background:var(--mx-s3);
+  display:flex;align-items:center;justify-content:center;
+  margin-bottom:16px;
+  color:var(--mx-t3);
+}
+.mx-empty-icon svg{width:28px;height:28px}
+
+.mx-empty-title{
+  font-size:15px;font-weight:700;
+  color:var(--mx-text);margin-bottom:6px;
+}
+.mx-empty-desc{
+  font-size:13px;color:var(--mx-t3);
+  line-height:1.5;max-width:320px;margin-bottom:20px;
+}
+
+/* Inline variant — smaller */
+.mx-empty-inline{
+  padding:24px 16px;
+}
+.mx-empty-inline .mx-empty-icon{
+  width:48px;height:48px;
+}
+.mx-empty-inline .mx-empty-icon svg{width:22px;height:22px}
+
+/* Mobile */
+@media(max-width:767px){
+  .mx-empty{padding:32px 16px}
+  .mx-empty-icon{width:52px;height:52px}
+  .mx-empty-icon svg{width:24px;height:24px}
+  .mx-empty-title{font-size:14px}
+  .mx-empty-desc{font-size:12px}
+}

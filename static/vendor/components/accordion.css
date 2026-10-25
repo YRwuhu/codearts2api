@@ -1,0 +1,81 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Accordion / Collapse Component
+   ═══════════════════════════════════════════ */
+
+.mx-accordion{
+  display:flex;flex-direction:column;
+  border:1px solid var(--mx-divider);
+  border-radius:var(--mx-r);
+  overflow:hidden;
+}
+
+/* Item */
+.mx-accordion-item{
+  border-bottom:1px solid var(--mx-divider);
+}
+.mx-accordion-item:last-child{border-bottom:none}
+
+/* Header / Trigger */
+.mx-accordion-header{
+  display:flex;align-items:center;gap:10px;
+  padding:14px 16px;
+  cursor:pointer;
+  font-size:14px;font-weight:600;
+  color:var(--mx-text);
+  transition:all var(--mx-d1) var(--mx-ease);
+  -webkit-tap-highlight-color:transparent;
+}
+.mx-accordion-header:hover{background:var(--mx-s-hover)}
+.mx-accordion-header:active{background:var(--mx-s-active)}
+
+/* Icon slot */
+.mx-accordion-header svg{flex-shrink:0;color:var(--mx-t2)}
+.mx-accordion-header .mx-accordion-title{flex:1}
+
+/* Arrow */
+.mx-accordion-arrow{
+  color:var(--mx-t3);flex-shrink:0;
+  transition:transform var(--mx-d2) var(--mx-ease);
+}
+.mx-accordion-item.open .mx-accordion-arrow{transform:rotate(180deg)}
+
+/* Content */
+.mx-accordion-content{
+  max-height:0;overflow:hidden;
+  transition:max-height var(--mx-d3) var(--mx-ease);
+}
+.mx-accordion-item.open .mx-accordion-content{
+  max-height:500px;
+}
+.mx-accordion-body{
+  padding:0 16px 16px;
+  font-size:13px;line-height:1.6;
+  color:var(--mx-text-on-surface);
+}
+
+/* Card variant — separate cards */
+.mx-accordion-card{border:none;gap:8px;background:none}
+.mx-accordion-card .mx-accordion-item{
+  background:var(--mx-s2);
+  border:1px solid var(--mx-divider);
+  border-radius:var(--mx-r);
+  overflow:hidden;
+}
+.mx-accordion-card .mx-accordion-item:last-child{border-bottom:1px solid var(--mx-divider)}
+
+/* Flush variant — no borders */
+.mx-accordion-flush{border:none;border-radius:0}
+.mx-accordion-flush .mx-accordion-item{border:none}
+.mx-accordion-flush .mx-accordion-header{padding:12px 0}
+
+/* Disabled */
+.mx-accordion-header.disabled{
+  opacity:0.4;cursor:not-allowed;pointer-events:none;
+}
+
+/* Mobile */
+@media(max-width:767px){
+  .mx-accordion-header{padding:14px 14px;min-height:48px}
+  .mx-accordion-body{font-size:14px}
+  .mx-accordion-card .mx-accordion-item{border-radius:var(--mx-r-sm)}
+}

@@ -1,0 +1,117 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Modal / Dialog Component
+   对应 Miuix Dialog — 多层 Surface + 弹簧入场
+   ═══════════════════════════════════════════ */
+
+/* Overlay */
+.mx-modal-overlay{
+  position:fixed;inset:0;z-index:1000;
+  display:flex;align-items:center;justify-content:center;
+  background:var(--mx-window-dim);
+  opacity:0;visibility:hidden;
+  transition:opacity var(--mx-d2) var(--mx-ease),
+             visibility var(--mx-d2);
+  padding:16px;
+}
+.mx-modal-overlay.open{
+  opacity:1;visibility:visible;
+}
+
+/* Dialog */
+.mx-modal{
+  background:var(--mx-s2);
+  border-radius:var(--mx-r);
+  box-shadow:var(--mx-sh3);
+  width:100%;max-width:420px;
+  max-height:calc(100dvh - 48px);
+  overflow:hidden;
+  display:flex;flex-direction:column;
+  transform:scale(0.92) translateY(16px);
+  opacity:0;
+  transition:transform var(--mx-d3) var(--mx-spring),
+             opacity var(--mx-d2) var(--mx-ease);
+}
+.mx-modal-overlay.open .mx-modal{
+  transform:scale(1) translateY(0);
+  opacity:1;
+}
+
+/* Size variants */
+.mx-modal-sm{max-width:340px}
+.mx-modal-lg{max-width:560px}
+.mx-modal-xl{max-width:720px}
+.mx-modal-full{max-width:calc(100dvw - 32px);max-height:calc(100dvh - 32px)}
+
+/* Header */
+.mx-modal-head{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:16px 20px;
+  border-bottom:1px solid var(--mx-divider);
+  flex-shrink:0;
+}
+.mx-modal-title{
+  font-size:15px;font-weight:700;
+}
+.mx-modal-close{
+  width:28px;height:28px;
+  display:flex;align-items:center;justify-content:center;
+  border-radius:var(--mx-r-xs);
+  cursor:pointer;color:var(--mx-t3);
+  transition:all var(--mx-d1) var(--mx-ease);
+}
+.mx-modal-close:hover{background:var(--mx-s-hover);color:var(--mx-text)}
+.mx-modal-close:active{transform:scale(0.9)}
+
+/* Body */
+.mx-modal-body{
+  padding:20px;
+  overflow-y:auto;flex:1;
+  font-size:14px;line-height:1.6;color:var(--mx-text-on-surface);
+}
+
+/* Footer */
+.mx-modal-foot{
+  display:flex;align-items:center;justify-content:flex-end;gap:8px;
+  padding:12px 20px;
+  border-top:1px solid var(--mx-divider);
+  flex-shrink:0;
+}
+
+/* Confirmation variant — icon + centered text */
+.mx-modal-confirm-icon{
+  width:48px;height:48px;
+  border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+  margin:0 auto 16px;
+}
+.mx-modal-confirm-icon.info{background:rgba(96,165,250,0.12);color:var(--mx-blue)}
+.mx-modal-confirm-icon.success{background:rgba(52,211,153,0.12);color:var(--mx-green)}
+.mx-modal-confirm-icon.warning{background:rgba(251,191,36,0.12);color:var(--mx-amber)}
+.mx-modal-confirm-icon.danger{background:rgba(248,113,113,0.12);color:var(--mx-red)}
+.mx-modal-confirm-text{
+  text-align:center;font-size:14px;color:var(--mx-text-on-surface);
+  line-height:1.6;margin-bottom:4px;
+}
+.mx-modal-confirm-title{
+  text-align:center;font-size:16px;font-weight:700;
+  margin-bottom:8px;
+}
+.mx-modal-confirm-foot{justify-content:center}
+
+/* Mobile: 按钮全宽堆叠 */
+@media(max-width:767px){
+  .mx-modal-foot{flex-direction:column-reverse}
+  .mx-modal-foot .mx-btn{width:100%}
+}
+
+/* Tablet: 居中弹窗 */
+@media(min-width:768px) and (max-width:1023px){
+  .mx-modal-overlay{align-items:center;padding:16px}
+  .mx-modal{max-width:480px;transform:scale(0.92) translateY(16px)}
+  .mx-modal-overlay.open .mx-modal{transform:scale(1) translateY(0)}
+}
+
+/* ═══ DARK MODE INNER GLOW — unified with Card/Stat ═══ */
+[data-theme="dark"] .mx-modal{
+  box-shadow:var(--mx-sh3),inset 0 1px 0 rgba(255,255,255,0.04);
+}

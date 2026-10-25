@@ -1,0 +1,198 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Design Tokens
+   直接从 Miuix Colors.kt lightColorScheme() / darkColorScheme() 移植
+   ═══════════════════════════════════════════ */
+
+:root {
+  /* ── Primary — from Miuix lightColorScheme primary = Color(0xFF3482FF) ── */
+  --mx-primary: #3482FF;
+  --mx-primary-hover: #5D9BFF;
+  --mx-primary-active: #277AF7;
+  --mx-primary-on: #FFFFFF;
+  --mx-primary-glow: rgba(52,130,255,0.12);
+  --mx-primary-container: #5D9BFF;
+  --mx-primary-container-on: #FFFFFF;
+  --mx-primary-variant: #3482FF;
+  --mx-primary-variant-on: #AECDFF;
+  --mx-tertiary-container: #EAF2FF;
+  --mx-tertiary-container-on: #3482FF;
+
+  /* ── Error — from Miuix error = Color(0xFFE94634) ── */
+  --mx-error: #E94634;
+  --mx-error-on: #FFFFFF;
+  --mx-error-container: #FDF6F4;
+  --mx-error-container-on: #410002;
+
+  /* ── Semantic ── */
+  --mx-green: #34D399;
+  --mx-amber: #FBBF24;
+  --mx-blue: #60A5FA;
+
+  /* ── Surface — from Miuix lightColorScheme() 源码 ── */
+  --mx-bg: #FFFFFF;                     /* background = White */
+  --mx-surface: #F7F7F7;               /* surface = 0xFFF7F7F7 */
+  --mx-surface-variant: #FFFFFF;        /* surfaceVariant = White */
+  --mx-s1: #F7F7F7;                    /* surface */
+  --mx-s2: #FFFFFF;                    /* surfaceContainer = White */
+  --mx-s3: #E8E8E8;                    /* surfaceContainerHigh = 0xFFE8E8E8 */
+  --mx-s4: #E8E8E8;                    /* surfaceContainerHighest = 0xFFE8E8E8 */
+  --mx-s-hover: rgba(0,0,0,0.04);
+  --mx-s-active: rgba(0,0,0,0.07);
+
+  /* ── Text — from Miuix 源码 ── */
+  --mx-text: #000000;                   /* onSurface = Black */
+  --mx-text-on-surface: rgba(0,0,0,0.8); /* onSurfaceSecondary = 0xCC000000 */
+  --mx-text-variant: rgba(0,0,0,0.6);   /* onSurfaceVariantSummary = 0x99000000 */
+  --mx-text-actions: rgba(0,0,0,0.4);   /* onSurfaceVariantActions = 0x66000000 */
+  --mx-t2: rgba(0,0,0,0.6);
+  --mx-t3: rgba(0,0,0,0.4);
+  --mx-text-bg-variant: #8C93B0;        /* onBackgroundVariant */
+  --mx-text-container-variant: #959595;  /* onSurfaceContainerVariant */
+  --mx-text-container-high: #A2A2A2;     /* onSurfaceContainerHigh */
+  --mx-text-disabled: #B2B2B2;           /* disabledOnSurface */
+
+  /* ── Secondary — from Miuix 源码 ── */
+  --mx-secondary: #E6E6E6;              /* secondary */
+  --mx-secondary-variant: #F0F0F0;      /* secondaryVariant */
+  --mx-secondary-container: #F0F0F0;
+  --mx-secondary-container-on: #A9A9A9;
+
+  /* ── Border / Divider — from Miuix 源码 ── */
+  --mx-border: #D9D9D9;                 /* outline = 0xFFD9D9D9 */
+  --mx-divider: #E0E0E0;               /* dividerLine = 0xFFE0E0E0 */
+
+  /* ── Disabled — from Miuix 源码 ── */
+  --mx-disabled-primary: #C2D9FF;
+  --mx-disabled-primary-on: #F3F8FF;
+  --mx-disabled-secondary: #F0F0F0;
+  --mx-disabled-secondary-on: #FCFCFC;
+
+  /* ── Window ── */
+  --mx-window-dim: rgba(0,0,0,0.3);    /* windowDimming */
+
+  /* ── Slider — from Miuix 源码 ── */
+  --mx-slider-bg: rgba(0,0,0,0.06);    /* 0x0F000000 */
+  --mx-slider-key: rgba(163,179,205,0.3);
+  --mx-slider-key-fg: #6EB5FF;
+
+  /* ── Radius (Miuix Smooth Corner — 16dp default) ── */
+  --mx-r: 16px;
+  --mx-r-sm: 12px;
+  --mx-r-xs: 8px;
+  --mx-r-pill: 9999px;
+
+  /* ── Shadow (Miuix multi-layer soft shadow) ── */
+  --mx-sh1: 0 1px 4px rgba(0,0,0,0.08);
+  --mx-sh2: 0 4px 16px rgba(0,0,0,0.06);
+  --mx-sh3: 0 8px 32px rgba(0,0,0,0.08);
+  --mx-glow: 0 0 0 1px rgba(52,130,255,0.06), 0 2px 12px rgba(52,130,255,0.04);
+
+  /* ── Motion (Miuix spring + ease) ── */
+  --mx-ease: cubic-bezier(0.16, 1, 0.3, 1);
+  --mx-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --mx-d1: 100ms;
+  --mx-d2: 200ms;
+  --mx-d3: 320ms;
+  --mx-d4: 500ms;
+
+  /* ── Typography ── */
+  --mx-font: "MiSans", "Mi Sans", -apple-system, "PingFang SC", "Noto Sans SC", sans-serif;
+  --mx-mono: "JetBrains Mono", "SF Mono", monospace;
+
+  /* Typography scale */
+  --mx-text-xs: 11px;
+  --mx-text-sm: 12px;
+  --mx-text-base: 13px;
+  --mx-text-md: 14px;
+  --mx-text-lg: 15px;
+  --mx-text-xl: 16px;
+  --mx-text-2xl: 20px;
+  --mx-text-3xl: 24px;
+
+  /* ── Safe area ── */
+  --mx-safe-t: env(safe-area-inset-top, 0px);
+  --mx-safe-b: env(safe-area-inset-bottom, 0px);
+}
+
+/* ═══════════════════════════════════════════
+   DARK MODE — from Miuix darkColorScheme() 源码
+   ═══════════════════════════════════════════ */
+[data-theme="dark"] {
+  /* Primary — darkColorScheme primary = Color(0xFF277AF7) */
+  --mx-primary: #277AF7;
+  --mx-primary-hover: #338FE4;
+  --mx-primary-active: #0073DD;
+  --mx-primary-on: #FFFFFF;
+  --mx-primary-glow: rgba(39,122,247,0.15);
+  --mx-primary-container: #338FE4;
+  --mx-primary-container-on: #FFFFFF;
+  --mx-primary-variant: #0073DD;
+  --mx-primary-variant-on: #99C7F1;
+  --mx-tertiary-container: #2B3B54;
+  --mx-tertiary-container-on: #4788FF;
+
+  /* Error — darkColorScheme error = Color(0xFFF12522) */
+  --mx-error: #F12522;
+  --mx-error-on: #FFFFFF;
+  --mx-error-container: #2E0603;
+  --mx-error-container-on: #FFDAD6;
+
+  /* Surface — 5-level gradient with 3-5% brightness steps */
+  --mx-bg: #161616;                     /* 页面背景 — 最底层 */
+  --mx-surface: #0C0C0C;               /* surface = s1 */
+  --mx-surface-variant: #1C1C1C;        /* surfaceVariant = s2 */
+  --mx-s1: #0C0C0C;                    /* 导航栏、侧边栏 — 比 bg 深 */
+  --mx-s2: #1C1C1C;                    /* 卡片 — 比 bg 浅 */
+  --mx-s3: #242424;                    /* 输入框、浮层 — 比 s2 浅 */
+  --mx-s4: #2C2C2C;                    /* 下拉菜单 — 最亮 */
+  --mx-s-hover: rgba(255,255,255,0.04);
+  --mx-s-active: rgba(255,255,255,0.07);
+
+  /* Text — from Miuix darkColorScheme() 源码 */
+  --mx-text: #F2F2F2;                   /* onSurface = 0xFFF2F2F2 */
+  --mx-text-on-surface: rgba(255,255,255,0.8);  /* 0xCCFFFFFF */
+  --mx-text-variant: rgba(255,255,255,0.5);     /* 0x80FFFFFF */
+  --mx-text-actions: rgba(255,255,255,0.4);     /* 0x66FFFFFF */
+  --mx-t2: rgba(255,255,255,0.6);
+  --mx-t3: rgba(255,255,255,0.4);
+  --mx-text-bg-variant: #787E96;
+  --mx-text-container-variant: #737373;
+  --mx-text-container-high: #666666;
+  --mx-text-disabled: #666666;
+
+  /* Secondary — from Miuix darkColorScheme() 源码 */
+  --mx-secondary: #505050;
+  --mx-secondary-variant: #434343;
+  --mx-secondary-container: #434343;
+  --mx-secondary-container-on: #7C7C7C;
+
+  /* Border / Divider — 提升对比度 */
+  --mx-border: #484848;                 /* outline = 提升到可见 */
+  --mx-divider: #404040;               /* dividerLine = 提升到可见 */
+
+  /* Disabled */
+  --mx-disabled-primary: #253E64;
+  --mx-disabled-primary-on: #677993;
+  --mx-disabled-secondary: #3F3F3F;
+  --mx-disabled-secondary-on: #797979;
+
+  /* Window */
+  --mx-window-dim: rgba(0,0,0,0.6);
+
+  /* Slider */
+  --mx-slider-bg: rgba(255,255,255,0.15);
+  --mx-slider-key: rgba(122,138,166,0.3);
+  --mx-slider-key-fg: #5DAAFF;
+
+  /* Shadow — dark mode 阴影更重 */
+  --mx-sh1: 0 1px 4px rgba(0,0,0,0.5);
+  --mx-sh2: 0 4px 16px rgba(0,0,0,0.4);
+  --mx-sh3: 0 8px 32px rgba(0,0,0,0.45);
+  --mx-glow: 0 0 0 1px rgba(39,122,247,0.08), 0 2px 12px rgba(39,122,247,0.06);
+}
+
+/* ═══ COMPACT DENSITY ═══ */
+[data-density="compact"] {
+  --mx-r: 14px;
+  --mx-r-sm: 10px;
+}

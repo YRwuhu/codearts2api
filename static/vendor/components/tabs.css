@@ -1,0 +1,94 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Tabs Component
+   ═══════════════════════════════════════════ */
+
+/* Tab bar */
+.mx-tabs{
+  display:flex;align-items:center;
+  border-bottom:1px solid var(--mx-divider);
+  overflow-x:auto;scrollbar-width:none;
+  -webkit-overflow-scrolling:touch;
+}
+.mx-tabs::-webkit-scrollbar{display:none}
+
+/* Tab item */
+.mx-tab{
+  display:flex;align-items:center;gap:6px;
+  padding:10px 16px;
+  font-size:13px;font-weight:500;
+  color:var(--mx-t3);
+  cursor:pointer;white-space:nowrap;
+  position:relative;
+  transition:all var(--mx-d1) var(--mx-ease);
+  -webkit-tap-highlight-color:transparent;
+}
+.mx-tab:hover{color:var(--mx-text)}
+
+/* Active indicator — bottom line */
+.mx-tab::after{
+  content:'';position:absolute;bottom:0;left:8px;right:8px;
+  height:2px;border-radius:1px;
+  background:var(--mx-primary);
+  transform:scaleX(0);
+  transition:transform var(--mx-d2) var(--mx-spring);
+}
+.mx-tab.active{color:var(--mx-primary);font-weight:600}
+.mx-tab.active::after{transform:scaleX(1)}
+
+/* Badge in tab */
+.mx-tab .mx-count{margin-left:4px}
+
+/* Disabled */
+.mx-tab.disabled{opacity:0.4;pointer-events:none}
+
+/* Pill variant */
+.mx-tabs-pill{
+  border-bottom:none;
+  background:var(--mx-s3);
+  border-radius:var(--mx-r-pill);
+  padding:3px;gap:2px;
+}
+.mx-tabs-pill .mx-tab{
+  border-radius:var(--mx-r-pill);
+  padding:6px 14px;
+}
+.mx-tabs-pill .mx-tab::after{display:none}
+.mx-tabs-pill .mx-tab.active{
+  background:var(--mx-primary);color:#fff;
+  box-shadow:0 2px 8px rgba(76,139,245,0.25);
+}
+
+/* Card variant */
+.mx-tabs-card{
+  border-bottom:none;gap:4px;
+}
+.mx-tabs-card .mx-tab{
+  border-radius:var(--mx-r-sm);
+  padding:8px 14px;
+}
+.mx-tabs-card .mx-tab::after{display:none}
+.mx-tabs-card .mx-tab.active{
+  background:var(--mx-primary-glow);color:var(--mx-primary);
+}
+
+/* Tab content */
+.mx-tab-panel{display:none;padding:16px 0}
+.mx-tab-panel.active{display:block}
+
+/* Alignment */
+.mx-tabs-center{justify-content:center}
+.mx-tabs-end{justify-content:flex-end}
+
+/* Mobile: 触控友好 + 可滚动 */
+@media(max-width:767px){
+  .mx-tab{padding:12px 14px;min-height:44px;font-size:14px}
+  .mx-tabs-pill .mx-tab{padding:8px 16px}
+  .mx-tabs-card .mx-tab{padding:10px 14px}
+  /* 隐藏超出的 badge */
+  .mx-tab .mx-count{display:none}
+}
+
+/* Tablet: 可滚动 */
+@media(min-width:768px) and (max-width:1023px){
+  .mx-tabs{overflow-x:auto;-webkit-overflow-scrolling:touch}
+}

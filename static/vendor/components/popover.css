@@ -1,0 +1,87 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Popover Component
+   ═══════════════════════════════════════════ */
+
+.mx-popover-wrap{position:relative;display:inline-flex}
+
+.mx-popover{
+  position:absolute;z-index:600;
+  min-width:180px;
+  background:var(--mx-s4);
+  border:1px solid var(--mx-divider);
+  border-radius:var(--mx-r-sm);
+  box-shadow:var(--mx-sh3);
+  padding:6px;
+  opacity:0;visibility:hidden;
+  transform:scale(0.95) translateY(-4px);
+  transform-origin:top center;
+  transition:all var(--mx-d2) var(--mx-spring);
+  pointer-events:none;
+}
+.mx-popover.open{
+  opacity:1;visibility:visible;
+  transform:scale(1) translateY(0);
+  pointer-events:auto;
+}
+
+/* Position: bottom */
+.mx-popover-bottom{
+  top:calc(100% + 6px);left:50%;
+  transform:translateX(-50%) scale(0.95) translateY(-4px);
+  transform-origin:top center;
+}
+.mx-popover-bottom.open{
+  transform:translateX(-50%) scale(1) translateY(0);
+}
+
+/* Position: left */
+.mx-popover-left{
+  right:calc(100% + 6px);top:50%;
+  transform:translateY(-50%) scale(0.95) translateX(4px);
+  transform-origin:center right;
+}
+.mx-popover-left.open{
+  transform:translateY(-50%) scale(1) translateX(0);
+}
+
+/* Position: right */
+.mx-popover-right{
+  left:calc(100% + 6px);top:50%;
+  transform:translateY(-50%) scale(0.95) translateX(-4px);
+  transform-origin:center left;
+}
+.mx-popover-right.open{
+  transform:translateY(-50%) scale(1) translateX(0);
+}
+
+/* Item */
+.mx-popover-item{
+  display:flex;align-items:center;gap:8px;
+  padding:8px 10px;border-radius:var(--mx-r-xs);
+  font-size:13px;font-weight:500;
+  cursor:pointer;color:var(--mx-text);
+  transition:all var(--mx-d1) var(--mx-ease);
+}
+.mx-popover-item:hover{background:var(--mx-s-hover)}
+.mx-popover-item:active{background:var(--mx-s-active);transform:scale(0.98)}
+.mx-popover-item svg{flex-shrink:0;color:var(--mx-t2)}
+
+/* Divider */
+.mx-popover-divider{
+  height:1px;background:var(--mx-divider);
+  margin:4px 0;
+}
+
+/* Danger item */
+.mx-popover-item.danger{color:var(--mx-red)}
+.mx-popover-item.danger svg{color:var(--mx-red)}
+
+/* Mobile: 底部弹出 + 加大触控 */
+@media(max-width:767px){
+  .mx-popover-item{padding:12px 14px;min-height:44px;font-size:14px}
+}
+
+/* ═══ DARK MODE INNER GLOW — unified with Card/Stat ═══ */
+[data-theme="dark"] .mx-popover{
+  box-shadow:var(--mx-sh3),inset 0 1px 0 rgba(255,255,255,0.04);
+}

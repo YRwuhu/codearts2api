@@ -1,0 +1,54 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Tooltip Component
+   ═══════════════════════════════════════════ */
+
+.mx-tooltip{
+  position:relative;
+}
+.mx-tooltip::after{
+  content:attr(data-tooltip);
+  position:absolute;
+  bottom:calc(100% + 8px);left:50%;
+  transform:translateX(-50%) translateY(4px);
+  padding:5px 10px;
+  background:var(--mx-s4);
+  color:var(--mx-text);
+  font-size:12px;font-weight:500;
+  white-space:nowrap;
+  border-radius:var(--mx-r-xs);
+  box-shadow:var(--mx-sh2);
+  opacity:0;visibility:hidden;
+  pointer-events:none;
+  transition:all var(--mx-d2) var(--mx-spring);
+  z-index:500;
+}
+.mx-tooltip:hover::after{
+  opacity:1;visibility:visible;
+  transform:translateX(-50%) translateY(0);
+}
+
+/* Position variants */
+.mx-tooltip-bottom::after{
+  bottom:auto;top:calc(100% + 8px);
+  transform:translateX(-50%) translateY(-4px);
+}
+.mx-tooltip-bottom:hover::after{
+  transform:translateX(-50%) translateY(0);
+}
+
+.mx-tooltip-left::after{
+  bottom:auto;left:auto;
+  right:calc(100% + 8px);top:50%;
+  transform:translateY(-50%) translateX(4px);
+}
+.mx-tooltip-left:hover::after{
+  transform:translateY(-50%) translateX(0);
+}
+
+.mx-tooltip-right::after{
+  bottom:auto;left:calc(100% + 8px);top:50%;
+  transform:translateY(-50%) translateX(-4px);
+}
+.mx-tooltip-right:hover::after{
+  transform:translateY(-50%) translateX(0);
+}

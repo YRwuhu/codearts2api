@@ -1,0 +1,94 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Tag / Chip Component
+   ═══════════════════════════════════════════ */
+
+.mx-tag{
+  display:inline-flex;align-items:center;gap:4px;
+  padding:4px 10px;
+  border-radius:var(--mx-r-pill);
+  font-size:12px;font-weight:600;
+  background:var(--mx-s3);color:var(--mx-text);
+  transition:all var(--mx-d1) var(--mx-ease);
+  cursor:default;
+  -webkit-tap-highlight-color:transparent;
+}
+
+/* Clickable */
+.mx-tag-clickable{cursor:pointer}
+.mx-tag-clickable:hover{background:var(--mx-s4)}
+.mx-tag-clickable:active{transform:scale(0.95)}
+
+/* Color variants */
+.mx-tag-primary{background:var(--mx-primary-glow);color:var(--mx-primary)}
+.mx-tag-success{background:rgba(52,211,153,0.1);color:var(--mx-green)}
+.mx-tag-warning{background:rgba(251,191,36,0.1);color:var(--mx-amber)}
+.mx-tag-error{background:rgba(248,113,113,0.1);color:var(--mx-red)}
+.mx-tag-info{background:rgba(96,165,250,0.1);color:var(--mx-blue)}
+
+/* Outline variant */
+.mx-tag-outline{
+  background:transparent;
+  border:1px solid var(--mx-border);
+}
+.mx-tag-outline.mx-tag-primary{border-color:var(--mx-primary);color:var(--mx-primary)}
+.mx-tag-outline.mx-tag-success{border-color:var(--mx-green);color:var(--mx-green)}
+.mx-tag-outline.mx-tag-warning{border-color:var(--mx-amber);color:var(--mx-amber)}
+.mx-tag-outline.mx-tag-error{border-color:var(--mx-red);color:var(--mx-red)}
+
+/* With dot */
+.mx-tag-dot::before{
+  content:'';width:6px;height:6px;
+  border-radius:50%;flex-shrink:0;
+}
+.mx-tag-primary.mx-tag-dot::before{background:var(--mx-primary)}
+.mx-tag-success.mx-tag-dot::before{background:var(--mx-green)}
+.mx-tag-warning.mx-tag-dot::before{background:var(--mx-amber)}
+.mx-tag-error.mx-tag-dot::before{background:var(--mx-red)}
+.mx-tag-info.mx-tag-dot::before{background:var(--mx-blue)}
+
+/* Close button */
+.mx-tag-close{
+  width:14px;height:14px;
+  display:flex;align-items:center;justify-content:center;
+  border-radius:50%;cursor:pointer;
+  transition:background var(--mx-d1);
+}
+.mx-tag-close:hover{background:rgba(0,0,0,0.1)}
+[data-theme="dark"] .mx-tag-close:hover{background:rgba(255,255,255,0.1)}
+
+/* Sizes */
+.mx-tag-sm{padding:2px 8px;font-size:11px}
+.mx-tag-lg{padding:6px 14px;font-size:13px}
+
+/* Tag group */
+.mx-tag-group{
+  display:flex;flex-wrap:wrap;gap:6px;
+}
+
+/* Input tag — for editable tag list */
+.mx-tag-input{
+  display:flex;flex-wrap:wrap;gap:6px;
+  padding:6px 10px;
+  background:var(--mx-s3);
+  border:1px solid var(--mx-border);
+  border-radius:var(--mx-r-sm);
+  min-height:40px;align-items:center;
+  transition:all var(--mx-d2) var(--mx-ease);
+  cursor:text;
+}
+
+/* Mobile */
+@media(max-width:767px){
+  .mx-tag{min-height:32px;padding:4px 12px}
+  .mx-tag-lg{min-height:38px}
+  .mx-tag-close{width:18px;height:18px}
+}
+.mx-tag-input:focus-within{
+  border-color:var(--mx-primary);
+  box-shadow:0 0 0 3px var(--mx-primary-glow);
+}
+.mx-tag-input input{
+  flex:1;min-width:60px;border:none;outline:none;
+  background:none;font-size:13px;color:var(--mx-text);
+}
+.mx-tag-input input::placeholder{color:var(--mx-t3)}

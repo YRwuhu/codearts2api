@@ -1,0 +1,98 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Toast / Snackbar Component
+   Miuix 轻量反馈 — 底部弹出 + 自动消失
+   ═══════════════════════════════════════════ */
+
+/* Container */
+.mx-toast-container{
+  position:fixed;bottom:16px;left:50%;
+  transform:translateX(-50%);
+  z-index:2000;
+  display:flex;flex-direction:column-reverse;align-items:center;gap:8px;
+  pointer-events:none;
+  padding-bottom:var(--mx-safe-b);
+}
+
+/* Toast */
+.mx-toast{
+  display:flex;align-items:center;gap:10px;
+  padding:10px 16px;
+  background:var(--mx-s4);
+  border-radius:var(--mx-r-sm);
+  box-shadow:var(--mx-sh3);
+  font-size:13px;font-weight:500;
+  color:var(--mx-text);
+  pointer-events:auto;
+  max-width:calc(100vw - 32px);
+  transform:translateY(12px) scale(0.95);
+  opacity:0;
+  transition:transform var(--mx-d3) var(--mx-spring),
+             opacity var(--mx-d2) var(--mx-ease);
+}
+.mx-toast.show{
+  transform:translateY(0) scale(1);
+  opacity:1;
+}
+.mx-toast.hide{
+  transform:translateY(-8px) scale(0.95);
+  opacity:0;
+}
+
+/* Icon */
+.mx-toast-icon{
+  width:20px;height:20px;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;
+}
+.mx-toast-icon svg{width:18px;height:18px}
+
+/* Variants */
+.mx-toast-success .mx-toast-icon{color:var(--mx-green)}
+.mx-toast-warning .mx-toast-icon{color:var(--mx-amber)}
+.mx-toast-error .mx-toast-icon{color:var(--mx-red)}
+.mx-toast-info .mx-toast-icon{color:var(--mx-blue)}
+
+/* Action button */
+.mx-toast-action{
+  padding:4px 10px;border-radius:var(--mx-r-xs);
+  font-size:12px;font-weight:600;
+  cursor:pointer;
+  transition:all var(--mx-d1) var(--mx-ease);
+  flex-shrink:0;
+}
+.mx-toast-action{color:var(--mx-primary)}
+.mx-toast-action:hover{background:var(--mx-primary-glow)}
+
+/* Close button */
+.mx-toast-close{
+  width:20px;height:20px;
+  display:flex;align-items:center;justify-content:center;
+  border-radius:var(--mx-r-xs);
+  cursor:pointer;color:var(--mx-t3);
+  transition:all var(--mx-d1);
+  flex-shrink:0;
+}
+.mx-toast-close:hover{color:var(--mx-text)}
+
+/* Progress bar (auto dismiss) */
+.mx-toast-progress{
+  position:absolute;bottom:0;left:0;
+  height:2px;border-radius:0 0 var(--mx-r-sm) var(--mx-r-sm);
+  background:var(--mx-primary);
+  opacity:0.4;
+  transition:width linear;
+}
+
+/* Mobile — full width + 底部安全区 */
+@media(max-width:767px){
+  .mx-toast-container{
+    left:8px;right:8px;
+    transform:none;
+    align-items:stretch;
+  }
+  .mx-toast{border-radius:var(--mx-r)}
+}
+
+/* Tablet */
+@media(min-width:768px) and (max-width:1023px){
+  .mx-toast-container{bottom:20px}
+}

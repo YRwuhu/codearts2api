@@ -1,0 +1,230 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Liquid Glass Effect v2
+   液体玻璃效果系统（完整版）
+   通过 [data-glass="liquid"] 属性启用
+   ═══════════════════════════════════════════ */
+
+/* ── Glass Variables ── */
+:root {
+  --mx-glass-blur: 12px;
+  --mx-glass-saturation: 180%;
+  --mx-glass-displacement: 25;
+  --mx-glass-aberration: 2;
+  --mx-glass-elasticity: 0.15;
+  --mx-glass-corner-radius: 16px;
+  --mx-glass-activation-zone: 200;
+  --mx-glass-bg-light: rgba(255, 255, 255, 0.25);
+  --mx-glass-bg-dark: rgba(0, 0, 0, 0.35);
+  --mx-glass-border-light: rgba(255, 255, 255, 0.2);
+  --mx-glass-border-dark: rgba(255, 255, 255, 0.08);
+  --mx-glass-mouse-x: 0;
+  --mx-glass-mouse-y: 0;
+}
+
+/* ═══════════════════════════════════════════
+   DARK MODE (default)
+   ═══════════════════════════════════════════ */
+
+/* ── TopBar ── */
+[data-glass="liquid"] .mx-topbar {
+  background: rgba(22, 22, 22, 0.45);
+  backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  -webkit-backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  border-bottom: 1px solid var(--mx-glass-border-dark);
+  filter: url(#mx-glass-filter);
+}
+
+/* ── Sidebar ── */
+[data-glass="liquid"] .mx-sidebar {
+  background: rgba(22, 22, 22, 0.45);
+  backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  -webkit-backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  border-right: 1px solid var(--mx-glass-border-dark);
+  filter: url(#mx-glass-filter);
+}
+
+/* ── Bottom Nav ── */
+[data-glass="liquid"] .mx-bottom-nav {
+  background: rgba(22, 22, 22, 0.45);
+  backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  -webkit-backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  border-top: 1px solid var(--mx-glass-border-dark);
+  filter: url(#mx-glass-filter);
+}
+
+/* ── Modal ── */
+[data-glass="liquid"] .mx-modal {
+  background: rgba(30, 30, 30, 0.5);
+  backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  -webkit-backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  border: 1px solid var(--mx-glass-border-dark);
+  filter: url(#mx-glass-filter);
+}
+
+/* ── Drawer ── */
+[data-glass="liquid"] .mx-drawer {
+  background: rgba(22, 22, 22, 0.5);
+  backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  -webkit-backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  border-left: 1px solid var(--mx-glass-border-dark);
+  filter: url(#mx-glass-filter);
+}
+
+/* ── Popover ── */
+[data-glass="liquid"] .mx-popover {
+  background: rgba(30, 30, 30, 0.5);
+  backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  -webkit-backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  border: 1px solid var(--mx-glass-border-dark);
+  filter: url(#mx-glass-filter);
+}
+
+/* ── Select Dropdown ── */
+[data-glass="liquid"] .mx-select-dropdown {
+  background: rgba(30, 30, 30, 0.5);
+  backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  -webkit-backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  border: 1px solid var(--mx-glass-border-dark);
+  filter: url(#mx-glass-filter);
+}
+
+/* ── Card (opt-in via .mx-card-glass) ── */
+[data-glass="liquid"] .mx-card-glass {
+  background: rgba(30, 30, 30, 0.4);
+  backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  -webkit-backdrop-filter: blur(var(--mx-glass-blur)) saturate(var(--mx-glass-saturation));
+  border: 1px solid var(--mx-glass-border-dark);
+  filter: url(#mx-glass-filter);
+}
+
+/* ═══════════════════════════════════════════
+   LIGHT MODE
+   ═══════════════════════════════════════════ */
+
+[data-theme="light"][data-glass="liquid"] .mx-topbar {
+  background: rgba(255, 255, 255, 0.45);
+  border-bottom: 1px solid var(--mx-glass-border-light);
+}
+
+[data-theme="light"][data-glass="liquid"] .mx-sidebar {
+  background: rgba(255, 255, 255, 0.45);
+  border-right: 1px solid var(--mx-glass-border-light);
+}
+
+[data-theme="light"][data-glass="liquid"] .mx-bottom-nav {
+  background: rgba(255, 255, 255, 0.45);
+  border-top: 1px solid var(--mx-glass-border-light);
+}
+
+[data-theme="light"][data-glass="liquid"] .mx-modal {
+  background: rgba(255, 255, 255, 0.5);
+  border: 1px solid var(--mx-glass-border-light);
+}
+
+[data-theme="light"][data-glass="liquid"] .mx-drawer {
+  background: rgba(255, 255, 255, 0.5);
+  border-left: 1px solid var(--mx-glass-border-light);
+}
+
+[data-theme="light"][data-glass="liquid"] .mx-popover {
+  background: rgba(255, 255, 255, 0.5);
+  border: 1px solid var(--mx-glass-border-light);
+}
+
+[data-theme="light"][data-glass="liquid"] .mx-select-dropdown {
+  background: rgba(255, 255, 255, 0.5);
+  border: 1px solid var(--mx-glass-border-light);
+}
+
+[data-theme="light"][data-glass="liquid"] .mx-card-glass {
+  background: rgba(255, 255, 255, 0.4);
+  border: 1px solid var(--mx-glass-border-light);
+}
+
+/* ═══════════════════════════════════════════
+   OVER-LIGHT 模式
+   亮色背景上使用的深色玻璃
+   ═══════════════════════════════════════════ */
+
+[data-glass="liquid"][data-glass-over-light="true"] .mx-topbar,
+[data-glass="liquid"][data-glass-over-light="true"] .mx-sidebar,
+[data-glass="liquid"][data-glass-over-light="true"] .mx-bottom-nav,
+[data-glass="liquid"][data-glass-over-light="true"] .mx-modal,
+[data-glass="liquid"][data-glass-over-light="true"] .mx-drawer,
+[data-glass="liquid"][data-glass-over-light="true"] .mx-popover,
+[data-glass="liquid"][data-glass-over-light="true"] .mx-select-dropdown,
+[data-glass="liquid"][data-glass-over-light="true"] .mx-card-glass {
+  background: rgba(0, 0, 0, 0.45);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+/* ═══════════════════════════════════════════
+   GLASS 可追踪元素
+   鼠标跟踪 + 弹性变换 + 双层边框
+   ═══════════════════════════════════════════ */
+
+.mx-glass-trackable {
+  position: relative;
+  transition: transform 0.2s ease-out;
+  will-change: transform;
+}
+
+.mx-glass-trackable .mx-glass-border-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: inherit;
+  z-index: 2;
+}
+
+/* Hover 高光层 */
+.mx-glass-trackable::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease-out;
+  background-image: radial-gradient(circle at 50% 0%, rgba(255,255,255,0.5) 0%, rgba(255,255,255,0) 50%);
+  mix-blend-mode: overlay;
+  z-index: 3;
+}
+
+.mx-glass-trackable:hover::after {
+  opacity: 0.5;
+}
+
+.mx-glass-trackable:active::after {
+  opacity: 0.8;
+  background-image: radial-gradient(circle at 50% 0%, rgba(255,255,255,1) 0%, rgba(255,255,255,0) 80%);
+}
+
+/* ═══════════════════════════════════════════
+   FALLBACK — browsers without SVG filter support
+   ═══════════════════════════════════════════ */
+@supports not (filter: url(#mx-glass-filter)) {
+  [data-glass="liquid"] .mx-topbar,
+  [data-glass="liquid"] .mx-sidebar,
+  [data-glass="liquid"] .mx-bottom-nav,
+  [data-glass="liquid"] .mx-modal,
+  [data-glass="liquid"] .mx-drawer,
+  [data-glass="liquid"] .mx-popover,
+  [data-glass="liquid"] .mx-select-dropdown,
+  [data-glass="liquid"] .mx-card-glass {
+    filter: none;
+  }
+}
+
+/* ═══════════════════════════════════════════
+   REDUCED MOTION
+   ═══════════════════════════════════════════ */
+@media (prefers-reduced-motion: reduce) {
+  .mx-glass-trackable {
+    transition: none !important;
+    transform: none !important;
+  }
+  .mx-glass-trackable::after {
+    transition: none !important;
+  }
+}

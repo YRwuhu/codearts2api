@@ -1,0 +1,77 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Input Component
+   ═══════════════════════════════════════════ */
+
+.mx-input-wrap{
+  display:flex;align-items:center;gap:10px;
+  background:var(--mx-s3);
+  border:1px solid var(--mx-border);
+  border-radius:var(--mx-r-sm);
+  padding:0 16px;height:40px;
+  transition:all var(--mx-d2) var(--mx-ease);
+}
+.mx-input-wrap:focus-within{
+  border-color:var(--mx-primary);
+  box-shadow:0 0 0 3px var(--mx-primary-glow);
+  background:var(--mx-s2);
+}
+.mx-input-wrap .mx-input-icon{
+  color:var(--mx-t3);flex-shrink:0;
+  display:flex;align-items:center;
+}
+.mx-input{
+  width:100%;height:100%;
+  background:none;
+  color:var(--mx-text);font-size:14px;
+  font-family:var(--mx-font);
+}
+.mx-input::placeholder{color:var(--mx-t3)}
+
+/* Textarea */
+.mx-textarea-wrap{
+  padding:12px 14px;height:auto;min-height:80px;
+  align-items:flex-start;
+}
+.mx-textarea{
+  width:100%;resize:vertical;min-height:60px;
+  background:none;border:none;outline:none;
+  color:var(--mx-text);font-size:14px;
+  font-family:var(--mx-font);line-height:1.6;
+}
+.mx-textarea::placeholder{color:var(--mx-t3)}
+
+/* Sizes */
+.mx-input-sm{height:34px;padding:0 12px;font-size:13px;border-radius:var(--mx-r-xs)}
+.mx-input-lg{height:46px;padding:0 16px;font-size:15px}
+
+/* Error */
+.mx-input-error{border-color:var(--mx-red)}
+.mx-input-error:focus-within{box-shadow:0 0 0 3px rgba(248,113,113,0.15)}
+
+/* Disabled */
+.mx-input-wrap.mx-disabled{
+  opacity:0.4;cursor:not-allowed;
+}
+.mx-input-wrap.mx-disabled input{pointer-events:none}
+
+/* Label */
+.mx-label{
+  display:block;font-size:12px;font-weight:600;
+  color:var(--mx-t2);margin-bottom:6px;
+  text-transform:uppercase;letter-spacing:0.04em;
+}
+
+/* Helper text */
+.mx-helper{font-size:12px;color:var(--mx-t3);margin-top:4px}
+.mx-helper-error{color:var(--mx-red)}
+
+/* Mobile: 防止 iOS 自动缩放 + 加大触控区 */
+@media(max-width:767px){
+  .mx-input-wrap{height:44px;padding:0 16px}
+  .mx-input{font-size:16px}
+  .mx-input-sm{height:38px;font-size:15px}
+  .mx-input-lg{height:50px;font-size:16px}
+  .mx-textarea-wrap{min-height:88px}
+  .mx-textarea{font-size:16px;min-height:72px}
+  .mx-label{font-size:13px;margin-bottom:8px}
+}

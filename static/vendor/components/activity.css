@@ -1,0 +1,53 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Activity List Component
+   ═══════════════════════════════════════════ */
+
+.mx-activity-item{
+  display:flex;align-items:flex-start;gap:12px;
+  padding:13px 0;
+  border-bottom:1px solid var(--mx-divider);
+  transition:all var(--mx-d1);
+}
+.mx-activity-item:last-child{border-bottom:none}
+.mx-activity-item:active{
+  background:var(--mx-s-active);
+  margin:0 -16px;padding:13px 16px;border-radius:var(--mx-r-sm);
+}
+
+.mx-activity-dot{
+  width:8px;height:8px;border-radius:50%;
+  margin-top:6px;flex-shrink:0;
+  transition:transform var(--mx-d2) var(--mx-spring);
+}
+.mx-activity-item:hover .mx-activity-dot{transform:scale(1.5)}
+
+.mx-activity-text{font-size:13px;line-height:1.5}
+.mx-activity-text b{font-weight:600;color:var(--mx-text)}
+.mx-activity-time{font-size:11px;color:var(--mx-t3);margin-top:3px}
+
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Chart Bar Component
+   ═══════════════════════════════════════════ */
+
+.mx-chart{display:flex;align-items:flex-end;gap:5px;height:160px}
+.mx-chart-bar-col{
+  flex:1;display:flex;flex-direction:column;
+  align-items:center;gap:6px;min-width:0;
+}
+.mx-chart-bar{
+  width:100%;border-radius:7px 7px 3px 3px;
+  background:var(--mx-primary);
+  transform-origin:bottom;
+  transition:filter var(--mx-d1),transform var(--mx-d1);
+}
+.mx-chart-bar.alt{background:var(--mx-s4)}
+.mx-chart-bar:active{filter:brightness(1.2);transform:scaleY(1.04)}
+
+.mx-chart-label{
+  font-size:10px;color:var(--mx-t3);
+  font-variant-numeric:tabular-nums;
+}
+
+/* Responsive chart height */
+@media(min-width:768px){.mx-chart{height:180px}}
+@media(min-width:1024px){.mx-chart{height:200px}}

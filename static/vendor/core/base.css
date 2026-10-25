@@ -1,0 +1,50 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Base Reset & Globals
+   ═══════════════════════════════════════════ */
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{font-size:14px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+body{
+  font-family:var(--mx-font);
+  background:var(--mx-bg);
+  color:var(--mx-text);
+  overflow-x:hidden;
+  min-height:100dvh;
+}
+button,input,textarea,select{font-family:inherit;border:none;outline:none;background:none}
+ul,ol{list-style:none}
+a{text-decoration:none;color:inherit}
+img{display:block;max-width:100%}
+
+/* Smooth scroll */
+html{scroll-behavior:smooth}
+
+/* Selection */
+::selection{background:var(--mx-primary-glow);color:var(--mx-text)}
+
+/* Scrollbar — Miuix thin style, auto-hide */
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--mx-s4);border-radius:2px;opacity:0;transition:opacity 0.3s}
+::-webkit-scrollbar-thumb:hover{background:var(--mx-t3)}
+body:hover ::-webkit-scrollbar-thumb{opacity:1}
+
+/* Firefox scrollbar auto-hide */
+*{scrollbar-color:transparent transparent}
+body:hover *{scrollbar-color:var(--mx-s4) transparent}
+
+/* Prevent selection on interactive */
+.no-select{-webkit-user-select:none;user-select:none}
+
+/* ═══ DARK MODE INNER GLOW — Miuix signature depth ═══ */
+[data-theme="dark"] .mx-card,
+[data-theme="dark"] .mx-stat{
+  box-shadow:var(--mx-sh1),inset 0 1px 0 rgba(255,255,255,0.04);
+}
+
+/* ═══ prefers-reduced-motion — kill all animation ═══ */
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{
+    animation-duration:0.01ms !important;
+    transition-duration:0.01ms !important;
+  }
+}

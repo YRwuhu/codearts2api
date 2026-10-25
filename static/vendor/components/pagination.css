@@ -1,0 +1,83 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Pagination Component
+   ═══════════════════════════════════════════ */
+
+.mx-pagination{
+  display:flex;align-items:center;gap:4px;
+  font-size:13px;
+}
+
+/* Page button */
+.mx-page-btn{
+  width:34px;height:34px;
+  display:flex;align-items:center;justify-content:center;
+  border-radius:var(--mx-r-xs);
+  cursor:pointer;color:var(--mx-t2);
+  font-weight:500;
+  transition:all var(--mx-d1) var(--mx-ease);
+  -webkit-tap-highlight-color:transparent;
+}
+.mx-page-btn:hover{background:var(--mx-s-hover);color:var(--mx-text)}
+.mx-page-btn:active{transform:scale(0.92)}
+
+/* Active */
+.mx-page-btn.active{
+  background:var(--mx-primary);color:#fff;
+  box-shadow:0 2px 8px rgba(76,139,245,0.25);
+}
+
+/* Disabled */
+.mx-page-btn.disabled{
+  opacity:0.3;pointer-events:none;
+}
+
+/* Ellipsis */
+.mx-page-ellipsis{
+  width:34px;height:34px;
+  display:flex;align-items:center;justify-content:center;
+  color:var(--mx-t3);font-size:12px;
+  letter-spacing:2px;
+}
+
+/* Prev / Next with text */
+.mx-page-prev,.mx-page-next{
+  display:flex;align-items:center;gap:4px;
+  padding:0 10px;height:34px;
+  border-radius:var(--mx-r-xs);
+  cursor:pointer;color:var(--mx-t2);
+  font-size:13px;font-weight:500;
+  transition:all var(--mx-d1) var(--mx-ease);
+}
+.mx-page-prev:hover,.mx-page-next:hover{
+  background:var(--mx-s-hover);color:var(--mx-text);
+}
+.mx-page-prev:active,.mx-page-next:active{transform:scale(0.95)}
+.mx-page-prev.disabled,.mx-page-next.disabled{
+  opacity:0.3;pointer-events:none;
+}
+
+/* Size info */
+.mx-page-info{
+  font-size:12px;color:var(--mx-t3);
+  margin:0 8px;
+}
+
+/* Simple variant — just prev/next + info */
+.mx-pagination-simple .mx-page-btn{display:none}
+.mx-pagination-simple .mx-page-ellipsis{display:none}
+
+/* Mobile: 精简显示 */
+@media(max-width:767px){
+  .mx-page-prev span,.mx-page-next span{display:none}
+  .mx-page-info{display:none}
+  .mx-pagination{gap:2px}
+  .mx-page-btn{width:32px;height:32px;font-size:12px}
+  .mx-page-prev,.mx-page-next{padding:0 6px;height:32px}
+  /* 只显示前 5 页 */
+  .mx-page-btn:nth-child(n+8){display:none}
+}
+
+/* Tablet */
+@media(min-width:768px) and (max-width:1023px){
+  .mx-page-btn{width:36px;height:36px}
+}

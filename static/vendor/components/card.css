@@ -1,0 +1,67 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Card Component
+   对应 Miuix Card.kt
+   CornerRadius = 16.dp, surfaceContainer 背景
+   ═══════════════════════════════════════════ */
+
+.mx-card{
+  background:var(--mx-s2);
+  border-radius:var(--mx-r);
+  overflow:hidden;
+  box-shadow:var(--mx-sh1);
+  transition:box-shadow var(--mx-d3) var(--mx-ease);
+}
+.mx-card:hover{
+  box-shadow:var(--mx-sh2);
+  transition-duration:var(--mx-d2);
+}
+
+.mx-card-head{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:12px 16px;
+  border-bottom:1px solid var(--mx-divider);
+}
+.mx-card-title{font-size:15px;font-weight:700}
+
+.mx-card-body{padding:16px}
+.mx-card-body > * + * { margin-top: 12px; }
+.mx-card-body > .mx-table-wrap { margin-top: 0; }
+.mx-card-body > .mx-chart { margin-top: 0; }
+
+/* 可点击卡片 — Miuix BasicCard with press feedback */
+.mx-card-clickable{
+  cursor:pointer;
+  transition:box-shadow var(--mx-d3) var(--mx-ease),
+             transform var(--mx-d3) var(--mx-ease);
+}
+.mx-card-clickable:hover{
+  transition-duration:var(--mx-d2);
+}
+.mx-card-clickable:active{transform:scale(0.98)}
+
+/* Mobile: 卡片内边距调整 */
+@media(max-width:767px){
+  .mx-card-body{padding:14px}
+  .mx-card-head{padding:12px 14px}
+}
+
+/* Miuix: 顶部 accent 线 */
+.mx-card-accent{
+  position:relative;overflow:hidden;
+}
+.mx-card-accent::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:2px;
+  background:var(--mx-card-accent,var(--mx-primary));
+  opacity:0;transition:opacity var(--mx-d2);
+}
+.mx-card-accent:hover::before{opacity:1}
+
+/* Miuix: 右上角柔光晕 */
+.mx-card-accent::after{
+  content:'';position:absolute;top:-40%;right:-20%;
+  width:100px;height:100px;
+  background:var(--mx-card-accent,var(--mx-primary));
+  border-radius:50%;opacity:0.04;
+  transition:opacity var(--mx-d2);
+}
+.mx-card-accent:hover::after{opacity:0.08}

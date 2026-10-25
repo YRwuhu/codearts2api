@@ -15,15 +15,11 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::models::{Pool, TARGET};
+use crate::models::TARGET;
 use crate::params;
+use crate::web::WebState;
 
-#[derive(Clone)]
-pub struct AppState {
-    pub pool: Pool,
-    pub http: reqwest::Client,
-    pub max_tokens_cap: i64,
-}
+pub type AppState = WebState;
 
 pub fn router(state: AppState) -> Router {
     let cors = CorsLayer::new()
@@ -39,6 +35,8 @@ pub fn router(state: AppState) -> Router {
             post(chat_completions).options(preflight),
         )
         .layer(cors)
+        .merge(crate::admin::router())
+        .merge(crate::web::router())
         .with_state(state)
 }
 
@@ -47,9 +45,9 @@ async fn preflight() -> StatusCode {
 }
 
 async fn list_models(State(state): State<AppState>) -> Response {
-    state.pool.ensure_fresh().await;
-    let data: Vec<Value> = state
-        .pool
+    let pool = state.pool.read().await.clone();
+    pool.ensure_fresh().await;
+    let data: Vec<Value> = pool
         .merged_models()
         .await
         .iter()
@@ -59,8 +57,9 @@ async fn list_models(State(state): State<AppState>) -> Response {
 }
 
 async fn get_model(State(state): State<AppState>, Path(model_id): Path<String>) -> Response {
-    state.pool.ensure_fresh().await;
-    let models = state.pool.merged_models().await;
+    let pool = state.pool.read().await.clone();
+    pool.ensure_fresh().await;
+    let models = pool.merged_models().await;
     match models.iter().find(|m| m.id == model_id) {
         Some(m) => Json(m.to_openai()).into_response(),
         None => (
@@ -119,16 +118,17 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid JSON body"),
     };
 
-    state.pool.ensure_fresh().await;
+    let pool = state.pool.read().await.clone();
+    pool.ensure_fresh().await;
 
     let model = req_json
         .get("model")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or(state.pool.first_model().await)
+        .or(pool.first_model().await)
         .unwrap_or_default();
 
-    if !state.pool.contains(&model).await {
+    if !pool.contains(&model).await {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": {
@@ -146,11 +146,10 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let cap = state
-        .pool
+    let cap = pool
         .max_tokens_of(&model)
         .await
-        .unwrap_or(state.max_tokens_cap);
+        .unwrap_or(state.config().max_tokens_cap);
 
     let mut prepared = req_json.clone();
     prepared["model"] = json!(model);
@@ -160,7 +159,7 @@ async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Respons
         }
     }
 
-    let candidates = state.pool.accounts_for(&model).await;
+    let candidates = pool.accounts_for(&model).await;
     if candidates.is_empty() {
         return error_response(StatusCode::NOT_FOUND, format!("model '{model}' 无可用账号"));
     }

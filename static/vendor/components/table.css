@@ -1,0 +1,85 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Table Component
+   ═══════════════════════════════════════════ */
+
+.mx-table-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.mx-table{width:100%;border-collapse:collapse}
+
+.mx-table th{
+  padding:12px 16px;
+  font-size:11px;font-weight:700;
+  color:var(--mx-t3);text-align:left;
+  text-transform:uppercase;letter-spacing:0.06em;
+  border-bottom:1px solid var(--mx-divider);
+  white-space:nowrap;cursor:pointer;
+  position:relative;transition:color var(--mx-d1);
+  -webkit-user-select:none;user-select:none;
+}
+.mx-table th:hover{color:var(--mx-t2)}
+/* Miuix: 表头 hover 底部亮线 */
+.mx-table th::after{
+  content:'';position:absolute;bottom:0;left:14px;right:14px;
+  height:2px;background:var(--mx-primary);border-radius:1px;
+  transform:scaleX(0);transition:transform var(--mx-d2) var(--mx-ease);
+}
+.mx-table th:hover::after{transform:scaleX(1)}
+
+.mx-table td{
+  padding:12px 16px;
+  font-size:13px;
+  border-bottom:1px solid var(--mx-divider);
+  white-space:nowrap;
+  transition:padding var(--mx-d1);
+}
+
+.mx-table tbody tr{
+  transition:background var(--mx-d3);
+}
+.mx-table tbody tr:hover{
+  background:var(--mx-s-hover);
+  transition-duration:var(--mx-d2);
+}
+.mx-table tbody tr:active{background:var(--mx-s-active)}
+/* Miuix: hover 时左 padding 微推 */
+.mx-table tbody tr:hover td{padding-left:18px}
+
+/* Mono cell */
+.mx-table .mono{
+  font-family:var(--mx-mono);font-size:12px;color:var(--mx-t2);
+}
+
+/* Compact mode */
+.mx-table-compact th{padding:8px 12px}
+.mx-table-compact td{padding:10px 12px}
+.mx-table-compact tbody tr:hover td{padding-left:14px}
+
+/* Mobile: 表格卡片化（需 data-label 属性配合） */
+@media(max-width:767px){
+  .mx-table-wrap{overflow-x:visible}
+  .mx-table{border:0}
+  .mx-table thead{display:none}
+  .mx-table tbody tr{
+    display:block;margin-bottom:12px;
+    border:1px solid var(--mx-divider);
+    border-radius:var(--mx-r-sm);
+    padding:12px;
+    background:var(--mx-s2);
+  }
+  .mx-table tbody td{
+    display:flex;justify-content:space-between;align-items:center;
+    padding:6px 0;border-bottom:1px solid var(--mx-divider);
+    white-space:normal;
+  }
+  .mx-table tbody td:last-child{border-bottom:none}
+  .mx-table tbody td::before{
+    content:attr(data-label);
+    font-size:11px;font-weight:700;color:var(--mx-t3);
+    text-transform:uppercase;letter-spacing:0.04em;
+    flex-shrink:0;margin-right:12px;
+  }
+  .mx-table tbody tr:hover td{padding-left:0}
+  .mx-table tbody tr:active{background:var(--mx-s-hover)}
+
+  .mx-table-compact tbody tr{padding:10px}
+  .mx-table-compact td{padding:5px 0}
+}

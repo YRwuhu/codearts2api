@@ -1,0 +1,93 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Drawer / Side Panel Component
+   ═══════════════════════════════════════════ */
+
+/* Overlay */
+.mx-drawer-overlay{
+  position:fixed;inset:0;z-index:900;
+  background:var(--mx-window-dim);
+  opacity:0;visibility:hidden;
+  transition:opacity var(--mx-d2) var(--mx-ease),
+             visibility var(--mx-d2);
+}
+.mx-drawer-overlay.open{opacity:1;visibility:visible}
+
+/* Drawer */
+.mx-drawer{
+  position:fixed;top:0;z-index:950;
+  width:320px;height:100dvh;
+  background:var(--mx-s1);
+  box-shadow:var(--mx-sh3);
+  display:flex;flex-direction:column;
+  transition:transform var(--mx-d3) var(--mx-spring);
+}
+
+/* Position: right (default) */
+.mx-drawer-right{
+  right:0;
+  transform:translateX(100%);
+}
+.mx-drawer-right.open{transform:translateX(0)}
+
+/* Position: left */
+.mx-drawer-left{
+  left:0;
+  transform:translateX(-100%);
+}
+.mx-drawer-left.open{transform:translateX(0)}
+
+/* Size variants */
+.mx-drawer-sm{width:280px}
+.mx-drawer-lg{width:420px}
+@media(min-width:1024px){
+  .mx-drawer-xl{width:560px}
+}
+
+/* Header */
+.mx-drawer-head{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:16px 20px;
+  border-bottom:1px solid var(--mx-divider);
+  flex-shrink:0;
+}
+.mx-drawer-title{font-size:15px;font-weight:700}
+.mx-drawer-close{
+  width:28px;height:28px;
+  display:flex;align-items:center;justify-content:center;
+  border-radius:var(--mx-r-xs);
+  cursor:pointer;color:var(--mx-t3);
+  transition:all var(--mx-d1);
+}
+.mx-drawer-close:hover{background:var(--mx-s-hover);color:var(--mx-text)}
+
+/* Body */
+.mx-drawer-body{
+  flex:1;overflow-y:auto;padding:20px;
+  font-size:14px;line-height:1.6;
+}
+
+/* Footer */
+.mx-drawer-foot{
+  display:flex;align-items:center;justify-content:flex-end;gap:8px;
+  padding:12px 20px;
+  border-top:1px solid var(--mx-divider);
+  flex-shrink:0;
+}
+
+/* Full width on mobile */
+@media(max-width:767px){
+  .mx-drawer{width:100%}
+  .mx-drawer-sm,.mx-drawer-lg,.mx-drawer-xl{width:100%}
+}
+
+/* Tablet */
+@media(min-width:768px) and (max-width:1023px){
+  .mx-drawer{width:360px}
+  .mx-drawer-sm{width:300px}
+  .mx-drawer-lg{width:420px}
+}
+
+/* ═══ DARK MODE INNER GLOW — unified with Card/Stat ═══ */
+[data-theme="dark"] .mx-drawer{
+  box-shadow:var(--mx-sh3),inset 0 1px 0 rgba(255,255,255,0.04);
+}

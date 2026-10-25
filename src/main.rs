@@ -1,9 +1,11 @@
+mod admin;
 mod api;
 mod config;
 mod models;
 mod params;
 mod signer;
 mod stream;
+mod web;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -144,13 +146,10 @@ fn serve() -> ExitCode {
         if account_count > 1 {
             println!("多账号已启用：失败时按配置顺序自动切换");
         }
+        println!("管理界面: http://{addr}/");
         println!("按 Ctrl+C 停止");
 
-        let state = api::AppState {
-            pool,
-            http,
-            max_tokens_cap: cfg.max_tokens_cap,
-        };
+        let state = web::WebState::new(cfg.clone(), pool, http);
 
         let app = api::router(state);
         if let Err(e) = axum::serve(listener, app).await {

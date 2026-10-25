@@ -1,0 +1,61 @@
+/* ═══════════════════════════════════════════
+   MIUIX CONSOLE — Badge & Tag Component
+   Miuix capsule shape badges
+   ═══════════════════════════════════════════ */
+
+.mx-badge{
+  display:inline-flex;align-items:center;gap:5px;
+  padding:3px 10px;
+  border-radius:var(--mx-r-pill);
+  font-size:12px;font-weight:600;
+  transition:filter var(--mx-d1);
+}
+.mx-badge:hover{filter:brightness(1.15)}
+
+.mx-badge::before{
+  content:'';width:6px;height:6px;
+  border-radius:50%;flex-shrink:0;
+}
+
+/* Variants */
+.mx-badge-success{background:rgba(52,211,153,0.1);color:var(--mx-green)}
+.mx-badge-success::before{background:var(--mx-green);animation:mx-pulse 2s infinite}
+
+.mx-badge-warning{background:rgba(251,191,36,0.1);color:var(--mx-amber)}
+.mx-badge-warning::before{background:var(--mx-amber)}
+
+.mx-badge-error{background:rgba(248,113,113,0.1);color:var(--mx-red)}
+.mx-badge-error::before{background:var(--mx-red);animation:mx-pulse 1.5s infinite}
+
+.mx-badge-info{background:rgba(96,165,250,0.1);color:var(--mx-blue)}
+.mx-badge-info::before{background:var(--mx-blue)}
+
+.mx-badge-neutral{background:rgba(139,149,165,0.1);color:var(--mx-t2)}
+.mx-badge-neutral::before{background:var(--mx-t2)}
+
+/* Dot-only badge */
+.mx-dot{
+  width:8px;height:8px;
+  border-radius:50%;
+  flex-shrink:0;
+}
+
+/* Count badge */
+.mx-count{
+  display:inline-flex;align-items:center;justify-content:center;
+  min-width:18px;height:18px;padding:0 5px;
+  border-radius:var(--mx-r-pill);
+  font-size:10px;font-weight:700;
+  background:var(--mx-primary);color:#fff;
+}
+
+@keyframes mx-pulse{
+  0%,100%{opacity:1;transform:scale(1)}
+  50%{opacity:0.5;transform:scale(1.3)}
+}
+
+/* Mobile */
+@media(max-width:767px){
+  .mx-badge{padding:4px 12px;font-size:13px}
+  .mx-count{min-width:20px;height:20px;font-size:11px}
+}
