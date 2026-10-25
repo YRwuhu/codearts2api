@@ -81,9 +81,19 @@ async fn build_pool(cfg: &Config, http: reqwest::Client) -> Pool {
     let enabled: Vec<&Account> = cfg.accounts.iter().filter(|a| a.enabled).collect();
     let mut catalogs = Vec::new();
     for account in enabled {
+        // OAuth 账号的 AK/SK 存在 auths/，必须先解析出来；
+        // 直接用 account.clone() 会拿到空凭证，签名时报
+        // "Access or Credential is empty in Authorization"。
+        let resolved = match admin::resolve_account(&http, &cfg.env_dir, account).await {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("[pool] 跳过账号 {}: {e}", account.id);
+                continue;
+            }
+        };
         let cache_path = cfg.cache_path_for(account);
         let catalog = Catalog::new(
-            account.clone(),
+            resolved,
             &cache_path,
             cfg.benefit_fallback,
             http.clone(),
