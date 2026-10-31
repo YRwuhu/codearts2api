@@ -43,6 +43,22 @@ impl Account {
     pub fn security_token(&self) -> Option<&str> {
         self.security_token.as_deref()
     }
+
+    /// 派生账号级上游会话 ID 用的稳定种子。
+    ///
+    /// 必须**跨凭证续期稳定**，否则上游会把续期当成新会话，又回到
+    /// `TM.00001041`。所以：
+    ///
+    /// - 手动 AK/SK 账号：用 AK（永不变）。
+    /// - OAuth 账号：用 `id`（即 user_id），**不能**用 STS 临时 AK——
+    ///   那个每 24 小时换一次。
+    pub fn session_seed(&self) -> String {
+        if self.is_oauth() {
+            self.id.clone()
+        } else {
+            self.ak.clone()
+        }
+    }
 }
 
 impl Account {
@@ -79,11 +95,11 @@ pub struct Config {
     pub max_tokens_cap: i64,
     /// 免费额度网关拿不到模型时，是否仍暴露兜底列表。
     pub benefit_fallback: bool,
-    /// 工具轮回合是否改用非流式上游请求（默认开）。
+    /// 工具轮回合是否改用非流式上游请求（默认关）。
     ///
-    /// 上游每账号每分钟只允许 3 个流式会话，而 agent 一个回合会发很多次请求。
-    /// 工具轮的产出是工具调用、不需要正文增量渲染，改成非流式可以省下名额，
-    /// 留给真正需要流式的最终回复。
+    /// 这是针对「上游 3 会话限制」的临时妥协：降级会丢掉工具调用的增量帧。
+    /// 账号级会话头（`x-ot-session-id`）修好后该限制已消失，因此默认关闭；
+    /// 只有在确实需要压低流式请求数时才打开。
     pub tool_turn_plain: bool,
     /// 流式槽位耗尽时是否降级为非流式上游请求。
     ///
@@ -290,9 +306,11 @@ impl Config {
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
 
+        // 账号级会话头（x-ot-session-id）修好后，上游 3 会话限制已消失，
+        // 工具轮不再需要降级非流式。保留开关供特殊场景使用。
         let tool_turn_plain = std::env::var("CODEARTS_TOOL_TURN_PLAIN")
-            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
-            .unwrap_or(true);
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
 
         let stream_degrade = std::env::var("CODEARTS_STREAM_DEGRADE")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))

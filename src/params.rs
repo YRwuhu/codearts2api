@@ -54,7 +54,31 @@ pub fn normalize_params(body: &mut Map<String, Value>, cap: i64) -> Option<(i64,
     // reasoning 是 Responses API 字段，Chat Completions 上游不认。
     body.remove("reasoning");
 
+    normalize_roles(body);
+
     capped_now
+}
+
+/// 把上游不认的 message 角色映射成它认识的。
+///
+/// OpenAI 的 `developer` 角色（新版 SDK 用它替代 `system`）上游不认，
+/// 直接转发会得到：
+///
+/// ```text
+/// InferHub.001001044.400 Message role cannot empty
+/// ```
+///
+/// 实测把它改成 `system` 后请求正常。
+pub fn normalize_roles(body: &mut Map<String, Value>) {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+    for msg in messages {
+        let Some(obj) = msg.as_object_mut() else { continue };
+        if obj.get("role").and_then(|r| r.as_str()) == Some("developer") {
+            obj.insert("role".to_string(), Value::from("system"));
+        }
+    }
 }
 
 /// 上游是否把错误塞进了 HTTP 200。
@@ -122,6 +146,18 @@ mod tests {
         normalize_params(&mut b, 65536);
         assert_eq!(b["max_tokens"], json!(1000));
         assert!(b.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn maps_developer_role_to_system() {
+        let mut b = body(json!({"messages": [
+            {"role": "developer", "content": "你是助手"},
+            {"role": "user", "content": "hi"}
+        ]}));
+        normalize_params(&mut b, 1000);
+        assert_eq!(b["messages"][0]["role"], "system");
+        // 其他角色不受影响
+        assert_eq!(b["messages"][1]["role"], "user");
     }
 
     #[test]

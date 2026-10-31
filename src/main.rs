@@ -71,9 +71,9 @@ fn print_help() {
   CODEARTS_PROXY_HOST           监听地址，默认 127.0.0.1
   CODEARTS_PROXY_PORT           监听端口，默认 8787
   CODEARTS_MAX_TOKENS_CAP       max_tokens 兜底上限，默认 131072
-  CODEARTS_TOOL_TURN_PLAIN      工具轮改走非流式上游，默认 1（开）
+  CODEARTS_TOOL_TURN_PLAIN      工具轮改走非流式上游，默认 0（关）
   CODEARTS_STREAM_DEGRADE       名额用完时降级非流式，默认 0（关）
-  CODEARTS_CONCURRENCY          每账号上游流式会话上限，默认 3
+  CODEARTS_CONCURRENCY          本地在途流式请求上限，默认 8
   CODEARTS_DAILY_TOKEN_CAP      每账号每日 token 上限，0 = 不限制
   CODEARTS_BENEFIT_FALLBACK     1 = 免费模型拿不到时仍暴露兜底列表
   CODEARTS_MODEL_CACHE          模型缓存路径，默认与 .env 同目录

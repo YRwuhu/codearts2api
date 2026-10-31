@@ -294,6 +294,42 @@ mod tests {
     }
 
     #[test]
+    fn extra_headers_are_signed_and_sent() {
+        // 账号级会话头必须参与签名，否则网关报 APIG.0301。
+        let signer = Signer::new("AKID", "SECRET");
+        let r = signer.sign(
+            "POST",
+            "https://example.com/api/v2/chat/completions",
+            b"{}",
+            &[
+                ("x-ot-session-id", "ses_abc"),
+                ("user-session-id", "ses_abc"),
+                ("model-id", "m1"),
+                ("model-name", "m1"),
+            ],
+        );
+        let auth = r
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Authorization")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        for name in ["x-ot-session-id", "user-session-id", "model-id", "model-name"] {
+            assert!(
+                auth.contains(name),
+                "SignedHeaders 必须包含 {name}，实际: {auth}"
+            );
+        }
+        // 同时必须真的作为请求头发出去
+        for name in ["x-ot-session-id", "user-session-id"] {
+            assert!(
+                r.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name)),
+                "{name} 必须随请求发送"
+            );
+        }
+    }
+
+    #[test]
     fn signature_is_deterministic_for_fixed_inputs() {
         let signer = Signer::new("AKID", "SECRET");
         let r1 = signer.sign("POST", "https://example.com/api/v2/chat/completions", b"{}", &[]);

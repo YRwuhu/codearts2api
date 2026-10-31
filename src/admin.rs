@@ -67,13 +67,13 @@ pub fn router() -> axum::Router<WebState> {
         .route("/api/usage/recent", get(usage_recent))
 }
 
-/// 上游每账号并发上限（与 api.rs 保持一致）。
+/// 本地在途流式请求上限（与 chat.rs 保持一致；不是上游会话数）。
 fn concurrency_limit() -> usize {
     std::env::var("CODEARTS_CONCURRENCY")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(3)
+        .unwrap_or(8)
 }
 
 /// 账号文件位置：优先 CODEARTS_ACCOUNTS，其次 .env 同目录 accounts.json。

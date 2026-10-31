@@ -305,13 +305,27 @@ impl Catalog {
         benefit: bool,
         model_id: &str,
     ) -> Vec<(String, String)> {
-        let mut extra: Vec<(&str, &str)> = Vec::new();
-        if benefit && !model_id.is_empty() {
-            extra.push(("maas_type", "benefit"));
+        let account = self.account().await;
+
+        // 会话标识必须让上游看到"同一个会话"，否则每个请求都会被当成新会话，
+        // 连续 3 个之后必被 `TM.00001041` 拒绝（详见 concurrency::account_session_id）。
+        // 这两个头**必须参与签名**，所以放进 extra 而不是签名后追加。
+        let session_id = crate::concurrency::account_session_id(&account.session_seed());
+
+        let mut extra: Vec<(&str, &str)> = vec![
+            ("x-ot-session-id", session_id.as_str()),
+            ("user-session-id", session_id.as_str()),
+        ];
+        // model-id / model-name 对所有模型都带（实测非 benefit 模型也接受），
+        // 必须与请求体里的 model 完全一致。maas_type 仍然只给 benefit。
+        if !model_id.is_empty() {
             extra.push(("model-id", model_id));
             extra.push(("model-name", model_id));
         }
-        let account = self.account().await;
+        if benefit {
+            extra.push(("maas_type", "benefit"));
+        }
+
         let signer = Signer::new(&account.ak, &account.sk);
         if account.is_oauth() {
             signer

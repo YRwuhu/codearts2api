@@ -230,29 +230,21 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
         }
     }
 
-    // 流式请求：优先选还有空流槽的账号。
-    //
-    // 默认**不会**降级成非流式。降级虽然能绕开会话槽限制，但代价是：
-    //   - 首字延迟变成整包返回（agent 类客户端会明显卡顿）
-    //   - 工具调用的增量帧全部丢失，客户端只能一次性拿到完整 tool_calls，
-    //     边生成边执行/边渲染的体验被破坏
-    //   - thinking 内容与正文的时序关系被压平
-    // 这些正是"工具调用和编辑文件很有问题"的直接原因。
-    //
-    // 所以默认改为**排队等槽位**（最多 ACQUIRE_TIMEOUT）。需要旧行为时
-    // 显式设 `CODEARTS_STREAM_DEGRADE=1`。
     // ── 决定上游请求形态 ──────────────────────────────────
     //
-    // 三个约束一起决定这里：
+    // 上游的 3 会话限制已经由账号级 `x-ot-session-id` 解决（见
+    // concurrency 模块），所以**默认全程保持真流式**，不降级。
     //
-    // 1. 上游每个账号每分钟只允许 **3 个流式会话**（实测，见 concurrency 模块）。
-    // 2. agent 类客户端（ZCode / Claude Code / Codex）**一个回合会发很多次
-    //    请求**：每执行一次工具就要再来一轮。一次交互轻松用掉 5-10 个名额。
-    // 3. 非流式请求**完全不占**这个名额（实测并发 4 个也不受限）。
+    // 流式请求唯一会走的非流式路径有三种，都是显式开关：
     //
-    // 所以对「工具轮回合」改用非流式上游请求、客户端照样收到 SSE——
-    // 这类请求本来也不需要在正文上做增量渲染（它产出的是工具调用），
-    // 用掉一个流式名额反而会把真正需要流式的最终回复挤出窗口。
+    // - `CODEARTS_TOOL_TURN_PLAIN=1`：工具轮改非流式，省流式请求数。
+    //   代价是工具调用的增量帧丢失（客户端只能一次性拿到完整 tool_calls）。
+    // - `CODEARTS_STREAM_DEGRADE=1`：本地并发位占满时降级。
+    //   代价同上，外加首字延迟变成整包返回。
+    // - 两者都不开时：排队等本地并发位（最多 ACQUIRE_TIMEOUT）。
+    //
+    // 没有开关时排队而不是降级，是因为降级破坏 agent 类客户端的
+    // 边生成边渲染/边执行体验，而这正是"工具调用和编辑文件很怪"的根源。
     let mut use_upstream_stream = req.stream;
     let tool_turn = req.stream && tool_turn(&req.body);
     if tool_turn && state.config().tool_turn_plain {
@@ -422,12 +414,16 @@ enum Attempt {
     },
 }
 
+/// 本地在途流式请求上限。
+///
+/// 注意这**不是**上游会话数：上游会话已由账号级 `x-ot-session-id` 收敛为 1 个，
+/// 3 会话限制不再适用。这里只是本地保护，默认给较宽松的值。
 fn upstream_concurrency_limit() -> usize {
     std::env::var("CODEARTS_CONCURRENCY")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(3)
+        .unwrap_or(8)
 }
 
 /// 对单个账号发一次请求。

@@ -1,69 +1,58 @@
-//! 会话槽位管理。
+//! 账号级会话标识与在途请求节流。
 //!
-//! # 上游到底怎么限流（实测，2026-10）
+//! # 上游到底怎么限并发（实测，2026-10）
 //!
-//! 对同一个 CodeArts 账号打 `/api/v2/chat/completions`：
+//! 上游按 **`x-ot-session-id` / `user-session-id`** 识别会话，每个账号最多
+//! 同时存在 3 个会话。请求不带这两个头时，上游把**每一个请求都当成新会话**，
+//! 于是连续 3 次之后第 4 次必被拒——即使这些请求完全串行。
 //!
-//! | 请求形态 | 表现 |
-//! |---|---|
-//! | `stream=false` | 并发 4 个全部成功，基本不限 |
-//! | `stream=true`  | 同时最多 3 个，第 4 个 `TM.00001041` |
+//! ## 修复方式：所有请求共用一个账号级会话 ID
 //!
-//! 几个容易误判的点，都已实测排除：
+//! 让同一账号下的所有请求带同一个固定 `x-ot-session-id`（见
+//! [`account_session_id`]），该账号就永远只占 1 个上游会话，与本地开几个
+//! 对话、几个 sub agent、几个并发流都无关。
 //!
-//! - `chat_id` / `Chat-Id` / `Session-Id` / `prompt_cache_key` 都**不能**
-//!   复用槽位。同一 chat_id 连发 6 次，仍然在第 4 次被拒。
-//! - 不是绑定 TCP 连接：每请求新建连接、或单连接 keep-alive 连发，行为一致。
-//! - 上游不按 chat_id 累积历史（`prompt_tokens` 恒定），所以这与服务端会话
-//!   记忆无关。
-//!
-//! # 槽位的准确模型（实测）
-//!
-//! 连续对照实验（每次先静默 130 秒确保干净）：
+//! 实测对照（同一账号）：
 //!
 //! | 场景 | 结果 |
 //! |---|---|
-//! | 1 个流跑完 | 8 秒后新流就 OK |
-//! | 2 个顺序流（不并发） | 6 秒后新流就 OK |
-//! | 3 个顺序流 | 58 秒后才恢复 |
-//! | 3 个**并发**流（各跑 1.5 秒） | 结束后 58 秒内新流全被拒 |
-//! | 3 个并发流（各跑 35 秒） | 从**启动**算 t+68s 恢复 |
+//! | 8 个串行流式请求，不带会话头 | 3 个成功，后 5 个被拒 |
+//! | 8 个串行流式请求，带固定会话头 | 8/8 成功 |
+//! | 5 个并发流式请求，带固定会话头 | 5/5 成功 |
+//! | 8 个并发流式请求，带固定会话头 | 8/8 成功 |
 //!
-//! 这两个数据点把模型钉死了：长流耗尽槽位后，恢复时间是「启动后 ~60 秒」，
-//! 而不是「结束后 ~60 秒」（后者要等到 t≈95s）。所以约束是：
+//! 因此「每分钟只能开 3 个流式会话」的旧结论是**错误的表象**：那是「每个
+//! 请求都被当成新会话，而会话存活约 60 秒」的观测结果，不是速率限制。
+//! 加上会话头之后限制完全消失，也不再需要靠「工具轮降级非流式」来省额度。
 //!
-//! **每 60 秒窗口内最多启动 3 个流式会话。**
+//! ## 那还需要本地闸门吗
 //!
-//! 这是一个**速率**限制，不是单纯的并发限制——第 4 个顺序流即使前 3 个
-//! 早就结束了，也照样被拒。因此单个对话如果在一分钟内跑超过 3 轮，
-//! 第 4 轮必然要等窗口滑过去。这是上游产品限制，代理无法绕过；
-//! 想提高吞吐只能加账号（每账号各算各的窗口）。
+//! 需要，但目的变了：不是限制「会话数」（会话已恒为 1），而是限制**在途
+//! 请求数**，避免本地把上游打爆或耗尽连接。上限给得较宽松，正常使用不排队。
 //!
-use std::collections::{HashMap, VecDeque};
+//! `chat_id` / `Chat-Id` / `Session-Id` / `prompt_cache_key` 仍然保留，但
+//! 它们只用于上游对话识别与 prompt cache 亲和，**不是**并发键。
+//!
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 
-/// 上游流式会话的滑动窗口长度。
+/// 触发并发错误后的冷却时间。
 ///
-/// 实测：
-/// - 3 个短流（各 1.5 秒）→ 新流在 t+58s 恢复
-/// - 3 个长流（各 35 秒）→ 新流在 t+68s 恢复
-///
-/// 两者都落在「启动后约 60 秒」，因此按**启动时间**计窗口。
-pub const STREAM_WINDOW: Duration = Duration::from_secs(60);
+/// 正常情况下不应该再遇到该错误（账号级会话头已把它解决）。真遇到时说明
+/// 有别处也在用同一账号，退避一阵避免继续撞墙。
+pub const SATURATION_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// 会话钉号的有效期；超过后重新选号。
 const PIN_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// 单个账号的流式限流器与健康状态。
 pub struct AccountGate {
-    /// 每个窗口内允许启动的流式会话数（实测 3）
+    /// 本地在途流式请求上限（不是上游会话数——会话已经恒为 1）
     limit: usize,
-    /// 最近一个窗口内的流式启动时间
-    stream_starts: Arc<Mutex<VecDeque<Instant>>>,
-    /// 同时在飞的流式请求（窗口过期后仍可能有流在跑）
+    /// 在途流式请求
     stream_concurrent: Arc<Semaphore>,
     /// 非流式并发（上游对这种请求几乎不限，但本地仍限个上限防止打爆）
     plain_slots: Arc<Semaphore>,
@@ -94,7 +83,6 @@ impl AccountGate {
         let limit = limit.max(1);
         Self {
             limit,
-            stream_starts: Arc::new(Mutex::new(VecDeque::new())),
             stream_concurrent: Arc::new(Semaphore::new(limit)),
             // 非流式请求不占上游会话槽，但限制一下并发避免把带宽打满
             plain_slots: Arc::new(Semaphore::new(limit.saturating_mul(4).max(4))),
@@ -111,11 +99,9 @@ impl AccountGate {
         }
     }
 
-    /// 当前窗口内还剩几个流式名额。
+    /// 还有几个空闲的流式并发位。
     pub async fn free_stream_slots(&self) -> usize {
-        let mut q = self.stream_starts.lock().await;
-        prune_window(&mut q);
-        self.limit.saturating_sub(q.len())
+        self.stream_concurrent.available_permits()
     }
 
     /// 获取一个槽位。
@@ -142,26 +128,8 @@ impl AccountGate {
             });
         }
 
-        // 1) 在当前窗口里预约一个名额；满了就等到最早那次启动滑出窗口。
-        loop {
-            let deadline = {
-                let mut q = self.stream_starts.lock().await;
-                prune_window(&mut q);
-                if q.len() < self.limit {
-                    q.push_back(Instant::now());
-                    None
-                } else {
-                    q.front().map(|t| *t + STREAM_WINDOW)
-                }
-            };
-            let Some(deadline) = deadline else { break };
-            let now = Instant::now();
-            if deadline > now {
-                tokio::time::sleep(deadline - now).await;
-            }
-        }
-
-        // 2) 并发许可：窗口过期后旧流可能还在跑，这里再兜一层。
+        // 占一个在途并发位。上游会话已由 x-ot-session-id 收敛为 1 个，
+        // 这里纯粹是本地保护。
         let permit = self
             .stream_concurrent
             .clone()
@@ -197,7 +165,7 @@ impl AccountGate {
 
         if is_concurrency_error(error) {
             // 说明本地记账落后于上游（例如别处也在用同一账号），退避一阵
-            st.cooldown_until = Some(Instant::now() + STREAM_WINDOW);
+            st.cooldown_until = Some(Instant::now() + SATURATION_COOLDOWN);
         } else if st.consecutive_failures >= 3 {
             let secs = (10u64 * st.consecutive_failures as u64).min(300);
             st.cooldown_until = Some(Instant::now() + Duration::from_secs(secs));
@@ -261,19 +229,14 @@ impl AccountGate {
     /// 快照，供 WebUI 展示。
     pub async fn snapshot(&self) -> serde_json::Value {
         let now = Instant::now();
-        let used = {
-            let mut q = self.stream_starts.lock().await;
-            prune_window(&mut q);
-            q.len()
-        };
+        let free = self.stream_concurrent.available_permits();
         let st = self.state.read().await;
         serde_json::json!({
             "limit": self.limit,
             "in_flight": st.stream_in_flight,
             "stream_in_flight": st.stream_in_flight,
             "plain_in_flight": st.plain_in_flight,
-            "stream_used_in_window": used,
-            "window_secs": STREAM_WINDOW.as_secs(),
+            "stream_free_slots": free,
             "available": st.cooldown_until.map(|u| now >= u).unwrap_or(true),
             "cooldown_remaining": st.cooldown_until
                 .map(|u| if now >= u { 0 } else { (u - now).as_secs() })
@@ -288,18 +251,6 @@ impl AccountGate {
                 .map(|(m, until)| (m.clone(), until.saturating_duration_since(now).as_secs()))
                 .collect::<HashMap<String, u64>>(),
         })
-    }
-}
-
-/// 丢掉滑出窗口的启动记录。
-fn prune_window(q: &mut VecDeque<Instant>) {
-    let now = Instant::now();
-    while let Some(front) = q.front() {
-        if now.duration_since(*front) >= STREAM_WINDOW {
-            q.pop_front();
-        } else {
-            break;
-        }
     }
 }
 
@@ -421,10 +372,34 @@ impl SessionPins {
     }
 }
 
+/// **账号级**上游会话 ID。
+///
+/// 这是 `TM.00001041 并发会话数已达上限(3个)` 的真正解法。
+///
+/// 上游按 `x-ot-session-id` / `user-session-id` 识别会话，每个账号最多
+/// 同时存在 3 个会话。请求不带这两个头时，上游把**每一个请求都当成新会话**，
+/// 于是连续 3 次之后第 4 次必被拒——即使这些请求完全串行。
+///
+/// 让同一账号下的所有请求共用一个固定会话 ID 后，该账号永远只占 1 个会话，
+/// 与本地开几个对话、几个 sub agent、几个并发流都无关。
+///
+/// 实测对照（同一账号、8 个串行流式请求）：
+/// - 不带会话头：3 个成功，后 5 个 `TM.00001041`
+/// - 带固定会话头：**8/8 全部成功**；5 个并发流式请求同样 5/5 成功
+///
+/// 命名沿用 Python 版的 `ses_` 前缀。派生用 `seed`（OAuth 账号传入稳定的
+/// user_id，手动账号传入 AK），避免 STS 临时凭证续期后会话 ID 漂移。
+pub fn account_session_id(seed: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(seed.as_bytes());
+    format!("ses_{}", &hex::encode(hasher.finalize())[..24])
+}
+
 /// 把本地会话键转成稳定的上游 chat_id。
 ///
-/// 注意：这**不会**让请求复用上游会话槽（实测无效），只为让同账号上的
-/// 同一对话命中 prompt cache、并在日志里可追踪。
+/// 注意：这**不是**并发键（并发由 [`account_session_id`] 决定），只为让
+/// 同账号上的同一对话命中 prompt cache、并在日志里可追踪。
 pub fn upstream_chat_id(session_key: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -540,41 +515,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_concurrency_is_capped() {
+    async fn stream_concurrency_is_capped_locally() {
         let gate = AccountGate::new(3);
         let _a = gate.acquire(true).await.unwrap();
         let _b = gate.acquire(true).await.unwrap();
         let _c = gate.acquire(true).await.unwrap();
         let fourth = tokio::time::timeout(Duration::from_millis(150), gate.acquire(true)).await;
-        assert!(fourth.is_err(), "并发流超过 3 个时必须阻塞等待");
+        assert!(fourth.is_err(), "本地在途并发超过上限时应阻塞");
     }
 
     #[tokio::test]
-    async fn dropped_stream_keeps_its_window_slot() {
-        // 上游是速率限制：流结束后名额仍留在 60 秒窗口里
+    async fn sequential_streams_never_wait() {
+        // 会话头修复后，串行请求不应有任何人为延迟（旧实现会卡 60 秒）
+        let gate = AccountGate::new(3);
+        for i in 0..12 {
+            let g = tokio::time::timeout(Duration::from_millis(300), gate.acquire(true))
+                .await
+                .unwrap_or_else(|_| panic!("第 {i} 个串行流被不必要地阻塞了"))
+                .unwrap();
+            drop(g);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_stream_frees_its_slot_immediately() {
         let gate = AccountGate::new(1);
         let g = gate.acquire(true).await.unwrap();
+        assert_eq!(gate.free_stream_slots().await, 0);
         drop(g);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             gate.free_stream_slots().await,
-            0,
-            "流结束后名额仍应留在窗口里（上游 60 秒内不再接受第 4 个）"
+            1,
+            "上游会话已由会话头收敛，本地并发位应立即归还"
         );
-    }
-
-    #[tokio::test]
-    async fn first_three_streams_do_not_wait() {
-        // 窗口内的前 3 个流必须立即放行，只有第 4 个才排队
-        let gate = AccountGate::new(3);
-        for i in 0..3 {
-            let g = tokio::time::timeout(Duration::from_millis(300), gate.acquire(true))
-                .await
-                .unwrap_or_else(|_| panic!("第 {i} 个流被不必要地阻塞了"))
-                .unwrap();
-            drop(g);
-        }
-        assert_eq!(gate.free_stream_slots().await, 0);
     }
 
     #[tokio::test]
@@ -635,6 +609,16 @@ mod tests {
         let key = session_key(&body, None);
         assert!(key.is_some(), "多模态内容也必须能派生出会话键");
         assert!(key.unwrap().starts_with("msg:"));
+    }
+
+    #[test]
+    fn account_session_id_is_stable_and_prefixed() {
+        let a = account_session_id("HPUATESTAK");
+        let b = account_session_id("HPUATESTAK");
+        assert_eq!(a, b, "同一账号必须得到同一会话 ID");
+        assert!(a.starts_with("ses_"));
+        assert_eq!(a.len(), 4 + 24);
+        assert_ne!(a, account_session_id("OTHER"));
     }
 
     #[test]

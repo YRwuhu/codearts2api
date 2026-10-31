@@ -1,6 +1,6 @@
 [package]
 name = "codearts2api"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Huawei Cloud CodeArts -> OpenAI compatible proxy"
 
