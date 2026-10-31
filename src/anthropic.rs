@@ -254,10 +254,12 @@ pub fn from_chat_completion(completion: &Value, model: &str, original: &Value) -
         let text = message.get("content").and_then(|v| v.as_str()).unwrap_or("");
         if !text.is_empty() {
             content.push(json!({"type": "text", "text": text}));
-        } else if !reasoning.is_empty() && message.get("tool_calls").is_none() {
-            // 上游把预算全花在推理上时 content 为空；不要把空响应丢给客户端。
-            content.push(json!({"type": "text", "text": reasoning}));
         }
+        // 注意：这里**不要**用 reasoning 兜底成 text。
+        // 推理内容已经放进 thinking block 了，再复制一份到 text 会让客户端
+        // 看到同一段话出现两次（模型推理 + 正文一模一样），这正是
+        // "一直重复一段话"的来源之一。真正空响应的情况由调用方按
+        // finish_reason 判断，不该靠复制内容掩盖。
 
         if let Some(calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
             for call in calls {
@@ -333,16 +335,23 @@ pub fn sse_body(stream: EventStream, model: String, _original: Option<Value>) ->
         use futures_util::StreamExt;
 
         let mut inner = stream;
-        let mut content_index: i64 = 0;
-        let mut text_block_open = false;
-        let mut thinking_block_open = false;
+
+        // Anthropic 要求 block index 从 0 开始且严格递增，每个 start 都必须
+        // 配对一个 stop。旧实现从 1 开始，且 thinking / text 共用计数器，
+        // 导致 thinking block 永远不关闭 —— 客户端会一直等这个 block 结束，
+        // 表现就是内容重复刷、工具调用解析错乱。
+        let mut next_index: i64 = 0;
+        // 当前打开的 block：(index, kind)
+        let mut open_block: Option<(i64, &'static str)> = None;
+
         let mut input_tokens: i64 = 0;
         let mut output_tokens: i64 = 0;
-        let mut accumulated_thinking: Option<String> = None;
-        // 工具调用按 index 聚合：id / name / arguments
+        let mut saw_text = false;
+        let mut saw_thinking = false;
+
+        // 工具调用按上游 index 聚合：id / name / arguments
         let mut tool_calls: std::collections::BTreeMap<i64, (String, String, String)> =
             std::collections::BTreeMap::new();
-        let emitted_tools: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
 
         yield anthropic_event("message_start", json!({
             "type": "message_start",
@@ -359,6 +368,24 @@ pub fn sse_body(stream: EventStream, model: String, _original: Option<Value>) ->
         }));
 
         yield anthropic_event("ping", json!({"type": "ping"}));
+
+        // 切换 block：先关掉当前打开的，再开一个新的。
+        macro_rules! switch_block {
+            ($kind:expr, $start_payload:expr) => {{
+                if let Some((idx, _)) = open_block.take() {
+                    yield anthropic_event("content_block_stop", json!({
+                        "type": "content_block_stop",
+                        "index": idx,
+                    }));
+                }
+                let idx = next_index;
+                next_index += 1;
+                open_block = Some((idx, $kind));
+                let mut payload = $start_payload;
+                payload["index"] = json!(idx);
+                yield anthropic_event("content_block_start", payload);
+            }};
+        }
 
         while let Some(item) = inner.next().await {
             match item {
@@ -381,52 +408,47 @@ pub fn sse_body(stream: EventStream, model: String, _original: Option<Value>) ->
                     for choice in choices {
                         let Some(delta) = choice.get("delta") else { continue };
 
-                        // thinking
+                        // ── thinking ──
                         if let Some(r) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
                             if !r.is_empty() {
-                                accumulated_thinking
-                                    .get_or_insert_with(String::new)
-                                    .push_str(r);
-                                if !thinking_block_open {
-                                    thinking_block_open = true;
-                                    content_index += 1;
-                                    yield anthropic_event("content_block_start", json!({
+                                saw_thinking = true;
+                                if !matches!(open_block, Some((_, "thinking"))) {
+                                    switch_block!("thinking", json!({
                                         "type": "content_block_start",
-                                        "index": content_index,
+                                        "index": 0,
                                         "content_block": {"type": "thinking", "thinking": ""},
                                     }));
                                 }
+                                let idx = open_block.map(|(i, _)| i).unwrap_or(0);
                                 yield anthropic_event("content_block_delta", json!({
                                     "type": "content_block_delta",
-                                    "index": content_index,
+                                    "index": idx,
                                     "delta": {"type": "thinking_delta", "thinking": r},
                                 }));
                             }
                         }
 
-                        // text
+                        // ── text ──
                         if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
                             if !text.is_empty() {
-                                if !text_block_open {
-                                    text_block_open = true;
-                                    if thinking_block_open {
-                                        content_index += 1;
-                                    }
-                                    yield anthropic_event("content_block_start", json!({
+                                saw_text = true;
+                                if !matches!(open_block, Some((_, "text"))) {
+                                    switch_block!("text", json!({
                                         "type": "content_block_start",
-                                        "index": content_index,
+                                        "index": 0,
                                         "content_block": {"type": "text", "text": ""},
                                     }));
                                 }
+                                let idx = open_block.map(|(i, _)| i).unwrap_or(0);
                                 yield anthropic_event("content_block_delta", json!({
                                     "type": "content_block_delta",
-                                    "index": content_index,
+                                    "index": idx,
                                     "delta": {"type": "text_delta", "text": text},
                                 }));
                             }
                         }
 
-                        // tool calls
+                        // ── tool calls：先聚合，流末尾统一发 ──
                         if let Some(calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                             for call in calls {
                                 let idx = call.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -452,6 +474,13 @@ pub fn sse_body(stream: EventStream, model: String, _original: Option<Value>) ->
                 }
                 Ok(StreamEvent::Done) => break,
                 Err(e) => {
+                    // 先关掉打开的 block 再报错，避免客户端卡在半截状态
+                    if let Some((idx, _)) = open_block.take() {
+                        yield anthropic_event("content_block_stop", json!({
+                            "type": "content_block_stop",
+                            "index": idx,
+                        }));
+                    }
                     yield anthropic_event("error", json!({
                         "type": "error",
                         "error": {"type": "api_error", "message": e.message},
@@ -461,65 +490,55 @@ pub fn sse_body(stream: EventStream, model: String, _original: Option<Value>) ->
             }
         }
 
-        // 只出推理、没有正文时，把推理内容作为 text block 补上，
-        // 避免客户端收到 content 为空的 message。
-        if !text_block_open && thinking_block_open {
-            if let Some(last) = accumulated_thinking.as_deref().filter(|t| !t.is_empty()) {
-                content_index += 1;
-                yield anthropic_event("content_block_start", json!({
-                    "type": "content_block_start",
-                    "index": content_index,
-                    "content_block": {"type": "text", "text": ""},
-                }));
-                yield anthropic_event("content_block_delta", json!({
-                    "type": "content_block_delta",
-                    "index": content_index,
-                    "delta": {"type": "text_delta", "text": last},
-                }));
-                text_block_open = true;
-            }
-        }
-
-        // 关闭已打开的 block
-        if thinking_block_open && !text_block_open {
+        // 关闭正文/推理 block
+        if let Some((idx, _)) = open_block.take() {
             yield anthropic_event("content_block_stop", json!({
                 "type": "content_block_stop",
-                "index": content_index,
-            }));
-        }
-        if text_block_open {
-            yield anthropic_event("content_block_stop", json!({
-                "type": "content_block_stop",
-                "index": content_index,
+                "index": idx,
             }));
         }
 
-        // 工具 block：逐个补齐 start/delta/stop
-        for (idx, (call_id, name, args)) in &tool_calls {
-            if emitted_tools.contains(idx) {
-                continue;
-            }
-            content_index += 1;
+        // 工具调用：每个一个独立 block。input_json_delta 要传**原始 JSON 片段**，
+        // 不是重新序列化的对象 —— 旧实现传了 to_string() 的完整对象，
+        // 客户端按流式片段拼接时就会解析失败。
+        for (_upstream_idx, (call_id, name, args)) in &tool_calls {
+            let idx = next_index;
+            next_index += 1;
             yield anthropic_event("content_block_start", json!({
                 "type": "content_block_start",
-                "index": content_index,
+                "index": idx,
                 "content_block": {
                     "type": "tool_use",
-                    "id": call_id,
+                    "id": if call_id.is_empty() {
+                        format!("toolu_{}", crate::chat::uuid_ish())
+                    } else {
+                        call_id.clone()
+                    },
                     "name": name,
                     "input": {},
                 },
             }));
-            let input: Value =
-                serde_json::from_str(args).unwrap_or_else(|_| json!({"_raw": args}));
             yield anthropic_event("content_block_delta", json!({
                 "type": "content_block_delta",
-                "index": content_index,
-                "delta": {"type": "input_json_delta", "partial_json": input.to_string()},
+                "index": idx,
+                "delta": {"type": "input_json_delta", "partial_json": args},
             }));
             yield anthropic_event("content_block_stop", json!({
                 "type": "content_block_stop",
-                "index": content_index,
+                "index": idx,
+            }));
+        }
+
+        // 什么都没产出时补一个空 text block，避免客户端拿到空 content 数组
+        if !saw_thinking && !saw_text && tool_calls.is_empty() {
+            yield anthropic_event("content_block_start", json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            }));
+            yield anthropic_event("content_block_stop", json!({
+                "type": "content_block_stop",
+                "index": 0,
             }));
         }
 

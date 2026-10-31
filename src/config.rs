@@ -79,6 +79,17 @@ pub struct Config {
     pub max_tokens_cap: i64,
     /// 免费额度网关拿不到模型时，是否仍暴露兜底列表。
     pub benefit_fallback: bool,
+    /// 工具轮回合是否改用非流式上游请求（默认开）。
+    ///
+    /// 上游每账号每分钟只允许 3 个流式会话，而 agent 一个回合会发很多次请求。
+    /// 工具轮的产出是工具调用、不需要正文增量渲染，改成非流式可以省下名额，
+    /// 留给真正需要流式的最终回复。
+    pub tool_turn_plain: bool,
+    /// 流式槽位耗尽时是否降级为非流式上游请求。
+    ///
+    /// 默认 `false`：降级会破坏工具调用的增量帧，agent 类客户端体验明显变差。
+    /// 需要"永不 429"时设 `CODEARTS_STREAM_DEGRADE=1`。
+    pub stream_degrade: bool,
     /// 每账号每日 token 上限；0 表示不限制。
     /// 借鉴 workbuddy2api 的 daily token cap：单账号可以设小一点防止一天把
     /// 套餐额度跑光，多账号则各算各的。
@@ -279,6 +290,14 @@ impl Config {
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
 
+        let tool_turn_plain = std::env::var("CODEARTS_TOOL_TURN_PLAIN")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+            .unwrap_or(true);
+
+        let stream_degrade = std::env::var("CODEARTS_STREAM_DEGRADE")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+
         let daily_token_cap = std::env::var("CODEARTS_DAILY_TOKEN_CAP")
             .ok()
             .and_then(|v| v.trim().parse::<i64>().ok())
@@ -295,6 +314,8 @@ impl Config {
             port,
             max_tokens_cap,
             benefit_fallback,
+            tool_turn_plain,
+            stream_degrade,
             daily_token_cap,
             model_cache_path,
             env_dir,

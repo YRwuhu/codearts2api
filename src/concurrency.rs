@@ -1,59 +1,70 @@
 //! 会话槽位管理。
 //!
-//! # 上游到底怎么限并发（实测，2026-10）
+//! # 上游到底怎么限流（实测，2026-10）
 //!
 //! 对同一个 CodeArts 账号打 `/api/v2/chat/completions`：
 //!
-//! | 请求形态 | 首个请求 | 连发 3 个后 | 说明 |
-//! |---|---|---|---|
-//! | `stream=false` | OK | 全部 OK | 不占会话槽，几乎没有限制 |
-//! | `stream=true`  | OK | 第 4 个起 `TM.00001041` | 每个流占 1 个槽，上限 3 |
+//! | 请求形态 | 表现 |
+//! |---|---|
+//! | `stream=false` | 并发 4 个全部成功，基本不限 |
+//! | `stream=true`  | 同时最多 3 个，第 4 个 `TM.00001041` |
 //!
-//! 关键点：**槽位不是随请求结束释放的**。流式请求结束后，会话仍被上游保留
-//! 一段时间（实测约 30–60 秒，期间同账号再开新流式会话会继续报
-//! `TM.00001041 并发会话数已达上限(3个)`）。`chat_id` / `Chat-Id` /
-//! `Session-Id` / `prompt_cache_key` 都**不能**让多个请求复用同一个槽位，
-//! 也不能提前释放——同一 chat_id 连发 6 次，照样在第 4 次被拒。
+//! 几个容易误判的点，都已实测排除：
 //!
-//! 所以「把同一对话钉到同一账号、复用 chat_id」并不能绕过限制。真正能做的
-//! 只有两件事：
+//! - `chat_id` / `Chat-Id` / `Session-Id` / `prompt_cache_key` 都**不能**
+//!   复用槽位。同一 chat_id 连发 6 次，仍然在第 4 次被拒。
+//! - 不是绑定 TCP 连接：每请求新建连接、或单连接 keep-alive 连发，行为一致。
+//! - 上游不按 chat_id 累积历史（`prompt_tokens` 恒定），所以这与服务端会话
+//!   记忆无关。
 //!
-//! 1. **本地记账**：代理自己数每个账号还有几个槽，用完了就排队 / 换号，
-//!    而不是把注定 400 的请求打上去。
-//! 2. **让流式请求尽量少**：能在本地把 `stream=false` 的请求聚合好再返回、
-//!    把并发压到 1，就不占槽。
+//! # 槽位的准确模型（实测）
 //!
-//! # 这个模块做什么
+//! 连续对照实验（每次先静默 130 秒确保干净）：
 //!
-//! - [`AccountGate`]：每账号的流式槽位池。槽位在流式响应**真正结束**时归还，
-//!   并额外保留一段「冷却」时间（[`SLOT_COOLDOWN`]），因为上游释放得更慢；
-//!   冷却期内槽位不算空闲，但会随时间自动回收。
-//! - [`SessionPins`]：把同一对话固定到同一账号。这**不是**为了省槽位，
-//!   而是为了上游 prompt cache 亲和（同账号同前缀才命中）以及避免同一对话
-//!   在两轮之间跳到不同账号导致行为不一致。
-//! - [`session_key`]：从请求里稳定地提取对话键。
-
-use std::collections::HashMap;
+//! | 场景 | 结果 |
+//! |---|---|
+//! | 1 个流跑完 | 8 秒后新流就 OK |
+//! | 2 个顺序流（不并发） | 6 秒后新流就 OK |
+//! | 3 个顺序流 | 58 秒后才恢复 |
+//! | 3 个**并发**流（各跑 1.5 秒） | 结束后 58 秒内新流全被拒 |
+//! | 3 个并发流（各跑 35 秒） | 从**启动**算 t+68s 恢复 |
+//!
+//! 这两个数据点把模型钉死了：长流耗尽槽位后，恢复时间是「启动后 ~60 秒」，
+//! 而不是「结束后 ~60 秒」（后者要等到 t≈95s）。所以约束是：
+//!
+//! **每 60 秒窗口内最多启动 3 个流式会话。**
+//!
+//! 这是一个**速率**限制，不是单纯的并发限制——第 4 个顺序流即使前 3 个
+//! 早就结束了，也照样被拒。因此单个对话如果在一分钟内跑超过 3 轮，
+//! 第 4 轮必然要等窗口滑过去。这是上游产品限制，代理无法绕过；
+//! 想提高吞吐只能加账号（每账号各算各的窗口）。
+//!
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 
-/// 流式会话结束后，上游仍占用槽位的时间。
+/// 上游流式会话的滑动窗口长度。
 ///
-/// 实测：3 个流打满后，新的流式请求在第 58 秒左右才恢复。取 60 秒留足余量；
-/// 设成 0 相当于「请求一结束就认为槽位可用」，会持续撞 `TM.00001041`。
-pub const SLOT_COOLDOWN: Duration = Duration::from_secs(60);
+/// 实测：
+/// - 3 个短流（各 1.5 秒）→ 新流在 t+58s 恢复
+/// - 3 个长流（各 35 秒）→ 新流在 t+68s 恢复
+///
+/// 两者都落在「启动后约 60 秒」，因此按**启动时间**计窗口。
+pub const STREAM_WINDOW: Duration = Duration::from_secs(60);
 
 /// 会话钉号的有效期；超过后重新选号。
 const PIN_TTL: Duration = Duration::from_secs(30 * 60);
 
-/// 单个账号的流式并发闸门与健康状态。
+/// 单个账号的流式限流器与健康状态。
 pub struct AccountGate {
-    /// 上游允许的并发流式会话数（默认 3）
+    /// 每个窗口内允许启动的流式会话数（实测 3）
     limit: usize,
-    /// 流式槽位
-    stream_slots: Arc<Semaphore>,
+    /// 最近一个窗口内的流式启动时间
+    stream_starts: Arc<Mutex<VecDeque<Instant>>>,
+    /// 同时在飞的流式请求（窗口过期后仍可能有流在跑）
+    stream_concurrent: Arc<Semaphore>,
     /// 非流式并发（上游对这种请求几乎不限，但本地仍限个上限防止打爆）
     plain_slots: Arc<Semaphore>,
     state: Arc<RwLock<GateState>>,
@@ -61,7 +72,7 @@ pub struct AccountGate {
 
 #[derive(Default)]
 struct GateState {
-    /// 当前占用的流式槽位（计入冷却中的）
+    /// 当前流式请求数
     stream_in_flight: u32,
     plain_in_flight: u32,
     /// 冷却截止时间（触发并发上限后短暂避让）
@@ -69,15 +80,13 @@ struct GateState {
     consecutive_failures: u32,
     total_requests: u64,
     total_failures: u64,
-    /// 最近一次 `TM.00001041` 的时间，用于自适应退避
-    last_saturation: Option<Instant>,
-    last_error: Option<String>,
     /// 按模型隔离的冷却（账号级冷却会让整个账号不可用，模型级只挡那一个模型）
     model_cooldowns: HashMap<String, Instant>,
-    /// 当日 token 消耗与配额（借鉴 workbuddy2api 的每日上限）
+    /// 当日 token 消耗与配额
     daily_tokens: i64,
     /// 日切时间戳（本地日期 0 点的秒级时间）
     daily_reset_ts: i64,
+    last_error: Option<String>,
 }
 
 impl AccountGate {
@@ -85,14 +94,15 @@ impl AccountGate {
         let limit = limit.max(1);
         Self {
             limit,
-            stream_slots: Arc::new(Semaphore::new(limit)),
+            stream_starts: Arc::new(Mutex::new(VecDeque::new())),
+            stream_concurrent: Arc::new(Semaphore::new(limit)),
             // 非流式请求不占上游会话槽，但限制一下并发避免把带宽打满
             plain_slots: Arc::new(Semaphore::new(limit.saturating_mul(4).max(4))),
             state: Arc::new(RwLock::new(GateState::default())),
         }
     }
 
-    /// 该账号现在是否可用（不在冷却中）。
+    /// 该账号现在是否可用（不在账号级冷却中）。
     pub async fn available(&self) -> bool {
         let st = self.state.read().await;
         match st.cooldown_until {
@@ -101,39 +111,72 @@ impl AccountGate {
         }
     }
 
-    /// 现在还有几个流式槽位空着（冷却中的不计入空闲）。
-    pub fn free_stream_slots(&self) -> usize {
-        self.stream_slots.available_permits()
+    /// 当前窗口内还剩几个流式名额。
+    pub async fn free_stream_slots(&self) -> usize {
+        let mut q = self.stream_starts.lock().await;
+        prune_window(&mut q);
+        self.limit.saturating_sub(q.len())
     }
 
-    /// 获取一个槽位。流式请求占用上游会话槽，非流式只占本地并发许可。
+    /// 获取一个槽位。
     ///
-    /// 上游对非流式请求不设会话上限，因此两者分开计数：把非流式请求也算进
-    /// 那 3 个槽里，会让「一次对话」在客户端并发轮询时凭空触发限制。
+    /// 流式：先在滑动窗口里预约名额（不够就等到窗口里最老的那个过期），
+    /// 再占用一个并发许可。非流式：只占本地并发许可，上游不限制。
     pub async fn acquire(&self, stream: bool) -> Result<SlotGuard, String> {
-        let sem = if stream {
-            self.stream_slots.clone()
-        } else {
-            self.plain_slots.clone()
-        };
-        let permit = sem
+        if !stream {
+            let permit = self
+                .plain_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| "并发闸门已关闭".to_string())?;
+            {
+                let mut st = self.state.write().await;
+                st.plain_in_flight += 1;
+                st.total_requests += 1;
+            }
+            return Ok(SlotGuard {
+                permit: Some(permit),
+                stream: false,
+                state: self.state.clone(),
+            });
+        }
+
+        // 1) 在当前窗口里预约一个名额；满了就等到最早那次启动滑出窗口。
+        loop {
+            let deadline = {
+                let mut q = self.stream_starts.lock().await;
+                prune_window(&mut q);
+                if q.len() < self.limit {
+                    q.push_back(Instant::now());
+                    None
+                } else {
+                    q.front().map(|t| *t + STREAM_WINDOW)
+                }
+            };
+            let Some(deadline) = deadline else { break };
+            let now = Instant::now();
+            if deadline > now {
+                tokio::time::sleep(deadline - now).await;
+            }
+        }
+
+        // 2) 并发许可：窗口过期后旧流可能还在跑，这里再兜一层。
+        let permit = self
+            .stream_concurrent
+            .clone()
             .acquire_owned()
             .await
             .map_err(|_| "并发闸门已关闭".to_string())?;
-
         {
             let mut st = self.state.write().await;
-            if stream {
-                st.stream_in_flight += 1;
-            } else {
-                st.plain_in_flight += 1;
-            }
+            st.stream_in_flight += 1;
             st.total_requests += 1;
         }
 
         Ok(SlotGuard {
             permit: Some(permit),
-            stream,
+            stream: true,
             state: self.state.clone(),
         })
     }
@@ -153,28 +196,12 @@ impl AccountGate {
         st.last_error = Some(error.chars().take(200).collect());
 
         if is_concurrency_error(error) {
-            // 并发上限：说明本地记账落后于上游，暂停一段时间让上游先释放
-            st.last_saturation = Some(Instant::now());
-            st.cooldown_until = Some(Instant::now() + SLOT_COOLDOWN);
+            // 说明本地记账落后于上游（例如别处也在用同一账号），退避一阵
+            st.cooldown_until = Some(Instant::now() + STREAM_WINDOW);
         } else if st.consecutive_failures >= 3 {
-            // 连续失败：指数避让，最长 5 分钟
             let secs = (10u64 * st.consecutive_failures as u64).min(300);
             st.cooldown_until = Some(Instant::now() + Duration::from_secs(secs));
         }
-    }
-
-    /// 若在冷却中返回剩余秒数。
-    #[cfg(test)]
-    pub async fn cooldown_secs_if_any(&self) -> Option<u64> {
-        let st = self.state.read().await;
-        st.cooldown_until.map(|until| {
-            let now = Instant::now();
-            if now >= until {
-                0
-            } else {
-                (until - now).as_secs() + 1
-            }
-        })
     }
 
     /// 该模型的冷却是否仍在生效。
@@ -187,9 +214,6 @@ impl AccountGate {
     }
 
     /// 让某个模型在这个账号上冷却一段时间。
-    ///
-    /// 与账号级冷却的区别：模型级只挡这一个模型（例如该模型在本账号额度用尽），
-    /// 其余模型照常可用。这是 workbuddy2api 的 `model_cooldowns` 结构。
     pub async fn cool_model(&self, model: &str, secs: u64) {
         let mut st = self.state.write().await;
         st.model_cooldowns
@@ -203,7 +227,6 @@ impl AccountGate {
         if st.daily_reset_ts != today {
             st.daily_reset_ts = today;
             st.daily_tokens = 0;
-            // 顺带清掉过期的模型冷却，避免 Map 无限增长
             let now = Instant::now();
             st.model_cooldowns.retain(|_, until| *until > now);
         }
@@ -221,16 +244,36 @@ impl AccountGate {
         }
     }
 
+    /// 若在冷却中返回剩余秒数。
+    #[cfg(test)]
+    pub async fn cooldown_secs_if_any(&self) -> Option<u64> {
+        let st = self.state.read().await;
+        st.cooldown_until.map(|until| {
+            let now = Instant::now();
+            if now >= until {
+                0
+            } else {
+                (until - now).as_secs() + 1
+            }
+        })
+    }
+
     /// 快照，供 WebUI 展示。
     pub async fn snapshot(&self) -> serde_json::Value {
-        let st = self.state.read().await;
         let now = Instant::now();
+        let used = {
+            let mut q = self.stream_starts.lock().await;
+            prune_window(&mut q);
+            q.len()
+        };
+        let st = self.state.read().await;
         serde_json::json!({
             "limit": self.limit,
             "in_flight": st.stream_in_flight,
             "stream_in_flight": st.stream_in_flight,
             "plain_in_flight": st.plain_in_flight,
-            "free_stream_slots": self.stream_slots.available_permits(),
+            "stream_used_in_window": used,
+            "window_secs": STREAM_WINDOW.as_secs(),
             "available": st.cooldown_until.map(|u| now >= u).unwrap_or(true),
             "cooldown_remaining": st.cooldown_until
                 .map(|u| if now >= u { 0 } else { (u - now).as_secs() })
@@ -248,8 +291,19 @@ impl AccountGate {
     }
 }
 
-/// 占用的槽位。流式请求结束（响应体全部发完）后 drop，
-/// 并在 [`SLOT_COOLDOWN`] 之后才真正把许可还给闸门。
+/// 丢掉滑出窗口的启动记录。
+fn prune_window(q: &mut VecDeque<Instant>) {
+    let now = Instant::now();
+    while let Some(front) = q.front() {
+        if now.duration_since(*front) >= STREAM_WINDOW {
+            q.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// 占用的槽位。drop 时立即归还并发许可；窗口记录会自己过期。
 pub struct SlotGuard {
     permit: Option<OwnedSemaphorePermit>,
     stream: bool,
@@ -258,7 +312,6 @@ pub struct SlotGuard {
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        // in_flight 需要在异步上下文里减；用 try_write 避免 drop 中 await
         let stream = self.stream;
         if let Ok(mut st) = self.state.try_write() {
             if stream {
@@ -277,21 +330,8 @@ impl Drop for SlotGuard {
                 }
             });
         }
-
-        let Some(permit) = self.permit.take() else {
-            return;
-        };
-        if !stream {
-            // 非流式请求上游不占会话，立即归还
-            drop(permit);
-            return;
-        }
-        // 流式请求：上游释放槽位有明显延迟，冷却期过后再归还，
-        // 否则本地以为有空位、打上去却拿到 TM.00001041。
-        tokio::spawn(async move {
-            tokio::time::sleep(SLOT_COOLDOWN).await;
-            drop(permit);
-        });
+        // 并发许可立即归还；窗口里的启动记录负责「60 秒内最多 3 个」。
+        drop(self.permit.take());
     }
 }
 
@@ -408,9 +448,6 @@ pub fn upstream_session_id(chat_id: &str) -> String {
 /// 优先用客户端显式传入的标识（`user` 字段、`X-Codearts-Chat-Id` 头），
 /// 否则退化为「首条 user 消息内容的哈希」——同一对话的续轮通常带相同历史，
 /// 哈希一致即可稳定钉号。
-///
-/// 内容既可能是纯字符串，也可能是多模态数组（`[{"type":"text","text":...}]`），
-/// 后者的旧实现会直接返回 None，导致所有多模态对话都拿到同一个空键。
 pub fn session_key(body: &serde_json::Value, header_hint: Option<&str>) -> Option<String> {
     if let Some(h) = header_hint {
         let h = h.trim();
@@ -489,23 +526,55 @@ mod tests {
         assert!(!is_auth_error("TM.00001041"));
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn gate_separates_stream_and_plain() {
+    async fn plain_requests_are_not_limited_by_stream_window() {
         let gate = AccountGate::new(2);
-        // 两个流式槽位占满
-        let s1 = gate.acquire(true).await.unwrap();
+        let _s1 = gate.acquire(true).await.unwrap();
         let _s2 = gate.acquire(true).await.unwrap();
-        let third = tokio::time::timeout(Duration::from_millis(120), gate.acquire(true)).await;
-        assert!(third.is_err(), "流式槽位耗尽时应阻塞等待");
-
-        // 非流式不受流式槽位影响
+        assert_eq!(gate.free_stream_slots().await, 0);
         let p = tokio::time::timeout(Duration::from_millis(500), gate.acquire(false))
             .await
-            .expect("非流式请求不应被流式槽位阻塞")
+            .expect("非流式请求不应被流式窗口阻塞")
             .unwrap();
         drop(p);
-        drop(s1);
+    }
+
+    #[tokio::test]
+    async fn stream_concurrency_is_capped() {
+        let gate = AccountGate::new(3);
+        let _a = gate.acquire(true).await.unwrap();
+        let _b = gate.acquire(true).await.unwrap();
+        let _c = gate.acquire(true).await.unwrap();
+        let fourth = tokio::time::timeout(Duration::from_millis(150), gate.acquire(true)).await;
+        assert!(fourth.is_err(), "并发流超过 3 个时必须阻塞等待");
+    }
+
+    #[tokio::test]
+    async fn dropped_stream_keeps_its_window_slot() {
+        // 上游是速率限制：流结束后名额仍留在 60 秒窗口里
+        let gate = AccountGate::new(1);
+        let g = gate.acquire(true).await.unwrap();
+        drop(g);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            gate.free_stream_slots().await,
+            0,
+            "流结束后名额仍应留在窗口里（上游 60 秒内不再接受第 4 个）"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_three_streams_do_not_wait() {
+        // 窗口内的前 3 个流必须立即放行，只有第 4 个才排队
+        let gate = AccountGate::new(3);
+        for i in 0..3 {
+            let g = tokio::time::timeout(Duration::from_millis(300), gate.acquire(true))
+                .await
+                .unwrap_or_else(|_| panic!("第 {i} 个流被不必要地阻塞了"))
+                .unwrap();
+            drop(g);
+        }
+        assert_eq!(gate.free_stream_slots().await, 0);
     }
 
     #[tokio::test]
@@ -518,16 +587,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_slot_is_held_after_drop() {
-        // 流式槽位 drop 后仍处于冷却期，不应立刻空出来
-        let gate = AccountGate::new(1);
-        assert_eq!(gate.free_stream_slots(), 1);
-        let guard = gate.acquire(true).await.unwrap();
-        assert_eq!(gate.free_stream_slots(), 0);
-        drop(guard);
-        // 冷却期远大于测试窗口，因此这里应当仍是 0
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(gate.free_stream_slots(), 0, "流式槽位必须等冷却期结束才归还");
+    async fn daily_tokens_accumulate() {
+        let gate = AccountGate::new(3);
+        assert_eq!(gate.daily_tokens().await, 0);
+        gate.add_daily_tokens(100).await;
+        gate.add_daily_tokens(50).await;
+        assert_eq!(gate.daily_tokens().await, 150);
     }
 
     #[tokio::test]
@@ -563,7 +628,6 @@ mod tests {
 
     #[test]
     fn session_key_handles_multimodal_content() {
-        // 多模态首条消息不应退化成 None（旧实现会）
         let body = json!({"messages":[{"role":"user","content":[
             {"type":"text","text":"这张图里是什么"},
             {"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}
@@ -583,7 +647,7 @@ mod tests {
         assert!(a.starts_with("chat-"));
 
         let sid = upstream_session_id(&a);
-        assert_eq!(sid.len(), 32); // 16 字节 hex
+        assert_eq!(sid.len(), 32);
         assert_eq!(sid, upstream_session_id(&a));
     }
 

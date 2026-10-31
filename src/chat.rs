@@ -20,7 +20,16 @@ use crate::params;
 use crate::web::WebState;
 
 /// 同一账号内，请求排队等槽位的最长时间。
-const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(120);
+///
+/// 需要覆盖一个完整滑动窗口（65 秒）再加一点余量，否则排在队尾的请求会被
+/// 自己的超时打断，而它其实马上就能开始。
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// 上游仍报会话满时的重试次数（窗口边界抖动）。
+const SATURATION_RETRIES: usize = 2;
+
+/// 每次重试前等待多久——足够让窗口里最早的那个流滑出去。
+const SATURATION_BACKOFF: Duration = Duration::from_secs(8);
 
 /// 后台心跳间隔：长时间没有上游数据时给客户端发一个 SSE 注释帧，
 /// 防止客户端/中间代理把空闲连接当死连接掐掉。
@@ -221,30 +230,57 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
         }
     }
 
-    // 流式请求优先用有流式槽位的账号；若所有账号的槽位都占满，
-    // **降级为上游非流式**再在本地合成 SSE。
+    // 流式请求：优先选还有空流槽的账号。
     //
-    // 这条降级路径是"只有一个对话却触发并发上限"的最终解法：实测上游对
-    // `stream=false` 的请求完全不占会话槽（3 个流槽占满时并发 4 个非流式请求
-    // 依然全部成功）。代价是首字延迟变成整包返回，收益是永远不会因为
-    // 60 秒的会话残留而把用户拒掉。
+    // 默认**不会**降级成非流式。降级虽然能绕开会话槽限制，但代价是：
+    //   - 首字延迟变成整包返回（agent 类客户端会明显卡顿）
+    //   - 工具调用的增量帧全部丢失，客户端只能一次性拿到完整 tool_calls，
+    //     边生成边执行/边渲染的体验被破坏
+    //   - thinking 内容与正文的时序关系被压平
+    // 这些正是"工具调用和编辑文件很有问题"的直接原因。
+    //
+    // 所以默认改为**排队等槽位**（最多 ACQUIRE_TIMEOUT）。需要旧行为时
+    // 显式设 `CODEARTS_STREAM_DEGRADE=1`。
+    // ── 决定上游请求形态 ──────────────────────────────────
+    //
+    // 三个约束一起决定这里：
+    //
+    // 1. 上游每个账号每分钟只允许 **3 个流式会话**（实测，见 concurrency 模块）。
+    // 2. agent 类客户端（ZCode / Claude Code / Codex）**一个回合会发很多次
+    //    请求**：每执行一次工具就要再来一轮。一次交互轻松用掉 5-10 个名额。
+    // 3. 非流式请求**完全不占**这个名额（实测并发 4 个也不受限）。
+    //
+    // 所以对「工具轮回合」改用非流式上游请求、客户端照样收到 SSE——
+    // 这类请求本来也不需要在正文上做增量渲染（它产出的是工具调用），
+    // 用掉一个流式名额反而会把真正需要流式的最终回复挤出窗口。
     let mut use_upstream_stream = req.stream;
+    let tool_turn = req.stream && tool_turn(&req.body);
+    if tool_turn && state.config().tool_turn_plain {
+        use_upstream_stream = false;
+    }
+
     if req.stream {
         let mut with_slot = Vec::new();
         for c in &candidates {
             let gate = state.gate(c.account_id(), upstream_concurrency_limit()).await;
-            if gate.free_stream_slots() > 0 {
+            if gate.free_stream_slots().await > 0 {
                 with_slot.push(c.clone());
             }
         }
-        if with_slot.is_empty() {
-            use_upstream_stream = false;
-            println!(
-                "[pool] {model}: 流式槽位已满，改用非流式上游并本地合成 SSE（不占会话槽）"
-            );
-        } else if with_slot.len() < candidates.len() {
+        if !with_slot.is_empty() && with_slot.len() < candidates.len() {
             // 有槽位的账号排前面
             candidates = with_slot;
+        } else if with_slot.is_empty() && use_upstream_stream {
+            if state.config().stream_degrade {
+                use_upstream_stream = false;
+                println!(
+                    "[pool] {model}: 流式名额已满，改用非流式上游并本地合成 SSE（不占名额）"
+                );
+            } else {
+                println!(
+                    "[pool] {model}: 流式名额已满，排队等待（如需自动降级设 CODEARTS_STREAM_DEGRADE=1）"
+                );
+            }
         }
     }
 
@@ -269,83 +305,108 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
             .gate(catalog.account_id(), upstream_concurrency_limit())
             .await;
 
-        // 等槽位。流式走流式池，非流式走独立的普通池（上游不限后者）。
-        let guard = match tokio::time::timeout(ACQUIRE_TIMEOUT, gate.acquire(use_upstream_stream))
-            .await
-        {
-            Ok(Ok(g)) => g,
-            Ok(Err(e)) => {
-                eprintln!("[{}] {model}: {e}", catalog.account_id());
-                last = Some(ApiError::unavailable(e));
-                continue;
-            }
-            Err(_) => {
-                println!("[{}] {model}: 等待并发槽位超时", catalog.account_id());
-                last = Some(ApiError::new(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "rate_limit_error",
-                    "等待并发槽位超时，请稍后重试",
-                ));
-                continue;
-            }
-        };
+        // 撞上 TM.00001041 时的重试次数。窗口是按本地时钟估算的，两个请求
+        // 同时越过边界时仍可能有一个被上游拒掉；重试一次几乎总能成功，
+        // 比把 429 甩给客户端好得多。
+        let mut saturation_retries = 0usize;
 
-        match attempt(
-            state,
-            catalog,
-            &model,
-            &req.body,
-            use_upstream_stream,
-            req.stream,
-            chat_id.as_deref(),
-            guard,
-            gate.clone(),
-        )
-        .await
-        {
-            Ok(Attempt::Done(outcome)) => {
-                catalog.note_success();
-                gate.note_success().await;
-                if let Some(key) = req.session_key.as_ref() {
-                    state.pins.pin(key, catalog.account_id()).await;
+        loop {
+            // 等槽位。流式走滑动窗口 + 并发池，非流式只占本地并发池。
+            let guard =
+                match tokio::time::timeout(ACQUIRE_TIMEOUT, gate.acquire(use_upstream_stream)).await
+                {
+                    Ok(Ok(g)) => g,
+                    Ok(Err(e)) => {
+                        eprintln!("[{}] {model}: {e}", catalog.account_id());
+                        last = Some(ApiError::unavailable(e));
+                        break;
+                    }
+                    Err(_) => {
+                        println!("[{}] {model}: 等待并发槽位超时", catalog.account_id());
+                        last = Some(ApiError::new(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "rate_limit_error",
+                            "等待并发槽位超时，请稍后重试",
+                        ));
+                        break;
+                    }
+                };
+
+            let outcome = attempt(
+                state,
+                catalog,
+                &model,
+                &req.body,
+                use_upstream_stream,
+                req.stream,
+                chat_id.as_deref(),
+                guard,
+                gate.clone(),
+            )
+            .await;
+
+            match outcome {
+                Ok(Attempt::Done(outcome)) => {
+                    catalog.note_success();
+                    gate.note_success().await;
+                    if let Some(key) = req.session_key.as_ref() {
+                        state.pins.pin(key, catalog.account_id()).await;
+                    }
+                    return Ok(outcome);
                 }
-                return Ok(outcome);
-            }
-            Ok(Attempt::Retry {
-                error,
-                switch_account,
-            }) => {
-                catalog.note_failure();
-                gate.note_failure(&error.message).await;
-                // 模型级失败（该账号没有这个模型 / 该模型额度耗尽）只让这一个
-                // 模型冷却，不要把整个账号拖下水。
-                if error.code == "model_not_found" {
-                    gate.cool_model(&model, 300).await;
+                Ok(Attempt::Retry {
+                    error,
+                    switch_account,
+                }) => {
+                    catalog.note_failure();
+                    gate.note_failure(&error.message).await;
+                    // 模型级失败（该账号没有这个模型 / 该模型额度耗尽）只让这一个
+                    // 模型冷却，不要把整个账号拖下水。
+                    if error.code == "model_not_found" {
+                        gate.cool_model(&model, 300).await;
+                    }
+
+                    // 上游说会话满了：本地窗口边界抖动，等一个窗口再试一次。
+                    // 单账号时这是唯一能做的，别直接拒绝用户。
+                    if concurrency::is_concurrency_error(&error.message)
+                        && saturation_retries < SATURATION_RETRIES
+                        && (!switch_account || idx + 1 >= candidates.len())
+                    {
+                        saturation_retries += 1;
+                        println!(
+                            "[{}] {model}: 上游会话仍占满，{} 秒后重试 ({saturation_retries}/{SATURATION_RETRIES})",
+                            catalog.account_id(),
+                            SATURATION_BACKOFF.as_secs()
+                        );
+                        tokio::time::sleep(SATURATION_BACKOFF).await;
+                        continue;
+                    }
+
+                    state
+                        .usage
+                        .record(crate::usage::UsageRecord::failed(
+                            &model,
+                            catalog.account_id(),
+                            started.elapsed().as_millis() as i64,
+                            format!("{}: {}", error.code, error.message),
+                        ))
+                        .await;
+                    if switch_account && idx + 1 < candidates.len() {
+                        println!(
+                            "[pool] {model}: 账号 {} 不可用（{}），切换下一个",
+                            catalog.account_id(),
+                            error.code
+                        );
+                        last = Some(error);
+                        break;
+                    }
+                    return Err(error);
                 }
-                state
-                    .usage
-                    .record(crate::usage::UsageRecord::failed(
-                        &model,
-                        catalog.account_id(),
-                        started.elapsed().as_millis() as i64,
-                        format!("{}: {}", error.code, error.message),
-                    ))
-                    .await;
-                if switch_account && idx + 1 < candidates.len() {
-                    println!(
-                        "[pool] {model}: 账号 {} 不可用（{}），切换下一个",
-                        catalog.account_id(),
-                        error.code
-                    );
-                    last = Some(error);
-                    continue;
+                Err(error) => {
+                    // 请求无法构造（例如序列化失败），换号也无意义
+                    gate.note_failure(&error.message).await;
+                    return Err(error);
                 }
-                return Err(error);
-            }
-            Err(error) => {
-                // 请求无法构造（例如序列化失败），换号也无意义
-                gate.note_failure(&error.message).await;
-                return Err(error);
             }
         }
     }
@@ -627,6 +688,33 @@ fn paced_stream(mut frames: Vec<Value>) -> EventStream {
     }
     items.push(Ok(StreamEvent::Done));
     Box::pin(futures_util::stream::iter(items))
+}
+
+/// 这个流式请求是不是「工具轮回合」。
+///
+/// 判定依据（按可靠性排序）：
+///
+/// 1. 历史里已经有 `tool` 结果 → 上一轮调了工具，这一轮必然还是工具循环。
+/// 2. 客户端带了 `tools` 定义 → 它期待模型可能调用工具。
+///
+/// 这两类请求产出的是工具调用，不需要正文增量渲染，但会消耗宝贵的流式名额。
+fn tool_turn(body: &Value) -> bool {
+    let has_tool_result = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|msgs| {
+            msgs.iter()
+                .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        })
+        .unwrap_or(false);
+    if has_tool_result {
+        return true;
+    }
+    // 没有工具定义就不可能调用工具，这种情况一定是最终回复，保留真流式
+    body.get("tools")
+        .and_then(|t| t.as_array())
+        .map(|t| !t.is_empty())
+        .unwrap_or(false)
 }
 
 /// 把上游错误归类：可换号的账号级错误 vs 客户端错误。
@@ -911,6 +999,35 @@ pub fn uuid_ish() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_tool_turns() {
+        // 有工具结果 → 工具轮
+        let with_result = json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "c1"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"}
+        ]});
+        assert!(tool_turn(&with_result));
+
+        // 带工具定义 → 也是工具轮
+        let with_tools = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f"}}]
+        });
+        assert!(tool_turn(&with_tools));
+
+        // 纯对话 → 不是工具轮，必须保留真流式
+        let plain = json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert!(!tool_turn(&plain));
+
+        // 空工具数组也不算
+        let empty_tools = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": []
+        });
+        assert!(!tool_turn(&empty_tools));
+    }
 
     #[test]
     fn converts_completion_to_chunk() {
