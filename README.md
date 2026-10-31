@@ -78,7 +78,9 @@ backup             HPUA****X9         enabled  5
 | `CODEARTS_ACCOUNTS` | 账号文件路径，默认 `.env` 同目录的 `accounts.json` |
 | `CODEARTS_PROXY_HOST` | 监听地址，默认 `127.0.0.1`（只本机可访问） |
 | `CODEARTS_PROXY_PORT` | 监听端口，默认 `8787` |
-| `CODEARTS_MAX_TOKENS_CAP` | 模型元数据缺失时 `max_tokens` 的兜底上限，默认 `65536` |
+| `CODEARTS_MAX_TOKENS_CAP` | 模型元数据缺失时 `max_tokens` 的兜底上限，默认 `131072` |
+| `CODEARTS_CONCURRENCY` | 每账号上游流式会话上限，默认 `3` |
+| `CODEARTS_DAILY_TOKEN_CAP` | 每账号每日 token 上限，`0` = 不限制 |
 | `CODEARTS_BENEFIT_FALLBACK` | `1` 时即使免费网关拿不到模型也列出兜底清单 |
 | `CODEARTS_MODEL_CACHE` | 模型缓存路径，默认与 `.env` 同目录 |
 
@@ -147,34 +149,90 @@ OpenAI Base URL: http://127.0.0.1:8787/v1
 ## 并发与会话
 
 上游按**会话**计并发（当前套餐上限 3），超出返回
-`TM.00001041 并发会话数已达上限`。代理侧有两层处理：
+`TM.00001041 并发会话数已达上限(3个)`。
 
-### 并发闸门
+### 实测结论（2026-10，决定了整个设计）
 
-每个账号一个信号量，上限默认 3（`CODEARTS_CONCURRENCY` 可改）。
-请求超出时**排队等待**而不是直接失败，最长等 60 秒。
+对同一账号连打 `/api/v2/chat/completions`：
 
-实测：同时发 10 个请求，全部成功（排队消化，约 7.8 秒）。
+| 请求形态 | 前 3 个 | 第 4 个起 |
+|---|---|---|
+| `stream=false` | 全部成功 | **仍然成功** |
+| `stream=true` | 成功 | `TM.00001041` |
 
-### 会话钉号
+两个关键事实：
 
-同一对话的请求固定路由到同一账号，避免上游把每轮都当成新会话、加速耗尽槽位。
+1. **只有流式请求占会话槽。** 3 个流槽占满时并发发 4 个非流式请求，全部成功。
+2. **槽位不随请求结束立即释放。** 流结束后上游仍占着会话约 **58 秒**；
+   这段时间内同账号开新流式会话照样被拒。
+
+另外实测确认：`chat_id` / `Chat-Id` / `Session-Id` / `prompt_cache_key`
+**不能**让多个请求复用同一个槽位，也不能提前释放。同一 chat_id 连发 6 次，
+仍然在第 4 次被拒。所以「复用 conversation id 就能绕过限制」是不成立的。
+
+### 旧实现为什么会让"一个对话"触发限制
+
+旧版有三个问题，叠加起来正好造成用户看到的现象：
+
+1. **许可在函数返回时就释放了**，而流式响应体还在慢慢往外发。
+   于是本地以为槽位空着，实际上上游还占着。
+2. **把非流式请求也算进那 3 个槽**，但上游对非流式请求根本不限会话。
+3. **没有考虑槽位释放延迟**，第 4 个请求立刻打上去就吃 `TM.00001041`。
+
+于是只要对话稍微连续一点（比如客户端每轮都发流式请求、或同一会话并发重试），
+就会撞上限——即使界面上只有"一个对话"。
+
+### 现在的做法
+
+**流式槽位池**：每账号默认 3 个流式槽（`CODEARTS_CONCURRENCY` 可改），
+非流式走**独立**的普通池（默认 4×流式上限），两者互不挤占。
+流式槽位在流**结束时**才归还，并且再等 60 秒（`SLOT_COOLDOWN`，
+对应实测的 58 秒残留）才真正释放。
+
+**槽位占满时降级**：所有账号的流式槽都满时，不报错，而是
+**改用非流式上游请求 + 本地合成 SSE**——客户端仍收到标准流式响应，
+但因为上游走 `stream=false`，完全不消耗会话槽。这是永不被
+`TM.00001041` 拒绝的兜底路径。代价是首字延迟变成整包返回。
+
+日志会明确标注：
+
+```
+[pool] deepseek-v4.1-flash: 流式槽位已满，改用非流式上游并本地合成 SSE（不占会话槽）
+```
+
+**多账号时分流**：仍有空流槽的账号会排到前面；全部占满才降级。
+单账号时直接降级，不排队等待。
+
+### 会话钉号（与并发无关）
+
+同一对话固定路由到同一账号。这**不是**为了省槽位（实测无效），
+而是因为上游的 **prompt cache 是账号级**的：只有同一账号再次看到相同前缀
+才会命中。把同一对话在账号间轮转，缓存命中率必然归零。
 
 会话键的提取顺序：
 
-1. `X-Codearts-Chat-Id` / `X-Conversation-Id` 请求头
+1. `X-Codearts-Chat-Id` / `X-Conversation-Id` / `X-Session-Id` 请求头
 2. 请求体的 `user` 字段
-3. 首条 `user` 消息内容的哈希（同一对话续轮时首条消息不变，因此稳定）
+3. `prompt_cache_key` / `conversation_id` 字段
+4. 首条 `user` 消息内容的哈希（多模态数组也支持；同一对话续轮时首条消息不变）
 
 钉号有效期 30 分钟，账号被禁用或删除时自动释放。
 
 ### 健康与冷却
 
 - 连续失败 3 次 → 指数退避（10 秒起，最长 5 分钟）
-- 遇到并发上限错误 → 立即冷却 20 秒，让上游释放槽位
+- 遇到并发上限错误 → 立即冷却 60 秒，让上游释放槽位
+- **模型级冷却**：某账号缺某个模型时，只冷却这一个模型 5 分钟，
+  账号上的其他模型照常可用（借鉴 workbuddy2api 的 `model_cooldowns`）
 - 冷却中的账号在选择时被跳过（除非全部都在冷却）
 
 这些状态都在「账号」页的**健康**列可见：正常 / 冷却 Ns / 当前并发数。
+
+### 每日 token 上限（可选）
+
+`CODEARTS_DAILY_TOKEN_CAP=2000000` 可给每账号设日 token 上限，
+按本地时区 0 点归零。达到上限的账号会被跳过；单账号时会返回 429
+并在消息里注明原因。默认 `0` = 不限制。
 
 ## 额度与用量
 
@@ -241,6 +299,14 @@ API Key  : codearts      （任意非空字符串）
 Model    : deepseek-v4.1-flash / glm-5.3 / kimi-k3 / openpangu-2.0-pro ...
 ```
 
+三种客户端协议指向同一个 Base URL：
+
+| 客户端类型 | 端点 | 说明 |
+|---|---|---|
+| OpenAI 兼容 | `POST {Base}/chat/completions` | 最通用 |
+| Codex / Responses | `POST {Base}/responses` | 需支持 Responses API 的客户端 |
+| Claude Code / Anthropic SDK | `POST {Base}/messages` | 设置 `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` |
+
 ## 子命令
 
 ```cmd
@@ -262,6 +328,9 @@ codearts2api.exe benefit claim backup  对指定账号签到（追加账号 id�
 | 端点 | 说明 |
 |---|---|
 | `POST /v1/chat/completions` | OpenAI 格式聊天补全，支持 `stream` 流式与 `tools` |
+| `POST /v1/responses` | OpenAI Responses API（Codex / 新版 SDK），含 `stream` 与 `function_call` |
+| `POST /v1/messages` | Anthropic Messages API（Claude Code / Anthropic SDK） |
+| `POST /v1/messages/count_tokens` | Anthropic token 估算（近似值） |
 | `GET /v1/models` | 模型列表（含 context_window / max_tokens 等能力元数据） |
 | `GET /v1/models/{id}` | 单模型详情 |
 | `OPTIONS *` | CORS 预检 |
@@ -290,11 +359,19 @@ codearts2api.exe benefit claim backup  对指定账号签到（追加账号 id�
 
 这几点是踩坑后补的，如果以后改代码请注意别退化：
 
-1. **`max_tokens` 一律按模型上限裁剪。**
-   上游对超限不返回 400，而是 **HTTP 200 + `error_code: InferHub.001001005.400`**。
-   客户端会看到一个"成功但没有内容"的响应，报错信息毫无指向性。
-   本代理会读 `models-cache.json` 里的 `max_tokens` 裁剪，并打印
-   `[param] <model>: max_tokens 384000 -> 65536 (上限 65536)`。
+1. **`max_tokens` 按上游**真实**校验上限裁剪（131072），而不是模型元数据。**
+   容易踩的坑：AgentCenter 的 `model_parameters.max_tokens` 恒为
+   `65536`/`65535`，但那只是"建议值"。上游参数校验器实际接受
+   **131072**，超出才报
+   `RANGE_VALIDATOR: max_tokens -> max_tokens should be between 1 and 131072`。
+
+   旧版直接信了元数据里的 65536，把客户端合法的 128k 请求砍成 64k，
+   于是"官方说能输出 384k、反代只给 60k"。现在的规则是
+   `cap = min(模型元数据, 131072)`，并且在元数据明显偏小时上抬到 131072
+   （见 `params::UPSTREAM_MAX_OUTPUT_TOKENS`）。
+
+   注意区分：**131072 是单次输出上限**；模型总上下文另见 `context_window`
+   （deepseek-v4.1 / glm-5.3 / kimi-k3 均为 1M）。
 
 2. **字段名归一化。**
    `max_tokens` / `max_completion_tokens` / `max_output_tokens` 统一收敛成
@@ -315,6 +392,67 @@ codearts2api.exe benefit claim backup  对指定账号签到（追加账号 id�
    AgentCenter 老套餐模型用基础签名；免费 benefit 模型必须额外签
    `maas_type: benefit` / `model-id` / `model-name` 三个头，否则上游报
    "model is not registered"。
+
+## 三种对外协议
+
+同一套上游通路，三种入站格式：
+
+### OpenAI Chat Completions — `POST /v1/chat/completions`
+
+原生格式，无损直通。`stream`、`tools`、`response_format` 全部支持。
+
+### OpenAI Responses API — `POST /v1/responses`
+
+供 Codex 与新版 OpenAI SDK 使用，做双向翻译：
+
+| Responses | Chat Completions |
+|---|---|
+| `input`（字符串 / item 数组） | `messages` |
+| `instructions` | 首条 `system` 消息 |
+| `max_output_tokens` | `max_tokens` |
+| `tools[].type=function` + `name` | `tools[].function.name` |
+| `input_image` / `output_text` | `image_url` / `text` |
+| `output`（`reasoning` / `message` / `function_call`） | `message.reasoning_content` / `.content` / `.tool_calls` |
+
+流式输出是语义化事件序列：`response.created` → `response.in_progress` →
+`response.output_item.added` → `response.output_text.delta`* →
+`response.completed`，推理内容走 `response.reasoning_text.delta`，
+工具调用走 `response.function_call_arguments.delta`。
+
+`previous_response_id` 会作为会话键参与钉号（不参与上下文拼接——
+本代理无状态，客户端需自带完整历史）。
+
+### Anthropic Messages — `POST /v1/messages`
+
+供 Claude Code / Anthropic SDK 使用：
+
+- `system` 顶层字段 → `system` 消息
+- `content` block 数组：`text` / `image` / `tool_use` / `tool_result`
+- `tool_use.input`（对象） ↔ `tool_calls.function.arguments`（字符串）
+- `tool_result`（user 消息里的 block）→ 独立的 `role: "tool"` 消息
+- `stop_sequences` → `stop`；`tool_choice` 的 `any` → `required`
+- `cache_control` 上游不支持，直接丢弃
+- 推理内容以 `thinking` block 返回
+
+流式事件严格按 Anthropic 顺序：`message_start` → `content_block_start` →
+`content_block_delta`* → `content_block_stop` → `message_delta` → `message_stop`。
+
+`POST /v1/messages/count_tokens` 用经验公式估算（中文约 1 字 1 token），
+只够客户端做预算判断，不是精确 tokenizer。
+
+### 空内容兜底
+
+上游在 `max_tokens` 很小时可能把预算全花在 reasoning 上，`content` 返回空串
+（`finish_reason: "length"`）。三种协议都做了兜底，不会静默返回空响应：
+
+- Chat Completions：如实透传（`finish_reason=length`），由客户端判断
+- Responses：`output_text` 用推理内容兜底，`output` 里两者都有
+- Anthropic：补一个 `text` block（推理本来就在 `thinking` block 里）
+
+### 保活
+
+流式期间若上游 15 秒没有数据，代理会发 SSE 注释帧（OpenAI 下是
+`: keepalive`，Anthropic 下是 `ping` 事件），防止中间代理把空闲连接掐掉。
 
 ## 已知限制
 

@@ -79,6 +79,10 @@ pub struct Config {
     pub max_tokens_cap: i64,
     /// 免费额度网关拿不到模型时，是否仍暴露兜底列表。
     pub benefit_fallback: bool,
+    /// 每账号每日 token 上限；0 表示不限制。
+    /// 借鉴 workbuddy2api 的 daily token cap：单账号可以设小一点防止一天把
+    /// 套餐额度跑光，多账号则各算各的。
+    pub daily_token_cap: i64,
     pub model_cache_path: PathBuf,
     pub env_dir: PathBuf,
 }
@@ -264,15 +268,22 @@ impl Config {
             .and_then(|v| v.trim().parse::<u16>().ok())
             .unwrap_or(8787);
 
+        // 兜底值只在上游没给元数据时用；真实硬上限是 params::UPSTREAM_MAX_OUTPUT_TOKENS。
         let max_tokens_cap = std::env::var("CODEARTS_MAX_TOKENS_CAP")
             .ok()
             .and_then(|v| v.trim().parse::<i64>().ok())
             .filter(|v| *v > 0)
-            .unwrap_or(65536);
+            .unwrap_or(crate::params::UPSTREAM_MAX_OUTPUT_TOKENS);
 
         let benefit_fallback = std::env::var("CODEARTS_BENEFIT_FALLBACK")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
+
+        let daily_token_cap = std::env::var("CODEARTS_DAILY_TOKEN_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(0);
 
         let model_cache_path = std::env::var("CODEARTS_MODEL_CACHE")
             .map(PathBuf::from)
@@ -284,6 +295,7 @@ impl Config {
             port,
             max_tokens_cap,
             benefit_fallback,
+            daily_token_cap,
             model_cache_path,
             env_dir,
         })

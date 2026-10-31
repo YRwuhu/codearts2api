@@ -1,5 +1,7 @@
 mod admin;
+mod anthropic;
 mod api;
+mod chat;
 mod checkin;
 mod concurrency;
 mod config;
@@ -7,6 +9,7 @@ mod models;
 mod oauth;
 mod params;
 mod quota;
+mod responses;
 mod signer;
 mod stream;
 mod usage;
@@ -52,6 +55,11 @@ fn print_help() {
   codearts2api benefit [status|claim|models|balance] [账号id]
                                 查询/领取免费额度
 
+协议:
+  /v1/chat/completions   OpenAI Chat Completions
+  /v1/responses          OpenAI Responses API（Codex）
+  /v1/messages           Anthropic Messages API（Claude Code）
+
 多账号:
   在 .env 同目录创建 accounts.json（参考 accounts.example.json）即可启用多账号。
   请求按文件中的顺序尝试，遇到并发超限/鉴权失败/该账号无此模型时自动切换下一个。
@@ -62,7 +70,9 @@ fn print_help() {
   CODEARTS_ACCOUNTS             账号文件路径，默认 .env 同目录 accounts.json
   CODEARTS_PROXY_HOST           监听地址，默认 127.0.0.1
   CODEARTS_PROXY_PORT           监听端口，默认 8787
-  CODEARTS_MAX_TOKENS_CAP       max_tokens 兜底上限，默认 65536
+  CODEARTS_MAX_TOKENS_CAP       max_tokens 兜底上限，默认 131072
+  CODEARTS_CONCURRENCY          每账号上游流式会话上限，默认 3
+  CODEARTS_DAILY_TOKEN_CAP      每账号每日 token 上限，0 = 不限制
   CODEARTS_BENEFIT_FALLBACK     1 = 免费模型拿不到时仍暴露兜底列表
   CODEARTS_MODEL_CACHE          模型缓存路径，默认与 .env 同目录
 "#

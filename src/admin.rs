@@ -318,6 +318,8 @@ pub async fn status(State(state): State<WebState>) -> Response {
             "host": cfg.host,
             "port": cfg.port,
             "max_tokens_cap": cfg.max_tokens_cap,
+            "upstream_max_output_tokens": crate::params::UPSTREAM_MAX_OUTPUT_TOKENS,
+            "daily_token_cap": cfg.daily_token_cap,
             "benefit_fallback": cfg.benefit_fallback,
             "accounts_file": accounts_file_path(&cfg).display().to_string(),
         }

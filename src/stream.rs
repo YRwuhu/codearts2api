@@ -172,7 +172,7 @@ pub fn forward_stream_line(raw_line: &[u8]) -> StreamAction {
         return StreamAction::Skip;
     }
     if trimmed.starts_with(':') {
-        return StreamAction::Passthrough(trimmed.to_string());
+        return StreamAction::Passthrough;
     }
     let Some(payload) = trimmed.strip_prefix("data:") else {
         return StreamAction::Skip;
@@ -216,7 +216,7 @@ pub fn forward_stream_line(raw_line: &[u8]) -> StreamAction {
 pub enum StreamAction {
     Skip,
     Done,
-    Passthrough(String),
+    Passthrough,
     Chunk(Value),
     Error(Value),
 }

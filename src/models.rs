@@ -124,11 +124,16 @@ struct CatalogState {
 
 /// 单个账号的模型目录与签名凭证。
 pub struct Catalog {
-    account: Account,
+    /// 稳定的账号 id，与凭证解耦（凭证会被续期替换）。
+    id: String,
+    /// 当前生效的账号凭证。OAuth 账号会在续期后整体替换。
+    account: tokio::sync::RwLock<Account>,
     inner: Arc<tokio::sync::RwLock<CatalogState>>,
     cache_path: PathBuf,
     benefit_fallback: bool,
     http: reqwest::Client,
+    /// 上一次成功续期的时间，避免并发请求重复续期。
+    last_refresh_creds: std::sync::Mutex<Option<std::time::Instant>>,
     /// 连续失败次数，用于 fetch 失败时回退缓存并抑制日志噪声。
     consecutive_failures: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -150,7 +155,8 @@ impl Catalog {
             }
         }
         Self {
-            account,
+            id: account.id.clone(),
+            account: tokio::sync::RwLock::new(account),
             inner: Arc::new(tokio::sync::RwLock::new(CatalogState {
                 models,
                 last_refresh: None,
@@ -158,16 +164,76 @@ impl Catalog {
             cache_path: cache_path.to_path_buf(),
             benefit_fallback,
             http,
+            last_refresh_creds: std::sync::Mutex::new(None),
             consecutive_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
+    /// 当前凭证的快照。
+    pub async fn account(&self) -> Account {
+        self.account.read().await.clone()
+    }
+
+    /// 在发请求前确保证件可用。
+    ///
+    /// OAuth 账号的 STS 临时凭证有效期 24 小时，但实测可能提前失效
+    /// （`APIG.0602 security token has expired`）。这里在剩余有效期不足
+    /// 5 分钟时主动续期，并在续期后替换内存中的凭证。
+    ///
+    /// 用 `last_refresh_creds` 做 60 秒节流：并发请求同时撞到过期时，
+    /// 只有一个会真的去换 token，其余直接复用结果。
+    pub async fn ensure_credentials(&self, state: &crate::web::WebState) -> Result<(), String> {
+        let current = self.account().await;
+        if !current.is_oauth() {
+            return Ok(());
+        }
+
+        let env_dir = state.config().env_dir;
+        let identity = match crate::oauth::store::load(&env_dir, &self.account_id().to_string()) {
+            Some(id) => id,
+            None => return Ok(()), // 没有 auths 文件时无能为力，让上游报错
+        };
+
+        // 还剩 5 分钟以上就不折腾
+        if !identity.expired() && !identity.expiring_within(300) {
+            return Ok(());
+        }
+
+        {
+            let guard = self
+                .last_refresh_creds
+                .lock()
+                .map_err(|_| "凭证锁中毒".to_string())?;
+            if let Some(t) = *guard {
+                if t.elapsed() < Duration::from_secs(60) {
+                    return Ok(()); // 刚续过，不重复续
+                }
+            }
+        }
+
+        let fresh = crate::oauth::store::refresh_and_save(&self.http, &env_dir, &identity).await?;
+        {
+            let mut acct = self.account.write().await;
+            acct.ak = fresh.access_key_id.clone();
+            acct.sk = fresh.secret_access_key.clone();
+            acct.security_token = Some(fresh.security_token.clone());
+        }
+        if let Ok(mut guard) = self.last_refresh_creds.lock() {
+            *guard = Some(std::time::Instant::now());
+        }
+        println!("[{}] 凭证已自动续期", self.account_id());
+        Ok(())
+    }
+
     pub fn account_id(&self) -> &str {
-        &self.account.id
+        &self.id
     }
 
     pub fn masked_ak(&self) -> String {
-        self.account.masked_ak()
+        self.account
+            .try_read()
+            .map(|a| a.masked_ak())
+            .unwrap_or_else(|_| "****".to_string())
     }
 
     pub async fn load_cache(&self) {
@@ -187,7 +253,7 @@ impl Catalog {
     async fn save_cache(&self, models: &[ModelInfo]) {
         let payload = json!({
             "updated_at": chrono::Utc::now().timestamp(),
-            "account": self.account.id,
+            "account": self.id,
             "models": models,
         });
         let Ok(text) = serde_json::to_string_pretty(&payload) else {
@@ -209,11 +275,12 @@ impl Catalog {
         body: &[u8],
         extra: &[(&str, &str)],
     ) -> Result<(u16, String), reqwest::Error> {
-        let signer = Signer::new(&self.account.ak, &self.account.sk);
+        let account = self.account().await;
+        let signer = Signer::new(&account.ak, &account.sk);
         // OAuth 账号用 STS 临时凭证，必须走 sign_full（带 X-Sdk-Content-Sha256
         // 与 X-Security-Token）；手动 AK/SK 账号保持原有基础签名。
-        let signed = if self.account.is_oauth() {
-            signer.sign_full(method, url, body, extra, self.account.security_token())
+        let signed = if account.is_oauth() {
+            signer.sign_full(method, url, body, extra, account.security_token())
         } else {
             signer.sign(method, url, body, extra)
         };
@@ -244,10 +311,11 @@ impl Catalog {
             extra.push(("model-id", model_id));
             extra.push(("model-name", model_id));
         }
-        let signer = Signer::new(&self.account.ak, &self.account.sk);
-        if self.account.is_oauth() {
+        let account = self.account().await;
+        let signer = Signer::new(&account.ak, &account.sk);
+        if account.is_oauth() {
             signer
-                .sign_full("POST", TARGET, body, &extra, self.account.security_token())
+                .sign_full("POST", TARGET, body, &extra, account.security_token())
                 .headers
         } else {
             signer.sign("POST", TARGET, body, &extra).headers
@@ -287,7 +355,10 @@ impl Catalog {
                         .map(|s| s.to_string());
                     info.description = Some("免费额度模型（签到领取）".to_string());
                     info.context_window = item.get("context_window").and_then(|v| v.as_i64());
-                    info.max_tokens = item.get("max_tokens").and_then(|v| v.as_i64());
+                    info.max_tokens = item
+                        .get("max_tokens")
+                        .and_then(|v| v.as_i64())
+                        .map(|v| v.max(crate::params::UPSTREAM_MAX_OUTPUT_TOKENS));
                     out.push(info);
                 }
                 out
@@ -295,13 +366,13 @@ impl Catalog {
             Ok((status, text)) => {
                 eprintln!(
                     "[{}] 免费模型列表同步失败（HTTP {status}）: {}",
-                    self.account.id,
+                    self.id,
                     &text[..text.len().min(200)]
                 );
                 Vec::new()
             }
             Err(e) => {
-                eprintln!("[{}] 免费模型列表同步失败: {e}", self.account.id);
+                eprintln!("[{}] 免费模型列表同步失败: {e}", self.id);
                 Vec::new()
             }
         }
@@ -317,16 +388,16 @@ impl Catalog {
         let (status, text) = match self.signed_send("GET", AGENT_LIST_URL, b"", &extra).await {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[{}] 自动同步模型失败: {e}", self.account.id);
+                eprintln!("[{}] 自动同步模型失败: {e}", self.id);
                 return false;
             }
         };
         if status != 200 {
-            eprintln!("[{}] 自动同步模型失败（HTTP {status}）", self.account.id);
+            eprintln!("[{}] 自动同步模型失败（HTTP {status}）", self.id);
             return false;
         }
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
-            eprintln!("[{}] 自动同步模型失败：响应不是合法 JSON", self.account.id);
+            eprintln!("[{}] 自动同步模型失败：响应不是合法 JSON", self.id);
             return false;
         };
         let Some(agents) = value.get("agents").and_then(|v| v.as_array()) else {
@@ -395,7 +466,12 @@ impl Catalog {
                 info.context_window = params
                     .and_then(|p| p.get("context_window"))
                     .and_then(|v| v.as_i64());
-                info.max_tokens = params.and_then(|p| p.get("max_tokens")).and_then(|v| v.as_i64());
+                info.max_tokens = params
+                    .and_then(|p| p.get("max_tokens"))
+                    .and_then(|v| v.as_i64())
+                    // 上游 model_parameters.max_tokens 恒为 65536，但真实校验器
+                    // 允许到 131072。以校验器为准，见 params::UPSTREAM_MAX_OUTPUT_TOKENS。
+                    .map(|v| v.max(crate::params::UPSTREAM_MAX_OUTPUT_TOKENS));
                 info.supports_images = params
                     .and_then(|p| p.get("supports_images"))
                     .and_then(|v| v.as_bool())
@@ -436,7 +512,7 @@ impl Catalog {
             state.last_refresh = Some(std::time::Instant::now());
         }
         self.save_cache(&discovered).await;
-        println!("[{}] 已同步 {} 个模型: {}", self.account.id, ids.len(), ids.join(", "));
+        println!("[{}] 已同步 {} 个模型: {}", self.id, ids.len(), ids.join(", "));
         true
     }
 

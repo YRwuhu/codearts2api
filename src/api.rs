@@ -1,22 +1,18 @@
-//! HTTP 服务：/v1/models 与 /v1/chat/completions。
+//! HTTP 路由：OpenAI Chat Completions / OpenAI Responses / Anthropic Messages。
 //!
-//! 多账号下同一个模型可能在多个账号可用。请求按账号配置顺序尝试，
-//! 遇到"该账号不可用"的错误（并发超限、鉴权失败、模型未授权）才切换，
-//! 参数错误等客户端问题直接返回，避免无意义地打满所有账号。
+//! 三种协议共用 `chat::execute` 这一条上游通路；本模块只做路由与
+//! 「请求格式 → OpenAI chat → 响应格式」的翻译。
 
-use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use bytes::Bytes;
-use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::models::TARGET;
-use crate::params;
+use crate::chat::{self, CallRequest, Outcome};
 use crate::web::WebState;
 
 pub type AppState = WebState;
@@ -33,6 +29,12 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/chat/completions",
             post(chat_completions).options(preflight),
+        )
+        .route("/v1/responses", post(responses).options(preflight))
+        .route("/v1/messages", post(anthropic_messages).options(preflight))
+        .route(
+            "/v1/messages/count_tokens",
+            post(anthropic_count_tokens).options(preflight),
         )
         .layer(cors)
         .merge(crate::admin::router())
@@ -74,436 +76,160 @@ async fn get_model(State(state): State<AppState>, Path(model_id): Path<String>) 
     }
 }
 
-/// 上游每账号的并发会话上限（实测套餐为 3），可用环境变量覆盖。
-fn upstream_concurrency_limit() -> usize {
-    std::env::var("CODEARTS_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(3)
+fn parse_body(body: &Bytes) -> Result<Value, Response> {
+    if body.is_empty() {
+        return Err(chat::ApiError::bad_request("empty body").to_openai());
+    }
+    serde_json::from_slice(body)
+        .map_err(|e| chat::ApiError::bad_request(format!("invalid JSON body: {e}")).to_openai())
 }
 
-fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(json!({"error": {"message": message.into(), "type": "invalid_request_error"}})),
-    )
-        .into_response()
-}
-
-/// 上游返回的这类错误说明"换个账号可能就好了"，值得切换重试。
-fn is_account_switchable(payload: &Value) -> bool {
-    let code = payload
-        .get("error_code")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_ascii_uppercase();
-    let msg = payload
-        .get("error_msg")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-
-    // 并发会话数已达上限
-    if code.contains("TM.00001041") || msg.contains("并发会话数") {
-        return true;
-    }
-    // 鉴权/授权类
-    if code.starts_with("APIG.0301") || code.starts_with("APIG.0302") || code.contains("401") {
-        return true;
-    }
-    // 该账号没有这个模型
-    if code.contains("4004") || msg.contains("benefit not found") || msg.contains("not registered") {
-        return true;
-    }
-    false
-}
+// ── OpenAI Chat Completions ──────────────────────────────────
 
 async fn chat_completions(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
-    if body.is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "empty body");
-    }
-    let req_json: Value = match serde_json::from_slice(&body) {
+    let req_json = match parse_body(&body) {
         Ok(v) => v,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid JSON body"),
+        Err(resp) => return resp,
     };
 
-    let pool = state.pool.read().await.clone();
-    pool.ensure_fresh().await;
-
-    let model = req_json
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or(pool.first_model().await)
-        .unwrap_or_default();
-
-    if !pool.contains(&model).await {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": {
-                "message": format!("model '{model}' 不在当前账号可用模型列表中"),
-                "type": "invalid_request_error",
-                "param": "model",
-                "code": "model_not_found"
-            }})),
-        )
-            .into_response();
-    }
-
-    let want_stream = req_json
+    let stream = req_json
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let cap = pool
-        .max_tokens_of(&model)
-        .await
-        .unwrap_or(state.config().max_tokens_cap);
+    let session_key = crate::concurrency::session_key(&req_json, chat::header_hint(&headers));
 
     let mut prepared = req_json.clone();
-    prepared["model"] = json!(model);
     if let Some(obj) = prepared.as_object_mut() {
-        if let Some((orig, capped)) = params::normalize_params(obj, cap) {
-            println!("[param] {model}: max_tokens {orig} -> {capped} (上限 {cap})");
+        // 这几个字段上游不认，且会触发 400。
+        for key in ["safety_identifier", "previous_response_id"] {
+            obj.remove(key);
         }
     }
 
-    // 会话键：优先请求头，其次请求体 user 字段，最后首条 user 消息哈希。
-    let header_hint = headers
-        .get("x-codearts-chat-id")
-        .or_else(|| headers.get("x-conversation-id"))
-        .and_then(|v| v.to_str().ok());
-    let sess_key = crate::concurrency::session_key(&req_json, header_hint);
+    let request = CallRequest {
+        body: prepared,
+        stream,
+        session_key,
+    };
 
-    // 上游按「会话」计并发：同一对话必须复用同一个 chat_id，否则每轮都被当成
-    // 新会话，3 个槽位很快耗尽（TM.00001041）。这里把本地会话键传给上游。
-    let upstream_chat_id = sess_key
-        .as_ref()
-        .map(|k| crate::concurrency::upstream_chat_id(k));
-    if let Some(cid) = upstream_chat_id.as_ref() {
-        if let Some(obj) = prepared.as_object_mut() {
-            obj.insert("chat_id".to_string(), json!(cid));
-            obj.insert("prompt_cache_key".to_string(), json!(cid));
-        }
+    match chat::execute(&state, request).await {
+        Ok(Outcome::Json(v)) => Json(v).into_response(),
+        Ok(Outcome::Stream(s)) => chat::openai_sse_body(s),
+        Err(e) => e.to_openai(),
     }
-
-    let started = std::time::Instant::now();
-    let mut candidates = pool.accounts_for(&model).await;
-    if candidates.is_empty() {
-        return error_response(StatusCode::NOT_FOUND, format!("model '{model}' 无可用账号"));
-    }
-
-    // 会话钉号：同一对话固定到同一账号。
-    if let Some(key) = sess_key.as_ref() {
-        if let Some(pinned) = state.pins.get(key).await {
-            // 把钉住的账号排到最前；若它已不可用则释放钉号重新选
-            if let Some(pos) = candidates.iter().position(|c| c.account_id() == pinned) {
-                let c = candidates.remove(pos);
-                candidates.insert(0, c);
-                state.pins.touch(key).await;
-            } else {
-                state.pins.release_account(&pinned).await;
-            }
-        }
-    }
-
-    // 有多个账号时，优先挑不在冷却中的；单账号则直接等待（acquire 内处理）。
-    if candidates.len() > 1 {
-        let mut ready = Vec::new();
-        for c in &candidates {
-            let gate = state.gate(c.account_id(), upstream_concurrency_limit()).await;
-            if gate.available().await {
-                ready.push(c.clone());
-            }
-        }
-        if !ready.is_empty() {
-            candidates = ready;
-        }
-    }
-
-    // 依次尝试各账号；只有"账号级"错误才继续下一个。
-    let mut last: Option<Response> = None;
-    let mut switched = 0usize;
-
-    for (idx, catalog) in candidates.iter().enumerate() {
-        let gate = state.gate(catalog.account_id(), upstream_concurrency_limit()).await;
-
-        // 等待并发槽位（超出上游上限时排队而非直接失败）
-        let _permit = match tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            gate.acquire(),
-        )
-        .await
-        {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => {
-                // 只有真的无法获取槽位才记录，避免并发时刷屏
-                eprintln!("[{}] {model}: {e}", catalog.account_id());
-                last = Some(error_response(StatusCode::SERVICE_UNAVAILABLE, e));
-                continue;
-            }
-            Err(_) => {
-                println!("[{}] {model}: 等待并发槽位超时", catalog.account_id());
-                last = Some(error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "等待并发槽位超时，请稍后重试",
-                ));
-                continue;
-            }
-        };
-
-        let benefit = !catalog.is_agent_channel(&model).await;
-        let body_bytes = match serde_json::to_vec(&prepared) {
-            Ok(v) => v,
-            Err(e) => {
-                return error_response(StatusCode::BAD_REQUEST, format!("serialize error: {e}"))
-            }
-        };
-        let headers = catalog.sign_headers(&body_bytes, benefit, &model).await;
-
-        let mut request = state.http.post(TARGET).body(body_bytes);
-        // Chat-Id / Session-Id 不参与签名（在签名头之后追加）
-        for (k, v) in headers {
-            if let (Ok(name), Ok(value)) = (
-                header::HeaderName::from_bytes(k.as_bytes()),
-                HeaderValue::from_str(&v),
-            ) {
-                request = request.header(name, value);
-            }
-        }
-        if let Some(cid) = upstream_chat_id.as_ref() {
-            request = request
-                .header("Chat-Id", cid)
-                .header("Session-Id", crate::concurrency::upstream_session_id(cid));
-        }
-
-        let upstream = match request.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                catalog.note_failure();
-                println!("[{}] {model}: 请求失败 {e}", catalog.account_id());
-                last = Some(error_response(
-                    StatusCode::BAD_GATEWAY,
-                    format!("upstream error: {e}"),
-                ));
-                continue;
-            }
-        };
-
-        let status = upstream.status();
-        if !status.is_success() {
-            let detail = upstream.text().await.unwrap_or_default();
-            let text = detail.chars().take(2000).collect::<String>();
-            let parsed = serde_json::from_str::<Value>(&detail).unwrap_or(Value::Null);
-            println!(
-                "[{}] {model}: 上游 HTTP {status} body={}",
-                catalog.account_id(),
-                &text[..text.len().min(300)]
-            );
-            gate.note_failure(&text).await;
-            if is_account_switchable(&parsed) && idx + 1 < candidates.len() {
-                catalog.note_failure();
-                switched += 1;
-                continue;
-            }
-            catalog.note_failure();
-            state
-                .usage
-                .record(crate::usage::UsageRecord::failed(
-                    &model,
-                    catalog.account_id(),
-                    started.elapsed().as_millis() as i64,
-                    format!("HTTP {status}"),
-                ))
-                .await;
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": {"message": format!("upstream {status}: {text}")}})),
-            )
-                .into_response();
-        }
-
-        if want_stream {
-            catalog.note_success();
-            gate.note_success().await;
-            if let Some(key) = sess_key.as_ref() {
-                state.pins.pin(key, catalog.account_id()).await;
-            }
-            if switched > 0 {
-                println!("[pool] {model}: 已切换到账号 {}", catalog.account_id());
-            }
-            state
-                .usage
-                .record(crate::usage::UsageRecord::from_upstream(
-                    &model,
-                    catalog.account_id(),
-                    started.elapsed().as_millis() as i64,
-                    true,
-                    None,
-                ))
-                .await;
-            return stream_response(upstream, model).await;
-        }
-
-        let raw = match upstream.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                catalog.note_failure();
-                last = Some(error_response(
-                    StatusCode::BAD_GATEWAY,
-                    format!("read upstream: {e}"),
-                ));
-                continue;
-            }
-        };
-        let result = crate::stream::parse_upstream(&raw);
-
-        if let Some(err) = result.get("error") {
-            let code = err.get("code").cloned().unwrap_or(Value::Null);
-            let err_status = params::error_status(&json!({"error_code": code}));
-            println!(
-                "[{}] {model}: 上游业务错误 {} {}",
-                catalog.account_id(),
-                code,
-                err.get("message").and_then(|v| v.as_str()).unwrap_or("")
-            );
-
-            // 200 里包的业务错误同样可能属于账号级，值得换号重试。
-            let switchable = result
-                .get("error")
-                .map(|e| {
-                    is_account_switchable(&json!({
-                        "error_code": e.get("code").cloned().unwrap_or(Value::Null),
-                        "error_msg": e.get("message").cloned().unwrap_or(Value::Null),
-                    }))
-                })
-                .unwrap_or(false);
-            if switchable && idx + 1 < candidates.len() {
-                catalog.note_failure();
-                switched += 1;
-                continue;
-            }
-
-            let status = StatusCode::from_u16(err_status).unwrap_or(StatusCode::BAD_GATEWAY);
-            return (status, Json(result)).into_response();
-        }
-
-        catalog.note_success();
-        gate.note_success().await;
-        if let Some(key) = sess_key.as_ref() {
-            state.pins.pin(key, catalog.account_id()).await;
-        }
-        if switched > 0 {
-            println!("[pool] {model}: 已切换到账号 {}", catalog.account_id());
-        }
-        state
-            .usage
-            .record(crate::usage::UsageRecord::from_upstream(
-                &model,
-                catalog.account_id(),
-                started.elapsed().as_millis() as i64,
-                false,
-                result.get("usage"),
-            ))
-            .await;
-        return Json(result).into_response();
-    }
-
-    last.unwrap_or_else(|| error_response(StatusCode::BAD_GATEWAY, "上游无可用账号"))
 }
 
-async fn stream_response(upstream: reqwest::Response, model: String) -> Response {
-    let content_type = upstream
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+// ── OpenAI Responses API ────────────────────────────────────
 
-    // 上游偶尔在 stream=true 时返回普通 JSON，需要包装成单帧 SSE。
-    if !content_type.contains("text/event-stream") {
-        let raw = upstream.bytes().await.unwrap_or_default();
-        let mut result = crate::stream::parse_upstream(&raw);
-        if let Some(choices) = result.get_mut("choices").and_then(|c| c.as_array_mut()) {
-            for choice in choices {
-                if choice
-                    .get("finish_reason")
-                    .map(|v| v.is_null())
-                    .unwrap_or(true)
-                {
-                    choice["finish_reason"] = json!("stop");
-                }
-            }
+async fn responses(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let req_json = match parse_body(&body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let stream = req_json
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let session_key = crate::concurrency::session_key(&req_json, chat::header_hint(&headers))
+        .or_else(|| {
+            req_json
+                .get("previous_response_id")
+                .and_then(|v| v.as_str())
+                .map(|s| format!("resp:{s}"))
+        });
+
+    let body = match crate::responses::to_chat_request(&req_json) {
+        Ok(v) => v,
+        Err(e) => return e.to_openai(),
+    };
+
+    let request = CallRequest {
+        body,
+        stream,
+        session_key,
+    };
+
+    match chat::execute(&state, request).await {
+        Ok(Outcome::Json(v)) => Json(crate::responses::from_chat_completion(&v, &req_json))
+            .into_response(),
+        Ok(Outcome::Stream(s)) => {
+            crate::responses::stream_body(s, req_json.get("model").and_then(|v| v.as_str()))
         }
-        let payload = serde_json::to_string(&result).unwrap_or_default();
-        let body = format!("data: {payload}\n\ndata: [DONE]\n\n");
-        return sse_response(Body::from(body));
+        Err(e) => e.to_openai(),
     }
+}
 
-    let mut upstream_stream = upstream.bytes_stream();
-    let stream = async_stream::stream! {
-        let mut saw_done = false;
-        let mut buffer: Vec<u8> = Vec::new();
+// ── Anthropic Messages ──────────────────────────────────────
 
-        while let Some(chunk) = upstream_stream.next().await {
-            let Ok(chunk) = chunk else { break };
-            buffer.extend_from_slice(&chunk);
-
-            while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
-                let line: Vec<u8> = buffer.drain(..=pos).collect();
-                let line = &line[..line.len().saturating_sub(1)];
-
-                match crate::stream::forward_stream_line(line) {
-                    crate::stream::StreamAction::Skip => {}
-                    crate::stream::StreamAction::Done => {
-                        saw_done = true;
-                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n"));
-                    }
-                    crate::stream::StreamAction::Passthrough(text) => {
-                        let frame = format!("{text}\n\n");
-                        yield Ok(Bytes::from(frame));
-                    }
-                    crate::stream::StreamAction::Chunk(value) => {
-                        let payload = serde_json::to_string(&value).unwrap_or_default();
-                        let frame = format!("data: {payload}\n\n");
-                        yield Ok(Bytes::from(frame));
-                    }
-                    crate::stream::StreamAction::Error(value) => {
-                        let payload = serde_json::to_string(&value).unwrap_or_default();
-                        println!("[stream] {model}: 上游业务错误 {payload}");
-                        let frame = format!("data: {payload}\n\ndata: [DONE]\n\n");
-                        yield Ok(Bytes::from(frame));
-                        return;
-                    }
-                }
-            }
-        }
-
-        if !saw_done {
-            yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+async fn anthropic_messages(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let req_json = match parse_body(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return chat::ApiError::bad_request("invalid JSON body").to_anthropic();
         }
     };
 
-    sse_response(Body::from_stream(stream))
+    let stream = req_json
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let session_key = crate::concurrency::session_key(&req_json, chat::header_hint(&headers));
+
+    let body = match crate::anthropic::to_chat_request(&req_json) {
+        Ok(v) => v,
+        Err(e) => return e.to_anthropic(),
+    };
+    let model = req_json
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let request = CallRequest {
+        body,
+        stream,
+        session_key,
+    };
+
+    match chat::execute(&state, request).await {
+        Ok(Outcome::Json(v)) => {
+            Json(crate::anthropic::from_chat_completion(&v, &model, &req_json)).into_response()
+        }
+        Ok(Outcome::Stream(s)) => {
+            crate::anthropic::sse_body(s, model, req_json.get("model").cloned())
+        }
+        Err(e) => e.to_anthropic(),
+    }
 }
 
-fn sse_response(body: Body) -> Response {
-    let mut resp = Response::new(body);
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/event-stream; charset=utf-8"),
-    );
-    resp.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache, no-transform"),
-    );
-    resp.headers_mut().insert(
-        header::HeaderName::from_static("x-accel-buffering"),
-        HeaderValue::from_static("no"),
-    );
-    resp
+/// Anthropic 客户端在发消息前会先估算 token 数；这里给一个可用的近似值，
+/// 而不是让整个请求失败。
+async fn anthropic_count_tokens(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    let req_json = match parse_body(&body) {
+        Ok(v) => v,
+        Err(_) => return chat::ApiError::bad_request("invalid JSON body").to_anthropic(),
+    };
+    let _ = state;
+    let tokens = crate::anthropic::estimate_tokens(&req_json);
+    Json(json!({"input_tokens": tokens})).into_response()
 }
+
