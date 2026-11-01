@@ -147,12 +147,27 @@ async fn response_detail(response: reqwest::Response) -> (reqwest::StatusCode, S
     (status, message)
 }
 
+async fn signed_request(
+    catalog: &Catalog,
+    method: &str,
+    url: &str,
+    body: &[u8],
+    accept: &str,
+) -> Vec<(String, String)> {
+    let extra = [
+        ("accept", accept),
+        ("agent-type", "CodeBase"),
+        ("x-requested-with", "XMLHttpRequest"),
+        ("x-codearts-doer-scenario-type", "web"),
+        ("x-ot-client-type", "web"),
+    ];
+    catalog.signed_request(method, url, body, &extra).await
+}
+
 /// 在发起模型任务前先创建会话，失败时仍可走现有视觉模型回退。
 pub async fn prepare_session(catalog: &Catalog) -> Result<String, String> {
     let url = format!("{BASE_URL}/codebaseservice/v1/cloudagent/sessions");
-    let headers = catalog
-        .signed_request("POST", &url, b"{}", &[("agent-type", "CodeBase")])
-        .await;
+    let headers = signed_request(catalog, "POST", &url, b"{}", "application/json").await;
     let mut request = catalog
         .http_client()
         .post(url)
@@ -181,12 +196,14 @@ pub async fn prepare_session(catalog: &Catalog) -> Result<String, String> {
 async fn upload(
     http: &reqwest::Client,
     catalog: &Catalog,
-    image: ImageAttachment,
+    bytes: Vec<u8>,
+    filename: &str,
+    mime: &str,
 ) -> Result<Value, String> {
     let url = format!("{BASE_URL}/codebaseservice/v1/cloudagent/attachments");
-    let part = reqwest::multipart::Part::bytes(image.bytes)
-        .file_name(image.filename.clone())
-        .mime_str(&image.mime)
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(filename.to_string())
+        .mime_str(mime)
         .map_err(|e| e.to_string())?;
     let form = reqwest::multipart::Form::new().part("file", part);
     let boundary = form.boundary().to_string();
@@ -201,6 +218,7 @@ async fn upload(
     let extra = [
         ("content-type", content_type.as_str()),
         ("accept", "application/json"),
+        ("agent-type", "CodeBase"),
         ("x-requested-with", "XMLHttpRequest"),
         ("x-codearts-doer-scenario-type", "web"),
         ("x-ot-client-type", "web"),
@@ -236,45 +254,98 @@ pub fn task_body(content: &str, model: &str, attachments: &[Value]) -> Value {
     })
 }
 
-/// 发送带附件任务，并把 CloudAgent SSE 统一转换为现有 OpenAI 事件流。
-pub async fn execute(
+async fn session_messages(catalog: &Catalog, session_id: &str) -> Result<Vec<Value>, String> {
+    let url = format!(
+        "{BASE_URL}/codebaseservice/v1/cloudagent/sessions/{session_id}/messages?page_num=1&page_size=200"
+    );
+    let headers = signed_request(catalog, "GET", &url, b"", "application/json").await;
+    let mut request = catalog
+        .http_client()
+        .get(url)
+        .timeout(Duration::from_secs(30));
+    for (key, value) in headers {
+        request = request.header(key, value);
+    }
+    let response = request.send().await.map_err(|e| e.to_string())?;
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("读取 CloudAgent 附件映射 HTTP {status}: {text}"));
+    }
+    let value = serde_json::from_str::<Value>(&text).map_err(|e| e.to_string())?;
+    Ok(value
+        .get("result")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn image_hint(messages: &[Value], filename: &str) -> Option<(String, String)> {
+    let needle = format!("[ImageName: {filename}]");
+    for message in messages.iter().rev() {
+        let Some(content) = message.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        if !content.contains(&needle) || !content.contains("[ImageId: ") {
+            continue;
+        }
+        let id = content
+            .split("[ImageId: ")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let path = content
+            .split("[ImagePath: ")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return Some((id, path));
+    }
+    None
+}
+
+fn attachment_retry_prompt(content: &str, hints: &[(String, String)]) -> String {
+    let mut text = format!("{content}\n\n请读取本轮已经上传的图片并回答上述问题。");
+    let ids: Vec<&str> = hints.iter().map(|(id, _)| id.as_str()).collect();
+    let paths: Vec<&str> = hints
+        .iter()
+        .map(|(_, path)| path.as_str())
+        .filter(|path| !path.is_empty())
+        .collect();
+    if !ids.is_empty() {
+        text.push_str(&format!(
+            "这些图片在会话中的 ImageId 为：{}。调用 analyzeImage 时，优先将这些 ID 传给 imageId，不要把上传 attachment_id 或文件名当作 ImageId。",
+            ids.join(", ")
+        ));
+    }
+    if !paths.is_empty() {
+        text.push_str(&format!(
+            "如果 imageId 无法使用，使用会话返回的 imagePath：{}。不要搜索或猜测其他路径。",
+            paths.join(", ")
+        ));
+    }
+    text
+}
+
+async fn run_task(
     state: &WebState,
     catalog: &Catalog,
     model: &str,
-    body: &Value,
-    client_stream: bool,
+    content: &str,
+    attachments: &[Value],
     session_id: &str,
-) -> Result<Outcome, ApiError> {
-    let started = std::time::Instant::now();
-    let (content, images) = input_from_messages(body).map_err(|message| {
-        ApiError::new(
-            axum::http::StatusCode::BAD_REQUEST,
-            "cloudagent_invalid_input",
-            message,
-        )
-    })?;
-    let mut attachments = Vec::new();
-    for image in images {
-        let uploaded = upload(&state.http, catalog, image)
-            .await
-            .map_err(ApiError::bad_request)?;
-        attachments.push(json!({
-            "attachment_id": uploaded["attachment_id"],
-            "filename": uploaded["filename"],
-            "mime": uploaded["mime"],
-        }));
-    }
+) -> Result<Vec<u8>, ApiError> {
     let url = format!("{BASE_URL}/codebaseservice/v1/cloudagent/sessions/{session_id}/messages");
-    let payload = serde_json::to_vec(&task_body(&content, model, &attachments))
+    let payload = serde_json::to_vec(&task_body(content, model, attachments))
         .map_err(|e| ApiError::bad_request(format!("序列化附件任务失败: {e}")))?;
-    let extra = [
-        ("accept", "text/event-stream"),
-        ("agent-type", "CodeBase"),
-        ("x-requested-with", "XMLHttpRequest"),
-        ("x-codearts-doer-scenario-type", "web"),
-        ("x-ot-client-type", "web"),
-    ];
-    let headers = catalog.signed_request("POST", &url, &payload, &extra).await;
+    let headers = signed_request(catalog, "POST", &url, &payload, "text/event-stream").await;
     let mut request = state
         .http
         .post(url)
@@ -296,11 +367,102 @@ pub async fn execute(
             detail,
         ));
     }
-    let raw = response
+    response
         .bytes()
         .await
-        .map_err(|e| ApiError::unavailable(format!("读取 CloudAgent 任务流失败: {e}")))?;
-    let result = parse_events(&raw, model, session_id).map_err(ApiError::bad_request)?;
+        .map(|bytes| bytes.to_vec())
+        .map_err(|e| ApiError::unavailable(format!("读取 CloudAgent 任务流失败: {e}")))
+}
+
+fn base64_retry_prompt(content: &str, images: &[ImageAttachment]) -> String {
+    let urls = images
+        .iter()
+        .map(|image| {
+            format!(
+                "data:{};base64,{}",
+                image.mime,
+                base64::engine::general_purpose::STANDARD.encode(&image.bytes)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{content}\n\n本轮图片已在会话中。请使用 analyzeImage 的 imageBase64 参数分析以下 data URL，不要猜 ImageId 或文件路径。工具一旦成功返回图像分析结果，就直接根据该结果回答用户，不要重复调用工具，不要再次分析或尝试 ImageId/路径：\n{urls}"
+    )
+}
+
+/// 发送带附件任务，并把 CloudAgent SSE 统一转换为现有 OpenAI 事件流。
+pub async fn execute(
+    state: &WebState,
+    catalog: &Catalog,
+    model: &str,
+    body: &Value,
+    client_stream: bool,
+    session_id: &str,
+) -> Result<Outcome, ApiError> {
+    let started = std::time::Instant::now();
+    println!("[cloudagent] {model}: 使用附件 + CloudAgent 会话 {session_id}");
+    let (content, images) = input_from_messages(body).map_err(|message| {
+        ApiError::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "cloudagent_invalid_input",
+            message,
+        )
+    })?;
+    let mut attachments = Vec::new();
+    for image in &images {
+        let uploaded = upload(
+            &state.http,
+            catalog,
+            image.bytes.clone(),
+            &image.filename,
+            &image.mime,
+        )
+        .await
+        .map_err(ApiError::bad_request)?;
+        attachments.push(json!({
+            "attachment_id": uploaded["attachment_id"],
+            "filename": uploaded["filename"],
+            "mime": uploaded["mime"],
+        }));
+    }
+    let mut raw = run_task(
+        state,
+        catalog,
+        model,
+        &base64_retry_prompt(&content, &images),
+        &attachments,
+        session_id,
+    )
+    .await?;
+    let mut result = parse_events(&raw, model, session_id);
+    if result.is_err() {
+        println!("[cloudagent] {model}: base64 图像任务未成功，尝试会话注册的 ImageId");
+        let messages = session_messages(catalog, session_id)
+            .await
+            .map_err(ApiError::bad_request)?;
+        let hints: Vec<(String, String)> = attachments
+            .iter()
+            .filter_map(|attachment| {
+                image_hint(&messages, attachment["filename"].as_str().unwrap_or(""))
+            })
+            .collect();
+        if !hints.is_empty() {
+            println!("[cloudagent] {model}: 使用会话注册的 ImageId 重试图片任务");
+            let retry = attachment_retry_prompt(&content, &hints);
+            raw = run_task(state, catalog, model, &retry, &attachments, session_id).await?;
+            result = parse_events(&raw, model, session_id);
+        }
+    }
+    let result = result.map_err(ApiError::bad_request)?;
+    if result["choices"][0]["message"]["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("已检测到 doom loop"))
+    {
+        return Err(ApiError::bad_request(
+            "CloudAgent 图像任务重复调用被中止，使用视觉模型回退",
+        ));
+    }
     state
         .usage
         .record(crate::usage::UsageRecord::from_upstream(
@@ -333,11 +495,23 @@ pub async fn execute(
     }
 }
 
+fn response_usage(value: &Value) -> Option<Value> {
+    let tokens = value.get("tokens")?;
+    Some(json!({
+        "prompt_tokens": tokens["input"],
+        "completion_tokens": tokens["output"],
+        "total_tokens": tokens["total"],
+        "completion_tokens_details": {"reasoning_tokens": tokens["reasoning"]},
+    }))
+}
+
 pub fn parse_events(raw: &[u8], model: &str, session_id: &str) -> Result<Value, String> {
     let text = String::from_utf8_lossy(raw);
     let mut content = String::new();
+    let mut image_analysis = None;
     let mut reasoning = String::new();
     let mut terminal_error = None;
+    let mut successful_image_analysis = false;
     let mut usage = None;
     let mut done = false;
     for block in text.replace("\r\n", "\n").split("\n\n") {
@@ -373,13 +547,28 @@ pub fn parse_events(raw: &[u8], model: &str, session_id: &str) -> Result<Value, 
                 .or_else(|| Some(data.clone()));
             continue;
         }
-        if event == "tool_result" && value.get("status").and_then(Value::as_str) == Some("error") {
-            terminal_error = value
-                .get("error")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| Some("CloudAgent 工具执行失败".into()));
-            continue;
+        if event == "tool_result" {
+            if value.get("tool").and_then(Value::as_str) == Some("analyzeImage")
+                && value.get("status").and_then(Value::as_str) == Some("completed")
+                && value
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .is_some_and(|result| !result.trim().is_empty())
+            {
+                successful_image_analysis = true;
+                image_analysis = value
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            if value.get("status").and_then(Value::as_str) == Some("error") {
+                terminal_error = value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| Some("CloudAgent 工具执行失败".into()));
+                continue;
+            }
         }
         if event == "thought" {
             if let Some(s) = value.get("content").and_then(Value::as_str) {
@@ -388,14 +577,7 @@ pub fn parse_events(raw: &[u8], model: &str, session_id: &str) -> Result<Value, 
         }
         if event == "done" {
             done = true;
-            usage = value.get("tokens").map(|tokens| {
-                json!({
-                    "prompt_tokens": tokens["input"],
-                    "completion_tokens": tokens["output"],
-                    "total_tokens": tokens["total"],
-                    "completion_tokens_details": {"reasoning_tokens": tokens["reasoning"]},
-                })
-            });
+            usage = response_usage(&value);
         }
         if event == "message" {
             if let Some(s) = value.get("content").and_then(Value::as_str) {
@@ -403,11 +585,15 @@ pub fn parse_events(raw: &[u8], model: &str, session_id: &str) -> Result<Value, 
             }
         }
     }
-    if let Some(error) = terminal_error {
+    if let Some(error) = terminal_error.filter(|_| !successful_image_analysis) {
         return Err(error);
     }
     if content.is_empty() {
-        return Err("CloudAgent 未返回文本内容；任务可能仍在处理或未完成".into());
+        if let Some(analysis) = image_analysis {
+            content = analysis;
+        } else {
+            return Err("CloudAgent 未返回文本内容；任务可能仍在处理或未完成".into());
+        }
     }
     if !done {
         return Err("CloudAgent 任务在完成事件前结束，响应可能不完整".into());
@@ -423,6 +609,7 @@ pub fn parse_events(raw: &[u8], model: &str, session_id: &str) -> Result<Value, 
         "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
         "usage": usage,
+        "codearts_channel": "cloudagent_attachments",
     }))
 }
 
@@ -466,6 +653,19 @@ mod tests {
     }
 
     #[test]
+    fn reads_session_image_mapping_not_upload_attachment_id() {
+        let messages = vec![
+            json!({"content":"[ImageId: internal-image-id][ImageName: pixel.png][ImagePath: /attachments/pixel.png] This is an image."}),
+        ];
+        let (id, path) = image_hint(&messages, "pixel.png").unwrap();
+        assert_eq!(id, "internal-image-id");
+        let retry = attachment_retry_prompt("describe", &[(id, path)]);
+        assert!(retry.contains("internal-image-id"));
+        assert!(retry.contains("/attachments/pixel.png"));
+        assert!(!retry.contains("imageId：20261101"));
+    }
+
+    #[test]
     fn parses_text_deltas_and_ignores_status() {
         let raw = b"event: status\ndata: {\"status\":\"processing\"}\n\nevent: message\ndata: {\"content\":\"A flag\"}\n\nevent: message\ndata: {\"content\":\" on a hill.\"}\n\nevent: done\ndata: {}\n\n";
         let result = parse_events(raw, "deepseek-v4.1-flash-1017", "s1").unwrap();
@@ -488,6 +688,14 @@ mod tests {
     fn rejects_truncated_task_before_done() {
         let raw = b"event: message\ndata: {\"content\":\"partial\"}\n\n";
         assert!(parse_events(raw, "m", "s").is_err());
+    }
+
+    #[test]
+    fn keeps_model_answer_after_successful_image_tool_and_permission_guard() {
+        let raw = b"event: tool_result\ndata: {\"tool\":\"analyzeImage\",\"status\":\"completed\",\"result\":\"Red\"}\n\nevent: tool_result\ndata: {\"tool\":\"tool_call\",\"status\":\"error\",\"error\":\"The user rejected permission to use this specific tool call.\"}\n\nevent: message\ndata: {\"content\":\"Red\"}\n\nevent: done\ndata: {}\n\n";
+        let result = parse_events(raw, "kimi-k3.1-pro", "s1").unwrap();
+        assert_eq!(result["model"], "kimi-k3.1-pro");
+        assert_eq!(result["choices"][0]["message"]["content"], "Red");
     }
 
     #[test]

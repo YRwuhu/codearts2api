@@ -160,13 +160,9 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
         .map(params::has_image_input)
         .unwrap_or(false);
     let mut attachment_session = None;
-    if has_images
-        && !pool.supports_images(&requested_model).await
-        && std::env::var("CODEARTS_CLOUDAGENT_ATTACHMENTS")
-            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-    {
-        // supports_images 仅表示直接聊天接口接受内嵌图片；网页版还可以通过
-        // 附件 + CloudAgent 会话处理图片。实验通道显式开启，失败自动回退。
+    if has_images && !pool.supports_images(&requested_model).await {
+        // 直接接口的视觉标记不覆盖 CloudAgent：优先保留用户选择的模型，
+        // 通过网页附件链路处理图像，失败后才使用独立的视觉模型回退。
         if let Some(catalog) = pool.accounts_for(&requested_model).await.into_iter().next() {
             match crate::cloudagent::prepare_session(&catalog).await {
                 Ok(session_id) => attachment_session = Some((catalog, session_id)),
@@ -186,7 +182,7 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
                 "CodeArts 将模型 {requested_model} 注册为纯文本，不能发送图片；请配置 CODEARTS_VISION_MODEL 为视觉模型"
             )));
         }
-        if !pool.contains(&vision).await {
+        if !pool.wait_for_model(&vision).await {
             return Err(ApiError::bad_request(format!(
                 "模型 {requested_model} 不支持图片，且视觉模型 {vision} 尚未同步；请刷新模型目录或配置 CODEARTS_VISION_MODEL"
             )));
@@ -227,7 +223,7 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
                     if vision.eq_ignore_ascii_case("off") {
                         return Err(error);
                     }
-                    if !pool.contains(&vision).await {
+                    if !pool.wait_for_model(&vision).await {
                         return Err(ApiError::bad_request(format!(
                             "附件任务失败，且视觉模型 {vision} 尚未同步：{}",
                             error.message

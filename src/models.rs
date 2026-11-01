@@ -57,8 +57,8 @@ pub struct ModelInfo {
     pub max_tokens: Option<i64>,
     #[serde(default)]
     pub supports_images: bool,
-    /// 是否尝试网页附件 + CloudAgent 会话通道；不代表内部图片映射已完成。
-    #[serde(default)]
+    /// 可通过网页附件 + CloudAgent 会话处理图片，独立于直接内嵌图片能力。
+    #[serde(default = "default_true")]
     pub supports_attachments: bool,
 }
 
@@ -67,6 +67,10 @@ fn default_object() -> String {
 }
 fn default_channel() -> String {
     "agent".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// 仅表示 `/api/v2/chat/completions` 接受内嵌图片的能力。
@@ -106,7 +110,7 @@ impl ModelInfo {
             context_window: None,
             max_tokens: None,
             supports_images,
-            supports_attachments: false,
+            supports_attachments: true,
         }
     }
 
@@ -121,8 +125,7 @@ impl ModelInfo {
             "supports_images": self.supports_images,
             "vision": self.supports_images,
             "supports_vision": self.supports_images,
-            "supports_attachments": self.supports_attachments && std::env::var("CODEARTS_CLOUDAGENT_ATTACHMENTS")
-                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")),
+            "supports_attachments": self.supports_attachments,
             "supports_function_calling": true,
             "supports_tool_calling": true,
             "supports_reasoning": true,
@@ -849,6 +852,26 @@ impl Pool {
             }
         }
         out
+    }
+
+    /// 首次图片请求可能先于后台目录刷新到达。给正在进行的同步一个短暂
+    /// 完成窗口；未过期目录不等待，也不为每个请求重复发起刷新。
+    pub async fn wait_for_model(&self, model_id: &str) -> bool {
+        const REFRESH_WAIT: Duration = Duration::from_secs(8);
+        let deadline = std::time::Instant::now() + REFRESH_WAIT;
+        loop {
+            if self.contains(model_id).await {
+                return true;
+            }
+            let stale = self.catalogs.iter().any(|catalog| !catalog.is_fresh());
+            if !stale || std::time::Instant::now() >= deadline {
+                return false;
+            }
+            for catalog in &self.catalogs {
+                catalog.ensure_fresh();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     pub async fn contains(&self, model_id: &str) -> bool {

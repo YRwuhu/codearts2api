@@ -120,18 +120,20 @@ CodeArts 有两条图片调用路径，能力标记不能混用：
   带附件上下文和 `agent: build` 的会话任务。DeepSeek 任务通过图像分析工具
   处理图片；这条链路同样使用现有 OAuth/AK/SK 凭证，不需要浏览器 Cookie。
 
-`deepseek-v4.1-flash-1017` 原生具备图像理解能力，但直接聊天接口会返回
-`The request model is not multimodal`。代理已验证网页同款附件协议可复用现有
-OAuth/AK/SK：上传图片、创建会话和提交 DeepSeek 任务均成功，并有真实读图
-返回。但 CloudAgent 的内部 `ImageId` 与上传 `attachment_id` 不同，映射偶尔
-未被图像工具接受，因此该通道暂标为**实验功能**，默认不启用。
+`deepseek-v4.1-flash-1017`、`deepseek-v4.1-flash`、`kimi-k3.1-pro`、`kimi-k3`
+等模型的直接聊天接口可能返回 `The request model is not multimodal`。代理默认
+为这些模型尝试网页附件 + CloudAgent，**保留所选模型负责对话和回答**，图像
+分析由 CloudAgent 的 `analyzeImage` 工具执行。图像工具可能调用独立的视觉
+后端，因此这不是把 base64 直接送进所选模型的 `/api/v2/chat/completions`。
 
-含图请求默认按以下顺序处理：直接接口支持的模型走原路径；否则回退到
-`CODEARTS_VISION_MODEL`。纯文本请求始终走原路径。设置
-`CODEARTS_CLOUDAGENT_ATTACHMENTS=1` 可在直接接口不支持的模型上优先尝试
-附件 + CloudAgent；该通道失败时仍回退视觉模型。模型目录的
-`supports_images` 不会被改成 `true`；`supports_attachments` 为实验能力标记，
-默认 `false`，打开开关只影响路由、不改模型厂商元数据。
+含图请求的优先级为：直接接口支持的模型走原路径；其他模型先走附件 +
+CloudAgent；附件任务失败后才回退 `CODEARTS_VISION_MODEL`。纯文本请求
+始终走原路径。目录的 `supports_images` 不会被改成 `true`，独立的
+`supports_attachments` 表示可尝试附件任务。
+
+附件任务优先使用会话内的 base64 图像，必要时读取服务端注册的内部 `ImageId`，
+不混用上传 `attachment_id`。工具成功后直接回答，避免重复图像调用和循环保护。
+该路径已实测上述四个模型返回正确颜色，Kimi K2.6 VL 的直接图片回退也已验证。
 
 附件通道目前支持 PNG/JPEG/WebP/GIF 的 base64 `data:` URL，单图不超过
 20 MiB；远程图片 URL 需先下载后以 base64 发送。CloudAgent 任务耗时可能长于
@@ -160,11 +162,8 @@ CODEARTS_MAX_TOKENS_CAP=131072
 # 可选：自定义 usage.jsonl 路径
 # CODEARTS_USAGE_ARCHIVE=D:\tools\codearts2api\usage.jsonl
 
-# 含图片请求使用的 CodeArts 视觉模型（off 可关闭自动路由）
+# 含图片请求失败时使用的 CodeArts 回退视觉模型（off 可关闭回退）
 CODEARTS_VISION_MODEL=kimi-k2.6-vl
-
-# 实验：优先尝试网页附件 + CloudAgent 通道（失败仍回退视觉模型）
-CODEARTS_CLOUDAGENT_ATTACHMENTS=0
 
 # 免费额度模型拿不到时是否仍列出兜底清单
 CODEARTS_BENEFIT_FALLBACK=0
