@@ -99,9 +99,9 @@ Model    : deepseek-v4.1-flash
 
 上游按**会话**计并发（当前套餐上限 3）。代理已处理：
 
-- 每账号并发上限 3（`CODEARTS_CONCURRENCY` 可调），超出排队而非报错
-- 同一对话固定路由到同一账号（会话钉号），避免重复占槽位
-- 撞到上限的账号冷却 20 秒，自动切到其他账号
+- 每账号本地在途流式请求上限默认为 8（`CODEARTS_CONCURRENCY` 可调），超出排队而非立即报错
+- 同一对话优先路由到同一账号（会话钉号），提高 prompt cache 亲和性
+- 撞到上游会话上限的账号冷却 30 秒，自动切到其他账号
 
 实测同时 10 个请求全部成功。
 
@@ -114,11 +114,14 @@ Model    : deepseek-v4.1-flash
 CODEARTS_PROXY_HOST=127.0.0.1
 CODEARTS_PROXY_PORT=8787
 
-# 每账号并发上限（默认 3）
-CODEARTS_CONCURRENCY=3
+# 每账号本地在途流式请求上限（默认 8，不是上游会话数）
+CODEARTS_CONCURRENCY=8
 
 # max_tokens 兜底上限（模型元数据缺失时用）
-CODEARTS_MAX_TOKENS_CAP=65536
+CODEARTS_MAX_TOKENS_CAP=131072
+
+# 可选：自定义 usage.jsonl 路径
+# CODEARTS_USAGE_ARCHIVE=D:\tools\codearts2api\usage.jsonl
 
 # 免费额度模型拿不到时是否仍列出兜底清单
 CODEARTS_BENEFIT_FALLBACK=0

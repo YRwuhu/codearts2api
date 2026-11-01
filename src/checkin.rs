@@ -318,7 +318,8 @@ mod tests {
 
     #[test]
     fn daily_matched_by_type_when_id_differs() {
-        let v = json!([{"campaignId": 99, "type": "daily_claim", "title": "t", "benefitAmount": 5}]);
+        let v =
+            json!([{"campaignId": 99, "type": "daily_claim", "title": "t", "benefitAmount": 5}]);
         let acts = parse_activities(&v);
         assert!(acts[0].is_daily());
     }

@@ -134,8 +134,13 @@ impl<'a> Signer<'a> {
 
         let canonical_headers: String = headers
             .iter()
-            .map(|(k, v)| format!("{k}:{}
-", v.trim()))
+            .map(|(k, v)| {
+                format!(
+                    "{k}:{}
+",
+                    v.trim()
+                )
+            })
             .collect();
         let signed_headers = headers
             .iter()
@@ -208,9 +213,7 @@ impl<'a> Signer<'a> {
         for (k, v) in extra_headers {
             headers.push((k.to_ascii_lowercase(), v.trim().to_string()));
         }
-        let has = |name: &str, list: &[(String, String)]| {
-            list.iter().any(|(k, _)| k == name)
-        };
+        let has = |name: &str, list: &[(String, String)]| list.iter().any(|(k, _)| k == name);
         if !has("host", &headers) {
             headers.push(("host".to_string(), host));
         }
@@ -314,7 +317,12 @@ mod tests {
             .find(|(k, _)| k == "Authorization")
             .map(|(_, v)| v.clone())
             .unwrap();
-        for name in ["x-ot-session-id", "user-session-id", "model-id", "model-name"] {
+        for name in [
+            "x-ot-session-id",
+            "user-session-id",
+            "model-id",
+            "model-name",
+        ] {
             assert!(
                 auth.contains(name),
                 "SignedHeaders 必须包含 {name}，实际: {auth}"
@@ -332,13 +340,20 @@ mod tests {
     #[test]
     fn signature_is_deterministic_for_fixed_inputs() {
         let signer = Signer::new("AKID", "SECRET");
-        let r1 = signer.sign("POST", "https://example.com/api/v2/chat/completions", b"{}", &[]);
+        let r1 = signer.sign(
+            "POST",
+            "https://example.com/api/v2/chat/completions",
+            b"{}",
+            &[],
+        );
         let auth1 = r1
             .headers
             .iter()
             .find(|(k, _)| k == "Authorization")
             .map(|(_, v)| v.clone())
             .unwrap();
-        assert!(auth1.starts_with("SDK-HMAC-SHA256 Access=AKID, SignedHeaders=content-type;host;x-sdk-date, Signature="));
+        assert!(auth1.starts_with(
+            "SDK-HMAC-SHA256 Access=AKID, SignedHeaders=content-type;host;x-sdk-date, Signature="
+        ));
     }
 }

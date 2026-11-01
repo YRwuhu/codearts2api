@@ -547,8 +547,10 @@
     try {
       const hours = state.usageHours;
       const bucket = hours <= 48 ? 'hour' : 'day';
-      const summary = await api('/api/usage?hours=' + hours + '&bucket=' + bucket);
-      const recent = await api('/api/usage/recent?hours=' + hours);
+      const [summary, recent] = await Promise.all([
+        api('/api/usage?hours=' + hours + '&bucket=' + bucket),
+        api('/api/usage/recent?hours=' + hours),
+      ]);
       renderUsage(summary, recent);
     } catch (e) {
       toast('error', '用量加载失败：' + e.message);
@@ -909,7 +911,9 @@
     setRoute(currentRouteFromHash());
     await loadStatus(false);
     // 每 20 秒静默刷新一次，账号状态与模型变化能及时反映
-    setInterval(() => loadStatus(false), 20000);
+    setInterval(() => {
+      if (!document.hidden) loadStatus(false);
+    }, 20000);
   }
 
   if (document.readyState === 'loading') {

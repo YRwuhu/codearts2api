@@ -48,7 +48,7 @@ async fn preflight() -> StatusCode {
 
 async fn list_models(State(state): State<AppState>) -> Response {
     let pool = state.pool.read().await.clone();
-    pool.ensure_fresh().await;
+    pool.ensure_fresh();
     let data: Vec<Value> = pool
         .merged_models()
         .await
@@ -60,7 +60,7 @@ async fn list_models(State(state): State<AppState>) -> Response {
 
 async fn get_model(State(state): State<AppState>, Path(model_id): Path<String>) -> Response {
     let pool = state.pool.read().await.clone();
-    pool.ensure_fresh().await;
+    pool.ensure_fresh();
     let models = pool.merged_models().await;
     match models.iter().find(|m| m.id == model_id) {
         Some(m) => Json(m.to_openai()).into_response(),
@@ -76,12 +76,15 @@ async fn get_model(State(state): State<AppState>, Path(model_id): Path<String>) 
     }
 }
 
-fn parse_body(body: &Bytes) -> Result<Value, Response> {
+fn parse_body(body: &Bytes) -> Result<Value, Box<Response>> {
     if body.is_empty() {
-        return Err(chat::ApiError::bad_request("empty body").to_openai());
+        return Err(Box::new(
+            chat::ApiError::bad_request("empty body").to_openai(),
+        ));
     }
-    serde_json::from_slice(body)
-        .map_err(|e| chat::ApiError::bad_request(format!("invalid JSON body: {e}")).to_openai())
+    serde_json::from_slice(body).map_err(|e| {
+        Box::new(chat::ApiError::bad_request(format!("invalid JSON body: {e}")).to_openai())
+    })
 }
 
 // ── OpenAI Chat Completions ──────────────────────────────────
@@ -93,7 +96,7 @@ async fn chat_completions(
 ) -> Response {
     let req_json = match parse_body(&body) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let stream = req_json
@@ -133,7 +136,7 @@ async fn responses(
 ) -> Response {
     let req_json = match parse_body(&body) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let stream = req_json
@@ -161,8 +164,9 @@ async fn responses(
     };
 
     match chat::execute(&state, request).await {
-        Ok(Outcome::Json(v)) => Json(crate::responses::from_chat_completion(&v, &req_json))
-            .into_response(),
+        Ok(Outcome::Json(v)) => {
+            Json(crate::responses::from_chat_completion(&v, &req_json)).into_response()
+        }
         Ok(Outcome::Stream(s)) => {
             crate::responses::stream_body(s, req_json.get("model").and_then(|v| v.as_str()))
         }
@@ -208,9 +212,10 @@ async fn anthropic_messages(
     };
 
     match chat::execute(&state, request).await {
-        Ok(Outcome::Json(v)) => {
-            Json(crate::anthropic::from_chat_completion(&v, &model, &req_json)).into_response()
-        }
+        Ok(Outcome::Json(v)) => Json(crate::anthropic::from_chat_completion(
+            &v, &model, &req_json,
+        ))
+        .into_response(),
         Ok(Outcome::Stream(s)) => {
             crate::anthropic::sse_body(s, model, req_json.get("model").cloned())
         }
@@ -220,10 +225,7 @@ async fn anthropic_messages(
 
 /// Anthropic 客户端在发消息前会先估算 token 数；这里给一个可用的近似值，
 /// 而不是让整个请求失败。
-async fn anthropic_count_tokens(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> Response {
+async fn anthropic_count_tokens(State(state): State<AppState>, body: Bytes) -> Response {
     let req_json = match parse_body(&body) {
         Ok(v) => v,
         Err(_) => return chat::ApiError::bad_request("invalid JSON body").to_anthropic(),
@@ -232,4 +234,3 @@ async fn anthropic_count_tokens(
     let tokens = crate::anthropic::estimate_tokens(&req_json);
     Json(json!({"input_tokens": tokens})).into_response()
 }
-

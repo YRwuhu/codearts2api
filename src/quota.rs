@@ -122,8 +122,7 @@ pub fn parse_quota(value: &Value) -> Quota {
                     quota.total_amount = num(metric.get("package_credit_amount"));
                     quota.total_used = num(metric.get("package_credit_used"));
                     quota.total_remain = num(metric.get("package_credit_remain"));
-                    quota.expiring_amount =
-                        num(metric.get("package_credit_expiring_amount"));
+                    quota.expiring_amount = num(metric.get("package_credit_expiring_amount"));
                 }
                 // 分套餐明细
                 "usageBasicPackageCredit" => quota.packages.push(CreditMetric {
@@ -177,7 +176,10 @@ pub fn parse_quota(value: &Value) -> Quota {
                     .unwrap_or_default()
                     .to_string(),
                 usage_token: int(model.get("usage_token_num")),
-                enabled: model.get("enable").and_then(|v| v.as_bool()).unwrap_or(false),
+                enabled: model
+                    .get("enable")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 status: model
                     .get("status")
                     .and_then(|v| v.as_str())

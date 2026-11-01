@@ -37,12 +37,7 @@ pub struct WebState {
 }
 
 impl WebState {
-    pub fn new(
-        config: Config,
-        pool: Pool,
-        http: reqwest::Client,
-        usage: Arc<UsageStore>,
-    ) -> Self {
+    pub fn new(config: Config, pool: Pool, http: reqwest::Client, usage: Arc<UsageStore>) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
             pool: Arc::new(RwLock::new(pool)),
@@ -64,7 +59,11 @@ impl WebState {
     }
 
     /// 取（或按需创建）某账号的并发闸门。
-    pub async fn gate(&self, account_id: &str, limit: usize) -> Arc<crate::concurrency::AccountGate> {
+    pub async fn gate(
+        &self,
+        account_id: &str,
+        limit: usize,
+    ) -> Arc<crate::concurrency::AccountGate> {
         {
             let guard = self.gates.read().await;
             if let Some(g) = guard.get(account_id) {
@@ -133,30 +132,8 @@ pub async fn static_handler(uri: Uri) -> Response {
     }
 }
 
-/// 浏览器端签到脚本从 devcloud 页面跨域回传结果，需要放开该端点的预检。
-async fn checkin_report_options() -> impl IntoResponse {
-    (
-        StatusCode::NO_CONTENT,
-        [
-            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
-            (
-                header::ACCESS_CONTROL_ALLOW_METHODS,
-                "POST, OPTIONS",
-            ),
-            (
-                header::ACCESS_CONTROL_ALLOW_HEADERS,
-                "content-type",
-            ),
-        ],
-    )
-}
-
 pub fn router() -> Router<WebState> {
     Router::new()
-        .route(
-            "/api/checkin/report",
-            axum::routing::options(checkin_report_options),
-        )
         .route("/", get(static_handler))
         .route("/accounts", get(static_handler))
         .route("/models", get(static_handler))

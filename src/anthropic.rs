@@ -17,6 +17,15 @@ use serde_json::{json, Value};
 
 use crate::chat::{ApiError, EventStream, StreamEvent};
 
+#[derive(Default)]
+struct PendingTool {
+    id: String,
+    name: String,
+    arguments: String,
+    started: bool,
+    closed: bool,
+}
+
 /// Anthropic 请求 → OpenAI chat 请求。
 pub fn to_chat_request(req: &Value) -> Result<Value, ApiError> {
     let mut messages: Vec<Value> = Vec::new();
@@ -63,10 +72,8 @@ pub fn to_chat_request(req: &Value) -> Result<Value, ApiError> {
                     }
                 }
                 Some("image") => {
-                    if let Some(source) = block.get("source") {
-                        if let Some(url) = anthropic_image_url(source) {
-                            parts.push(json!({"type": "image_url", "image_url": {"url": url}}));
-                        }
+                    if let Some(part) = anthropic_image_part(block) {
+                        parts.push(part);
                     }
                 }
                 Some("tool_use") => {
@@ -84,12 +91,17 @@ pub fn to_chat_request(req: &Value) -> Result<Value, ApiError> {
                 }
                 Some("tool_result") => {
                     let out = block.get("content").cloned().unwrap_or(json!(""));
-                    let text = blocks_to_text(&out);
+                    let (text, images) = tool_result_content(&out);
                     tool_results.push(json!({
                         "role": "tool",
                         "tool_call_id": block.get("tool_use_id").cloned().unwrap_or(Value::Null),
                         "content": text,
                     }));
+                    if !images.is_empty() {
+                        // 上游只接受用户消息中的图片。截图必须单独保留，不能被
+                        // blocks_to_text 丢掉，也不能把 base64 塞进工具文本。
+                        tool_results.push(json!({"role": "user", "content": images}));
+                    }
                 }
                 // thinking / redacted_thinking / cache_control 等：上游没有对应概念
                 _ => {}
@@ -195,6 +207,44 @@ fn convert_tool_choice(tc: &Value) -> Value {
     }
 }
 
+fn anthropic_image_part(block: &Value) -> Option<Value> {
+    let url = anthropic_image_url(block.get("source")?)?;
+    Some(json!({"type": "image_url", "image_url": {"url": url}}))
+}
+
+fn tool_result_content(content: &Value) -> (String, Vec<Value>) {
+    let mut text = Vec::new();
+    let mut images = Vec::new();
+    collect_tool_result_content(content, &mut text, &mut images);
+    (text.join("\n"), images)
+}
+
+fn collect_tool_result_content(content: &Value, text: &mut Vec<String>, images: &mut Vec<Value>) {
+    match content {
+        Value::String(s) => text.push(s.clone()),
+        Value::Array(blocks) => {
+            for block in blocks {
+                collect_tool_result_content(block, text, images);
+            }
+        }
+        Value::Object(_) => match content.get("type").and_then(|v| v.as_str()) {
+            Some("text") => {
+                if let Some(s) = content.get("text").and_then(|v| v.as_str()) {
+                    text.push(s.to_string());
+                }
+            }
+            Some("image") => images.extend(anthropic_image_part(content)),
+            Some("tool_result") => {
+                if let Some(nested) = content.get("content") {
+                    collect_tool_result_content(nested, text, images);
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
 fn anthropic_image_url(source: &Value) -> Option<String> {
     match source.get("type").and_then(|v| v.as_str()) {
         Some("base64") => {
@@ -251,7 +301,10 @@ pub fn from_chat_completion(completion: &Value, model: &str, original: &Value) -
             content.push(json!({"type": "thinking", "thinking": reasoning}));
         }
 
-        let text = message.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let text = message
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if !text.is_empty() {
             content.push(json!({"type": "text", "text": text}));
         }
@@ -349,9 +402,11 @@ pub fn sse_body(stream: EventStream, model: String, _original: Option<Value>) ->
         let mut saw_text = false;
         let mut saw_thinking = false;
 
-        // 工具调用按上游 index 聚合：id / name / arguments
-        let mut tool_calls: std::collections::BTreeMap<i64, (String, String, String)> =
+        // 工具调用按上游 index 跟踪；每个 index 只开启一次 block。
+        let mut tool_calls: std::collections::BTreeMap<i64, PendingTool> =
             std::collections::BTreeMap::new();
+        let mut active_tool: Option<i64> = None;
+        // 已关闭工具再次交错出现时，参数暂存到流末尾的合法 block 中。
 
         yield anthropic_event("message_start", json!({
             "type": "message_start",
@@ -448,25 +503,60 @@ pub fn sse_body(stream: EventStream, model: String, _original: Option<Value>) ->
                             }
                         }
 
-                        // ── tool calls：先聚合，流末尾统一发 ──
+                        // ── tool calls：工具片段立即输出，不等整个响应完成 ──
                         if let Some(calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                             for call in calls {
-                                let idx = call.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
-                                let entry = tool_calls.entry(idx).or_insert_with(|| {
-                                    (String::new(), String::new(), String::new())
-                                });
-                                if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
-                                    if !id.is_empty() {
-                                        entry.0 = id.to_string();
+                                let upstream_idx = call.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+                                let id = call.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                let func = call.get("function");
+                                let name = func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                                let args = func.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("");
+
+                                if active_tool != Some(upstream_idx) {
+                                    if let Some((idx, kind)) = open_block.take() {
+                                        if kind == "tool_use" {
+                                            if let Some(tool) = tool_calls.get_mut(&active_tool.unwrap_or(-1)) {
+                                                tool.closed = true;
+                                            }
+                                        }
+                                        yield anthropic_event("content_block_stop", json!({
+                                            "type": "content_block_stop", "index": idx,
+                                        }));
                                     }
+                                    active_tool = Some(upstream_idx);
                                 }
-                                if let Some(func) = call.get("function") {
-                                    if let Some(n) = func.get("name").and_then(|v| v.as_str()) {
-                                        entry.1.push_str(n);
-                                    }
-                                    if let Some(a) = func.get("arguments").and_then(|v| v.as_str()) {
-                                        entry.2.push_str(a);
-                                    }
+                                let should_start = {
+                                    let tool = tool_calls.entry(upstream_idx).or_default();
+                                    if !id.is_empty() && tool.id.is_empty() { tool.id = id.to_string(); }
+                                    if !name.is_empty() { tool.name.push_str(name); }
+                                    tool.arguments.push_str(args);
+                                    active_tool == Some(upstream_idx) && !tool.started && !tool.closed
+                                };
+                                if should_start {
+                                    let tool = tool_calls.get(&upstream_idx).expect("tool exists");
+                                    let call_id = if tool.id.is_empty() {
+                                        format!("toolu_{}", crate::chat::uuid_ish())
+                                    } else { tool.id.clone() };
+                                    let block_index = next_index;
+                                    next_index += 1;
+                                    open_block = Some((block_index, "tool_use"));
+                                    yield anthropic_event("content_block_start", json!({
+                                        "type": "content_block_start",
+                                        "index": block_index,
+                                        "content_block": {
+                                            "type": "tool_use", "id": call_id,
+                                            "name": tool.name, "input": {},
+                                        },
+                                    }));
+                                    tool_calls.get_mut(&upstream_idx).expect("tool exists").started = true;
+                                }
+                                if !args.is_empty() && active_tool == Some(upstream_idx) && tool_calls.get(&upstream_idx).map(|t| t.started && !t.closed).unwrap_or(false) {
+                                    let block_index = open_block.map(|(i, _)| i).unwrap_or(0);
+                                    yield anthropic_event("content_block_delta", json!({
+                                        "type": "content_block_delta",
+                                        "index": block_index,
+                                        "delta": {"type": "input_json_delta", "partial_json": args},
+                                    }));
                                 }
                             }
                         }
@@ -490,7 +580,7 @@ pub fn sse_body(stream: EventStream, model: String, _original: Option<Value>) ->
             }
         }
 
-        // 关闭正文/推理 block
+        // 关闭最后一个 block，再按上游 index 发送被交错的工具。
         if let Some((idx, _)) = open_block.take() {
             yield anthropic_event("content_block_stop", json!({
                 "type": "content_block_stop",
@@ -498,38 +588,30 @@ pub fn sse_body(stream: EventStream, model: String, _original: Option<Value>) ->
             }));
         }
 
-        // 工具调用：每个一个独立 block。input_json_delta 要传**原始 JSON 片段**，
-        // 不是重新序列化的对象 —— 旧实现传了 to_string() 的完整对象，
-        // 客户端按流式片段拼接时就会解析失败。
-        for (_upstream_idx, (call_id, name, args)) in &tool_calls {
-            let idx = next_index;
+        // 交错工具的尾部片段推迟到此处；不会改写已关闭的 block。
+        for tool in tool_calls.values() {
+            if tool.started {
+                continue;
+            }
+            let block_index = next_index;
             next_index += 1;
             yield anthropic_event("content_block_start", json!({
-                "type": "content_block_start",
-                "index": idx,
+                "type": "content_block_start", "index": block_index,
                 "content_block": {
                     "type": "tool_use",
-                    "id": if call_id.is_empty() {
-                        format!("toolu_{}", crate::chat::uuid_ish())
-                    } else {
-                        call_id.clone()
-                    },
-                    "name": name,
-                    "input": {},
+                    "id": if tool.id.is_empty() { format!("toolu_{}", crate::chat::uuid_ish()) } else { tool.id.clone() },
+                    "name": tool.name, "input": {},
                 },
             }));
             yield anthropic_event("content_block_delta", json!({
-                "type": "content_block_delta",
-                "index": idx,
-                "delta": {"type": "input_json_delta", "partial_json": args},
+                "type": "content_block_delta", "index": block_index,
+                "delta": {"type": "input_json_delta", "partial_json": tool.arguments},
             }));
             yield anthropic_event("content_block_stop", json!({
-                "type": "content_block_stop",
-                "index": idx,
+                "type": "content_block_stop", "index": block_index,
             }));
         }
 
-        // 什么都没产出时补一个空 text block，避免客户端拿到空 content 数组
         if !saw_thinking && !saw_text && tool_calls.is_empty() {
             yield anthropic_event("content_block_start", json!({
                 "type": "content_block_start",
@@ -583,9 +665,11 @@ pub fn estimate_tokens(req: &Value) -> i64 {
             chars += blocks_to_text(&content).chars().count();
             // 图片按固定成本估
             if let Some(blocks) = content.as_array() {
-                chars += blocks.iter().filter(|b| {
-                    b.get("type").and_then(|v| v.as_str()) == Some("image")
-                }).count() * 4000;
+                chars += blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("image"))
+                    .count()
+                    * 4000;
             }
         }
     }
@@ -603,6 +687,59 @@ pub fn estimate_tokens(req: &Value) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
+
+    #[test]
+    fn converts_direct_base64_image() {
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "这是什么？"},
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg", "data": "AAA"
+                }}
+            ]}]
+        });
+        let chat = to_chat_request(&req).unwrap();
+        assert_eq!(
+            chat["messages"][0]["content"],
+            json!([
+                {"type": "text", "text": "这是什么？"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA"}}
+            ])
+        );
+    }
+
+    #[test]
+    fn preserves_images_in_tool_result() {
+        let req = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "text", "text": "截图如下"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": "AAA"
+                    }},
+                    {"type": "tool_result", "content": [
+                        {"type": "image", "source": {"type": "url", "url": "https://example.com/2.png"}}
+                    ]}
+                ]}
+            ]}]
+        });
+        let chat = to_chat_request(&req).unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[0]["content"], "截图如下");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(
+            messages[1]["content"],
+            json!([
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                {"type": "image_url", "image_url": {"url": "https://example.com/2.png"}}
+            ])
+        );
+        assert!(!messages[0].to_string().contains("base64"));
+    }
 
     #[test]
     fn converts_simple_message() {
@@ -617,6 +754,99 @@ mod tests {
         assert_eq!(chat["messages"][0]["content"], "你是助手");
         assert_eq!(chat["messages"][1]["content"], "你好");
         assert_eq!(chat["max_tokens"], 100);
+    }
+
+    #[tokio::test]
+    async fn tool_arguments_stream_incrementally_with_paired_blocks() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let stream: EventStream = Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }));
+        tx.send(Ok(StreamEvent::Chunk(
+            json!({"choices":[{"delta":{"tool_calls":[{
+                "index":0,"id":"call-1","function":{"name":"read_file","arguments":"{\"path\":"}
+            }]}}]}),
+        )))
+        .await
+        .unwrap();
+        let mut body = sse_body(stream, "m".to_string(), None)
+            .into_body()
+            .into_data_stream();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let bytes = body.next().await.expect("stream ended").unwrap();
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                if text.contains("input_json_delta") {
+                    return text;
+                }
+            }
+        })
+        .await
+        .expect("tool delta must arrive before Done");
+        assert!(frame.contains("input_json_delta"));
+        tx.send(Ok(StreamEvent::Done)).await.unwrap();
+        drop(tx);
+        let mut rest = String::new();
+        while let Some(bytes) = body.next().await {
+            rest.push_str(core::str::from_utf8(&bytes.unwrap()).unwrap());
+        }
+        assert_eq!(rest.matches("event: content_block_stop").count(), 1);
+        assert!(rest.contains("message_stop"));
+    }
+
+    #[tokio::test]
+    async fn interleaved_tools_never_reopen_a_closed_block() {
+        let call = |index: i64, id: &str, args: &str| {
+            Ok(StreamEvent::Chunk(
+                json!({"choices":[{"delta":{"tool_calls":[{
+                    "index":index,"id":id,"function":{"name":"f","arguments":args}
+                }]}}]}),
+            ))
+        };
+        let stream: EventStream = Box::pin(futures_util::stream::iter(vec![
+            call(0, "a", "{"),
+            call(1, "b", "{"),
+            call(0, "a", "}"),
+            call(1, "b", "}"),
+            Ok(StreamEvent::Done),
+        ]));
+        let body = sse_body(stream, "m".into(), None).into_body();
+        let text = String::from_utf8(
+            axum::body::to_bytes(body, usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let events: Vec<Value> = text
+            .split("\n\n")
+            .filter_map(|b| b.lines().find_map(|l| l.strip_prefix("data: ")))
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let starts: Vec<&str> = events
+            .iter()
+            .filter(|e| e["type"] == "content_block_start")
+            .filter_map(|e| e["content_block"]["id"].as_str())
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert!(starts.contains(&"a"));
+        assert!(starts.contains(&"b"));
+        for id in ["a", "b"] {
+            let matching: Vec<&Value> = events
+                .iter()
+                .filter(|e| {
+                    e["content_block"]["id"] == id || e["delta"]["partial_json"].is_string()
+                })
+                .collect();
+            assert!(matching.len() >= 2);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["type"] == "content_block_stop")
+                .count(),
+            2
+        );
     }
 
     #[test]

@@ -76,7 +76,13 @@ impl UsageRecord {
         }
     }
 
-    pub fn failed(model: &str, account: &str, elapsed_ms: i64, error: impl Into<String>) -> Self {
+    pub fn failed(
+        model: &str,
+        account: &str,
+        elapsed_ms: i64,
+        stream: bool,
+        error: impl Into<String>,
+    ) -> Self {
         Self {
             ts: chrono::Utc::now().timestamp(),
             model: model.to_string(),
@@ -86,7 +92,7 @@ impl UsageRecord {
             total_tokens: 0,
             reasoning_tokens: 0,
             elapsed_ms,
-            stream: false,
+            stream,
             ok: false,
             error: Some(error.into()),
         }
@@ -188,10 +194,7 @@ impl UsageStore {
     /// `since_ts` 为 0 表示全部时间。
     pub async fn summarize(&self, since_ts: i64, bucket: &str) -> Value {
         let guard = self.records.lock().await;
-        let filtered: Vec<&UsageRecord> = guard
-            .iter()
-            .filter(|r| r.ts >= since_ts)
-            .collect();
+        let filtered: Vec<&UsageRecord> = guard.iter().filter(|r| r.ts >= since_ts).collect();
 
         let mut total = Agg::default();
         let mut by_model: BTreeMap<String, Agg> = BTreeMap::new();
@@ -220,11 +223,7 @@ impl UsageStore {
                 v
             })
             .collect();
-        models.sort_by_key(|v| {
-            -v.get("total_tokens")
-                .and_then(|x| x.as_i64())
-                .unwrap_or(0)
-        });
+        models.sort_by_key(|v| -v.get("total_tokens").and_then(|x| x.as_i64()).unwrap_or(0));
 
         let mut accounts: Vec<Value> = by_account
             .into_iter()
@@ -234,11 +233,7 @@ impl UsageStore {
                 v
             })
             .collect();
-        accounts.sort_by_key(|v| {
-            -v.get("total_tokens")
-                .and_then(|x| x.as_i64())
-                .unwrap_or(0)
-        });
+        accounts.sort_by_key(|v| -v.get("total_tokens").and_then(|x| x.as_i64()).unwrap_or(0));
 
         let series: Vec<Value> = by_bucket
             .into_iter()
@@ -319,7 +314,13 @@ mod tests {
         for i in 0..3 {
             let usage = json!({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15});
             store
-                .record(UsageRecord::from_upstream("m1", "a1", 100 + i, false, Some(&usage)))
+                .record(UsageRecord::from_upstream(
+                    "m1",
+                    "a1",
+                    100 + i,
+                    false,
+                    Some(&usage),
+                ))
                 .await;
         }
         let s = store.summarize(0, "hour").await;

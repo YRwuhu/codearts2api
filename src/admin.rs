@@ -3,18 +3,17 @@
 //! 账号变更会写回 accounts.json 并重建账号池，无需重启进程。
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::routing::{get, patch, post};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::routing::{get, patch, post};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::{Account, Config};
-use crate::models::{Catalog, Pool};
+use crate::models::Pool;
 use crate::web::WebState;
 
 #[derive(Serialize, Deserialize)]
@@ -67,15 +66,6 @@ pub fn router() -> axum::Router<WebState> {
         .route("/api/usage/recent", get(usage_recent))
 }
 
-/// 本地在途流式请求上限（与 chat.rs 保持一致；不是上游会话数）。
-fn concurrency_limit() -> usize {
-    std::env::var("CODEARTS_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(8)
-}
-
 /// 账号文件位置：优先 CODEARTS_ACCOUNTS，其次 .env 同目录 accounts.json。
 pub fn accounts_file_path(cfg: &Config) -> PathBuf {
     std::env::var("CODEARTS_ACCOUNTS")
@@ -91,8 +81,7 @@ fn read_accounts(path: &PathBuf) -> Result<Vec<AccountRecord>, String> {
         return Ok(Vec::new());
     }
     let text = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
-    let parsed: AccountsFile =
-        serde_json::from_str(&text).map_err(|e| format!("解析失败: {e}"))?;
+    let parsed: AccountsFile = serde_json::from_str(&text).map_err(|e| format!("解析失败: {e}"))?;
     Ok(parsed.accounts)
 }
 
@@ -148,13 +137,6 @@ async fn commit_accounts(
     }
 }
 
-fn mask(ak: &str) -> String {
-    if ak.len() <= 8 {
-        return "****".to_string();
-    }
-    format!("{}****{}", &ak[..4], &ak[ak.len() - 2..])
-}
-
 fn err(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({"error": message.into()}))).into_response()
 }
@@ -171,7 +153,10 @@ pub async fn resolve_account(
     }
 
     let Some(mut identity) = crate::oauth::store::load(env_dir, &account.id) else {
-        return Err(format!("账号 {} 的 OAuth 凭证不存在，请重新登录", account.id));
+        return Err(format!(
+            "账号 {} 的 OAuth 凭证不存在，请重新登录",
+            account.id
+        ));
     };
 
     // 快过期（30 分钟内）或已过期时先续期
@@ -200,40 +185,11 @@ pub async fn resolve_account(
     })
 }
 
-/// 重建账号池（账号变更后调用）。
+/// 缓存优先重建账号池；后台独立刷新，不让管理操作等待慢上游。
 pub async fn rebuild_pool(state: &WebState) -> Result<usize, String> {
-    let cfg = state.config();
-    let enabled: Vec<&Account> = cfg.accounts.iter().filter(|a| a.enabled).collect();
-    if enabled.is_empty() {
-        return Err("没有启用的账号".to_string());
-    }
-    let mut catalogs = Vec::new();
-    for account in enabled {
-        // OAuth 账号需要先解析出 STS 凭证
-        let resolved = match resolve_account(&state.http, &cfg.env_dir, account).await {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("[pool] 跳过账号 {}: {e}", account.id);
-                continue;
-            }
-        };
-        let cache_path = cfg.cache_path_for(account);
-        let catalog = Catalog::new(
-            resolved,
-            &cache_path,
-            cfg.benefit_fallback,
-            state.http.clone(),
-        );
-        if !catalog.refresh().await {
-            catalog.load_cache().await;
-        }
-        catalogs.push(Arc::new(catalog));
-    }
-    if catalogs.is_empty() {
-        return Err("没有任何账号能成功初始化（OAuth 账号可能需要重新登录）".to_string());
-    }
-    let count = catalogs.len();
-    *state.pool.write().await = Pool::new(catalogs);
+    let pool = Pool::build(&state.config(), state.http.clone(), false).await?;
+    let count = pool.catalogs().len();
+    *state.pool.write().await = pool;
     Ok(count)
 }
 
@@ -255,7 +211,7 @@ pub async fn status(State(state): State<WebState>) -> Response {
         }
         accounts.push(json!({
             "id": account.id,
-            "ak": mask(&account.ak),
+            "ak": account.masked_ak(),
             "enabled": account.enabled,
             "models": models,
             "model_count": models.len(),
@@ -263,24 +219,23 @@ pub async fn status(State(state): State<WebState>) -> Response {
     }
 
     // OAuth 账号的登录状态（凭证有效期）
-    let oauth_accounts: Vec<serde_json::Value> =
-        crate::oauth::store::load_all(&cfg.env_dir)
-            .iter()
-            .map(|id| {
-                json!({
-                    "user_id": id.user_id,
-                    "user_name": id.display_name(),
-                    "remaining_secs": id.remaining_secs(),
-                    "expires_at": id.expiration,
-                    "expiring_soon": id.expiring_within(1800),
-                })
+    let oauth_accounts: Vec<serde_json::Value> = crate::oauth::store::load_all(&cfg.env_dir)
+        .iter()
+        .map(|id| {
+            json!({
+                "user_id": id.user_id,
+                "user_name": id.display_name(),
+                "remaining_secs": id.remaining_secs(),
+                "expires_at": id.expiration,
+                "expiring_soon": id.expiring_within(1800),
             })
-            .collect();
+        })
+        .collect();
 
     // 每账号的并发/健康快照
     let mut health = serde_json::Map::new();
     for account in &cfg.accounts {
-        let gate = state.gate(&account.id, concurrency_limit()).await;
+        let gate = state.gate(&account.id, cfg.concurrency).await;
         health.insert(account.id.clone(), gate.snapshot().await);
     }
     let pinned_sessions = state.pins.len().await;
@@ -289,12 +244,14 @@ pub async fn status(State(state): State<WebState>) -> Response {
     let model_list: Vec<Value> = merged
         .iter()
         .map(|m| {
-            m.to_openai().as_object().map(|o| {
-                let mut v = o.clone();
-                v.insert("channel".to_string(), json!(m.channel));
-                Value::Object(v)
-            })
-            .unwrap_or(Value::Null)
+            m.to_openai()
+                .as_object()
+                .map(|o| {
+                    let mut v = o.clone();
+                    v.insert("channel".to_string(), json!(m.channel));
+                    Value::Object(v)
+                })
+                .unwrap_or(Value::Null)
         })
         .collect();
 
@@ -308,7 +265,7 @@ pub async fn status(State(state): State<WebState>) -> Response {
             "model_count": total_models,
             "oauth_count": oauth_accounts.len(),
             "pinned_sessions": pinned_sessions,
-            "concurrency_limit": concurrency_limit(),
+            "concurrency_limit": cfg.concurrency,
             "total_account_models": described.iter().map(|(_, _, n)| *n).sum::<usize>(),
             "listen": format!("{}:{}", cfg.host, cfg.port),
         },
@@ -344,7 +301,7 @@ pub async fn list_accounts(State(state): State<WebState>) -> Response {
                 .unwrap_or(0);
             json!({
                 "id": a.id,
-                "ak": mask(&a.ak),
+                "ak": a.masked_ak(),
                 "enabled": a.enabled,
                 "model_count": count,
             })
@@ -374,7 +331,10 @@ pub async fn add_account(
     }
     // 防呆：华为云 AK 通常是 20 位大写字母数字
     if ak.len() < 16 || sk.len() < 16 {
-        return err(StatusCode::BAD_REQUEST, "ak / sk 长度异常，请确认没有复制漏");
+        return err(
+            StatusCode::BAD_REQUEST,
+            "ak / sk 长度异常，请确认没有复制漏",
+        );
     }
 
     let path = accounts_file_path(&state.config());
@@ -465,10 +425,7 @@ pub async fn update_account(
 }
 
 /// DELETE /api/accounts/{id} —— 删除账号。
-pub async fn delete_account(
-    State(state): State<WebState>,
-    Path(id): Path<String>,
-) -> Response {
+pub async fn delete_account(State(state): State<WebState>, Path(id): Path<String>) -> Response {
     let path = accounts_file_path(&state.config());
     let mut accounts = match read_accounts(&path) {
         Ok(v) => v,
@@ -510,10 +467,7 @@ pub struct TestRequest {
 }
 
 /// POST /api/test —— 用指定模型发一次真实请求，验证端到端可用。
-pub async fn test_model(
-    State(state): State<WebState>,
-    Json(req): Json<TestRequest>,
-) -> Response {
+pub async fn test_model(State(state): State<WebState>, Json(req): Json<TestRequest>) -> Response {
     let pool = state.pool.read().await.clone();
     let model = req.model.trim().to_string();
     if model.is_empty() {
@@ -630,11 +584,7 @@ async fn refresh_all_quota(state: &WebState) -> usize {
         if quota.ok {
             success += 1;
         }
-        state
-            .quota
-            .write()
-            .await
-            .insert(account.id.clone(), quota);
+        state.quota.write().await.insert(account.id.clone(), quota);
     }
     success
 }
@@ -773,7 +723,12 @@ pub async fn checkin_status(State(state): State<WebState>) -> Response {
                 accounts.push(AccountCheckin {
                     account: account.id.clone(),
                     ok: true,
-                    message: if claimed { "今日已签到" } else { "今日未签到" }.to_string(),
+                    message: if claimed {
+                        "今日已签到"
+                    } else {
+                        "今日未签到"
+                    }
+                    .to_string(),
                     claimed_today: claimed,
                     benefit_amount: daily.map(|a| a.benefit_amount).unwrap_or(0.0),
                     activities,
@@ -947,19 +902,12 @@ pub async fn save_oauth_identity(
     state.reload_config()?;
     let _ = rebuild_pool(state).await;
 
-    println!(
-        "[oauth] 账号已保存: {} ({})",
-        identity.display_name(),
-        id
-    );
+    println!("[oauth] 账号已保存: {} ({})", identity.display_name(), id);
     Ok(())
 }
 
 /// POST /api/oauth/logout —— 移除某个 OAuth 账号。
-pub async fn oauth_logout(
-    State(state): State<WebState>,
-    Path(account): Path<String>,
-) -> Response {
+pub async fn oauth_logout(State(state): State<WebState>, Path(account): Path<String>) -> Response {
     let cfg = state.config();
 
     if let Err(e) = crate::oauth::store::remove(&cfg.env_dir, &account) {

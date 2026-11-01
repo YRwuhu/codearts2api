@@ -4,9 +4,8 @@
 //!   1. 生成 ticket_id / secret / PKCE / DPoP 密钥对
 //!   2. 构造 `codearts.huaweicloud.com/portal/authorize` 链接，浏览器打开登录
 //!   3. 双通道取凭据：
-//!      a. 本地回调 `http://127.0.0.1:{port}/oauth/callback` 收到 code
-//!         → POST sts/v1/oauth2/tokens (grant_type=authorization_code)
-//!      b. 兜底：轮询 snap-manager `/v1/login/ticket`
+//!      - 本地回调 `http://127.0.0.1:{port}/oauth/callback` 收到 code，再换 token
+//!      - 兜底：轮询 snap-manager `/v1/login/ticket`
 //!   4. 得到 STS 临时 AK/SK + security_token + refresh_token，持久化
 //!   5. 到期前用 refresh_token + 同一 DPoP 私钥续期
 
@@ -229,7 +228,10 @@ impl Sessions {
         })
     }
 
-    pub async fn find_by_ticket(&self, ticket_id: &str) -> Option<(String, String, String, DpopKey, u16)> {
+    pub async fn find_by_ticket(
+        &self,
+        ticket_id: &str,
+    ) -> Option<(String, String, String, DpopKey, u16)> {
         let guard = self.inner.lock().await;
         guard
             .iter()
@@ -401,9 +403,12 @@ pub async fn exchange_code(
         ));
     }
 
-    payload
-        .into_identity(verifier, dpop)
-        .ok_or_else(|| format!("token 响应缺少凭证: {}", text.chars().take(200).collect::<String>()))
+    payload.into_identity(verifier, dpop).ok_or_else(|| {
+        format!(
+            "token 响应缺少凭证: {}",
+            text.chars().take(200).collect::<String>()
+        )
+    })
 }
 
 /// 用 STS 凭证查账号身份（登录响应有时不带 user_id/user_name）。
@@ -440,13 +445,25 @@ pub async fn fetch_current_user(
         return Err(format!("查询身份 HTTP {}", resp.status()));
     }
 
-    let value: Value = resp.json().await.map_err(|e| format!("解析身份失败: {e}"))?;
+    let value: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("解析身份失败: {e}"))?;
     // 兼容直接返回与包在 data 里两种形态
     let node = value.get("data").unwrap_or(&value);
     Ok((
-        node.get("user_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-        node.get("user_name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-        node.get("domain_id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        node.get("user_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        node.get("user_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        node.get("domain_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
     ))
 }
 

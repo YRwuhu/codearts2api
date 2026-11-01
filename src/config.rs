@@ -91,6 +91,8 @@ pub struct Config {
     pub accounts: Vec<Account>,
     pub host: String,
     pub port: u16,
+    /// 本地在途流式请求上限，不是上游会话数。
+    pub concurrency: usize,
     /// 模型允许的最大输出 token 数兜底值（模型元数据缺失时使用）。
     pub max_tokens_cap: i64,
     /// 免费额度网关拿不到模型时，是否仍暴露兜底列表。
@@ -268,19 +270,23 @@ impl Config {
 
         // accounts.json 为空或不存在时回退到 .env 单账号
         if accounts.is_empty() {
-            let ak = std::env::var("CODEARTS_AK").unwrap_or_default().trim().to_string();
-            let sk = std::env::var("CODEARTS_SK").unwrap_or_default().trim().to_string();
+            let ak = std::env::var("CODEARTS_AK")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let sk = std::env::var("CODEARTS_SK")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             if !ak.is_empty() && !sk.is_empty() {
                 accounts.push(Account::manual("default".to_string(), ak, sk, true));
             }
         }
 
         if accounts.is_empty() {
-            return Err(
-                "未配置任何账号：请在 .env 填写 CODEARTS_AK / CODEARTS_SK，\
+            return Err("未配置任何账号：请在 .env 填写 CODEARTS_AK / CODEARTS_SK，\
                  或创建 accounts.json（参考 accounts.example.json）"
-                    .to_string(),
-            );
+                .to_string());
         }
         if !accounts.iter().any(|a| a.enabled) {
             return Err("所有账号都被禁用（enabled=false），没有可用账号".to_string());
@@ -294,6 +300,12 @@ impl Config {
             .ok()
             .and_then(|v| v.trim().parse::<u16>().ok())
             .unwrap_or(8787);
+
+        let concurrency = std::env::var("CODEARTS_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(8);
 
         // 兜底值只在上游没给元数据时用；真实硬上限是 params::UPSTREAM_MAX_OUTPUT_TOKENS。
         let max_tokens_cap = std::env::var("CODEARTS_MAX_TOKENS_CAP")
@@ -330,6 +342,7 @@ impl Config {
             accounts,
             host,
             port,
+            concurrency,
             max_tokens_cap,
             benefit_fallback,
             tool_turn_plain,

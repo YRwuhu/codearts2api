@@ -20,9 +20,19 @@ pub fn auths_dir(env_dir: &Path) -> PathBuf {
 fn file_name(user_id: &str) -> String {
     let safe: String = user_id
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    let safe = if safe.is_empty() { "unknown".to_string() } else { safe };
+    let safe = if safe.is_empty() {
+        "unknown".to_string()
+    } else {
+        safe
+    };
     format!("codearts-{safe}.json")
 }
 
@@ -32,8 +42,7 @@ pub fn save(env_dir: &Path, identity: &Identity) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建 {} 失败: {e}", dir.display()))?;
 
     let path = dir.join(file_name(&identity.user_id));
-    let text = serde_json::to_string_pretty(identity)
-        .map_err(|e| format!("序列化失败: {e}"))?;
+    let text = serde_json::to_string_pretty(identity).map_err(|e| format!("序列化失败: {e}"))?;
 
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, text).map_err(|e| format!("写入失败: {e}"))?;

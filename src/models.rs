@@ -23,9 +23,11 @@ pub const AGENT_LIST_URL: &str =
     "https://snap-access.cn-north-4.myhuaweicloud.com/v1/agent-center/agents/useragents?offset=0&limit=100";
 pub const AGENT_DETAIL_PATH: &str = "/v1/agent-center/agents/detail";
 pub const OPENGW_BASE: &str = "https://opengw.developer.huaweicloud.com";
-pub const OPENGW_CONFIG_URL: &str = "https://opengw.developer.huaweicloud.com/api/v1/gateway/config";
+pub const OPENGW_CONFIG_URL: &str =
+    "https://opengw.developer.huaweicloud.com/api/v1/gateway/config";
 
-pub const FALLBACK_AGENT_MODELS: [&str; 3] = ["openpangu-2.0-pro", "openpangu-2.0-flash", "GLM-5.2"];
+pub const FALLBACK_AGENT_MODELS: [&str; 3] =
+    ["openpangu-2.0-pro", "openpangu-2.0-flash", "GLM-5.2"];
 pub const BENEFIT_MODELS: [&str; 3] = [
     "glm-5.3-flash",
     "deepseek-v4-pro-0813",
@@ -134,8 +136,8 @@ pub struct Catalog {
     http: reqwest::Client,
     /// 上一次成功续期的时间，避免并发请求重复续期。
     last_refresh_creds: std::sync::Mutex<Option<std::time::Instant>>,
-    /// 连续失败次数，用于 fetch 失败时回退缓存并抑制日志噪声。
-    consecutive_failures: Arc<std::sync::atomic::AtomicU32>,
+    /// 自动与手动刷新共用一把锁，防止旧响应覆盖新目录。
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Catalog {
@@ -165,7 +167,7 @@ impl Catalog {
             benefit_fallback,
             http,
             last_refresh_creds: std::sync::Mutex::new(None),
-            consecutive_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -188,8 +190,9 @@ impl Catalog {
             return Ok(());
         }
 
-        let env_dir = state.config().env_dir;
-        let identity = match crate::oauth::store::load(&env_dir, &self.account_id().to_string()) {
+        // OAuth 身份只在凭证检查或续期时读取；未过期时不访问磁盘。
+        let env_dir = &state.config().env_dir;
+        let identity = match crate::oauth::store::load(env_dir, self.account_id()) {
             Some(id) => id,
             None => return Ok(()), // 没有 auths 文件时无能为力，让上游报错
         };
@@ -211,7 +214,7 @@ impl Catalog {
             }
         }
 
-        let fresh = crate::oauth::store::refresh_and_save(&self.http, &env_dir, &identity).await?;
+        let fresh = crate::oauth::store::refresh_and_save(&self.http, env_dir, &identity).await?;
         {
             let mut acct = self.account.write().await;
             acct.ak = fresh.access_key_id.clone();
@@ -236,18 +239,42 @@ impl Catalog {
             .unwrap_or_else(|_| "****".to_string())
     }
 
-    pub async fn load_cache(&self) {
-        let Ok(text) = tokio::fs::read_to_string(&self.cache_path).await else {
-            return;
+    async fn load_cache_data(&self) -> Option<CacheFile> {
+        let text = tokio::fs::read_to_string(&self.cache_path).await.ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    async fn load_cache(&self) {
+        let cache = {
+            let _guard = self.refresh_lock.lock().await;
+            self.load_cache_data().await
         };
-        let Ok(cache) = serde_json::from_str::<CacheFile>(&text) else {
-            return;
-        };
+        if let Some(cache) = cache {
+            self.install_cache(cache).await;
+        }
+    }
+
+    async fn install_cache(&self, cache: CacheFile) {
         if cache.models.is_empty() {
             return;
         }
+        let _guard = self.refresh_lock.lock().await;
+        let cached_at = tokio::fs::metadata(&self.cache_path)
+            .await
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .filter(|age| *age < CACHE_TTL)
+            .map(|_| std::time::Instant::now());
         let mut state = self.inner.write().await;
-        state.models = cache.models.into_iter().map(|m| (m.id.clone(), m)).collect();
+        state.models = cache
+            .models
+            .into_iter()
+            .map(|m| (m.id.clone(), m))
+            .collect();
+        if cached_at.is_some() {
+            state.last_refresh = cached_at;
+        }
     }
 
     async fn save_cache(&self, models: &[ModelInfo]) {
@@ -293,7 +320,7 @@ impl Catalog {
         if !body.is_empty() {
             req = req.body(body.to_vec());
         }
-        let resp = req.send().await?;
+        let resp = req.timeout(Duration::from_secs(20)).send().await?;
         let status = resp.status().as_u16();
         let text = resp.text().await?;
         Ok((status, text))
@@ -336,14 +363,13 @@ impl Catalog {
         }
     }
 
-
     /// 从 opengw 免费额度网关取模型列表；失败返回空。
     async fn refresh_benefit_models(&self) -> Vec<ModelInfo> {
         match self
             .signed_send("GET", OPENGW_CONFIG_URL, b"", &[("x-language", "zh-cn")])
             .await
         {
-            Ok((status, text)) if status == 200 => {
+            Ok((200, text)) => {
                 let Ok(value) = serde_json::from_str::<Value>(&text) else {
                     return Vec::new();
                 };
@@ -394,6 +420,11 @@ impl Catalog {
 
     /// 从 AgentCenter 同步真实模型列表。成功返回 true。
     pub async fn refresh(&self) -> bool {
+        let _guard = self.refresh_lock.lock().await;
+        self.refresh_locked().await
+    }
+
+    async fn refresh_locked(&self) -> bool {
         let extra = [
             ("agent-type", "AgentCenter"),
             ("x-language", "zh-cn"),
@@ -526,50 +557,45 @@ impl Catalog {
             state.last_refresh = Some(std::time::Instant::now());
         }
         self.save_cache(&discovered).await;
-        println!("[{}] 已同步 {} 个模型: {}", self.id, ids.len(), ids.join(", "));
+        println!(
+            "[{}] 已同步 {} 个模型: {}",
+            self.id,
+            ids.len(),
+            ids.join(", ")
+        );
         true
     }
 
-    /// 短周期缓存，避免客户端轮询 /v1/models 时反复请求上游。
-    pub async fn ensure_fresh(&self, force_initial: bool) {
-        let needs = {
-            let state = self.inner.read().await;
-            if force_initial {
-                true
-            } else {
-                match state.last_refresh {
-                    Some(t) => t.elapsed() > CACHE_TTL,
-                    None => true,
-                }
-            }
-        };
-        if !needs {
+    /// 过期目录仍可服务请求；后台单飞刷新，不让控制接口拖住聊天首字。
+    pub fn ensure_fresh(self: &Arc<Self>) {
+        if self.is_fresh() {
             return;
         }
-
-        // 缓存文件较新时优先用缓存，避免每次重启都打上游
-        if let Ok(meta) = tokio::fs::metadata(&self.cache_path).await {
-            if let Ok(modified) = meta.modified() {
-                let age = SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or(Duration::from_secs(u64::MAX / 2));
-                if age < CACHE_TTL {
-                    let empty = self.inner.read().await.models.is_empty();
-                    if empty {
-                        self.load_cache().await;
-                    }
-                    let mut state = self.inner.write().await;
-                    state.last_refresh = Some(std::time::Instant::now());
-                    return;
-                }
+        let Ok(guard) = self.refresh_lock.clone().try_lock_owned() else {
+            return;
+        };
+        // 拿到刷新锁即表示可以启动后台任务。
+        // 等待锁期间另一个刷新可能已经完成。
+        if self.is_fresh() {
+            return;
+        }
+        let catalog = self.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            if !catalog.refresh_locked().await {
+                // 当前内存快照可以继续服务；不重新安装可能已过期的磁盘缓存。
+                catalog.inner.write().await.last_refresh = Some(std::time::Instant::now());
             }
-        }
+        });
+    }
 
-        if !self.refresh().await {
-            self.load_cache().await;
-            let mut state = self.inner.write().await;
-            state.last_refresh = Some(std::time::Instant::now());
-        }
+    fn is_fresh(&self) -> bool {
+        self.inner
+            .try_read()
+            .ok()
+            .and_then(|state| state.last_refresh)
+            .map(|t| t.elapsed() <= CACHE_TTL)
+            .unwrap_or(false)
     }
 
     pub async fn models(&self) -> Vec<ModelInfo> {
@@ -593,16 +619,6 @@ impl Catalog {
             .map(|m| m.channel == "agent")
             .unwrap_or(false)
     }
-
-    pub fn note_failure(&self) {
-        self.consecutive_failures
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn note_success(&self) {
-        self.consecutive_failures
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-    }
 }
 
 /// 多账号池：合并模型列表并按顺序提供故障切换。
@@ -616,13 +632,50 @@ impl Pool {
         Self { catalogs }
     }
 
+    /// 缓存优先构建账号池；CLI 可选择等待同步完成。
+    pub async fn build(
+        cfg: &crate::config::Config,
+        http: reqwest::Client,
+        wait_for_refresh: bool,
+    ) -> Result<Self, String> {
+        let mut catalogs = Vec::new();
+        for account in cfg.accounts.iter().filter(|a| a.enabled) {
+            let resolved = match crate::admin::resolve_account(&http, &cfg.env_dir, account).await {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("[pool] 跳过账号 {}: {e}", account.id);
+                    continue;
+                }
+            };
+            let catalog = Arc::new(Catalog::new(
+                resolved,
+                &cfg.cache_path_for(account),
+                cfg.benefit_fallback,
+                http.clone(),
+            ));
+            if wait_for_refresh {
+                if !catalog.refresh().await {
+                    catalog.load_cache().await;
+                }
+            } else {
+                catalog.load_cache().await;
+                catalog.ensure_fresh();
+            }
+            catalogs.push(catalog);
+        }
+        if catalogs.is_empty() {
+            return Err("没有任何账号能成功初始化（OAuth 账号可能需要重新登录）".to_string());
+        }
+        Ok(Self::new(catalogs))
+    }
+
     pub fn catalogs(&self) -> &[Arc<Catalog>] {
         &self.catalogs
     }
 
-    pub async fn ensure_fresh(&self) {
+    pub fn ensure_fresh(&self) {
         for catalog in &self.catalogs {
-            catalog.ensure_fresh(false).await;
+            catalog.ensure_fresh();
         }
     }
 
@@ -707,5 +760,36 @@ impl Pool {
             ));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fresh_cache_replaces_builtin_fallback_models() {
+        let dir = std::env::temp_dir().join(format!("ca2a-cache-test-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("models.json");
+        let cache = CacheFile {
+            updated_at: chrono::Utc::now().timestamp(),
+            models: vec![ModelInfo::new("cached-model".to_string(), "agent")],
+        };
+        tokio::fs::write(&path, serde_json::to_vec(&cache).unwrap())
+            .await
+            .unwrap();
+        let catalog = Catalog::new(
+            Account::manual("test".into(), "ak".into(), "sk".into(), true),
+            &path,
+            false,
+            reqwest::Client::new(),
+        );
+        catalog.load_cache().await;
+        assert!(catalog.contains("cached-model").await);
+        assert!(!catalog.contains(FALLBACK_AGENT_MODELS[0]).await);
+        assert!(catalog.is_fresh());
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

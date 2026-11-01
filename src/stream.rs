@@ -68,7 +68,9 @@ pub fn parse_sse_bytes(raw: &[u8]) -> Value {
                     last_finish = Some(normalize_finish_reason(Some(reason)));
                 }
             }
-            let Some(delta) = choice.get("delta") else { continue };
+            let Some(delta) = choice.get("delta") else {
+                continue;
+            };
 
             if let Some(s) = delta.get("content").and_then(|v| v.as_str()) {
                 text_parts.push(s.to_string());
@@ -251,7 +253,10 @@ data: [DONE]
 data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"sh","arguments":":1}"}}]},"finish_reason":"tool_calls"}]}
 "#;
         let v = parse_sse_bytes(raw);
-        assert_eq!(v["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "Bash");
+        assert_eq!(
+            v["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "Bash"
+        );
         assert_eq!(
             v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
             "{\"a\":1}"
@@ -260,7 +265,8 @@ data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"sh","ar
 
     #[test]
     fn other_finish_reason_becomes_stop() {
-        let v = parse_upstream(br#"{"choices":[{"message":{"content":"x"},"finish_reason":"other"}]}"#);
+        let v =
+            parse_upstream(br#"{"choices":[{"message":{"content":"x"},"finish_reason":"other"}]}"#);
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
     }
 

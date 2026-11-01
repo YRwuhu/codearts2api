@@ -133,20 +133,27 @@ mod tests {
     #[test]
     fn produces_three_part_jwt() {
         let key = DpopKey::generate();
-        let proof = key.proof("https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens").unwrap();
+        let proof = key
+            .proof("https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens")
+            .unwrap();
         let parts: Vec<&str> = proof.split('.').collect();
         assert_eq!(parts.len(), 3);
 
         // header 可解出 alg/typ/jwk
-        let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+        let header: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
         assert_eq!(header["alg"], "ES256");
         assert_eq!(header["typ"], "dpop+jwt");
         assert_eq!(header["jwk"]["crv"], "P-256");
 
         // payload 含 htm/htu/iat/jti
-        let payload: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        let payload: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
         assert_eq!(payload["htm"], "POST");
-        assert!(payload["htu"].as_str().unwrap().contains("/v1/oauth2/tokens"));
+        assert!(payload["htu"]
+            .as_str()
+            .unwrap()
+            .contains("/v1/oauth2/tokens"));
         assert!(payload["iat"].is_i64());
         assert!(payload["jti"].is_string());
     }

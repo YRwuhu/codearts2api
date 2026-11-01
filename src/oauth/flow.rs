@@ -103,10 +103,7 @@ pub struct CallbackParams {
     pub ticket_id: Option<String>,
 }
 
-pub async fn callback(
-    State(state): State<WebState>,
-    Query(p): Query<CallbackParams>,
-) -> Response {
+pub async fn callback(State(state): State<WebState>, Query(p): Query<CallbackParams>) -> Response {
     let code = p.code.unwrap_or_default();
     let secret = p.secret.unwrap_or_default();
     let redirect = p.redirect.unwrap_or_default();
@@ -121,8 +118,7 @@ pub async fn callback(
         let mut resp = Response::new(axum::body::Body::empty());
         *resp.status_mut() = StatusCode::TEMPORARY_REDIRECT;
         if let Ok(loc) = redirect.parse() {
-            resp.headers_mut()
-                .insert(axum::http::header::LOCATION, loc);
+            resp.headers_mut().insert(axum::http::header::LOCATION, loc);
         }
         return resp;
     }
@@ -133,9 +129,10 @@ pub async fn callback(
 
     // 第二阶段：有 code，找到对应会话完成换取
     match complete_with_code(&state, &ticket_id, &code).await {
-        Ok(name) => {
-            Html(format!("<h3>登录成功，可以关闭此页面。</h3><p>账号：{name}</p>")).into_response()
-        }
+        Ok(name) => Html(format!(
+            "<h3>登录成功，可以关闭此页面。</h3><p>账号：{name}</p>"
+        ))
+        .into_response(),
         Err(e) => Html(format!("<h3>登录失败</h3><p>{e}</p>")).into_response(),
     }
 }

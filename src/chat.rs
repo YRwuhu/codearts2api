@@ -5,7 +5,7 @@
 //! 真正的账号路由与并发控制只在这里实现一次。
 
 use std::pin::Pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -18,6 +18,9 @@ use crate::concurrency::{self, SlotGuard};
 use crate::models::TARGET;
 use crate::params;
 use crate::web::WebState;
+
+/// 聊天上游的空闲读取上限；不再限制整段流的总时长。
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// 同一账号内，请求排队等槽位的最长时间。
 ///
@@ -61,7 +64,11 @@ impl ApiError {
     }
 
     pub fn unavailable(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::SERVICE_UNAVAILABLE, "upstream_unavailable", message)
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upstream_unavailable",
+            message,
+        )
     }
 
     /// OpenAI 风格错误体（Chat Completions 与 Responses 通用）。
@@ -131,7 +138,7 @@ pub struct CallRequest {
 /// 执行一次聊天请求。
 pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, ApiError> {
     let pool = state.pool.read().await.clone();
-    pool.ensure_fresh().await;
+    pool.ensure_fresh();
 
     let model = req
         .body
@@ -198,7 +205,7 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
         let daily_cap = state.config().daily_token_cap;
         let mut ready = Vec::new();
         for c in &candidates {
-            let gate = state.gate(c.account_id(), upstream_concurrency_limit()).await;
+            let gate = state.gate(c.account_id(), state.config().concurrency).await;
             if !gate.available().await {
                 continue;
             }
@@ -218,14 +225,17 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
     // 单账号但额度/模型被挡时，明确告诉调用方原因，别静默失败。
     if candidates.len() == 1 {
         let gate = state
-            .gate(candidates[0].account_id(), upstream_concurrency_limit())
+            .gate(candidates[0].account_id(), state.config().concurrency)
             .await;
         let daily_cap = state.config().daily_token_cap;
         if daily_cap > 0 && gate.daily_tokens().await >= daily_cap {
             return Err(ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
-                format!("账号 {} 今日 token 已达上限 {daily_cap}", candidates[0].account_id()),
+                format!(
+                    "账号 {} 今日 token 已达上限 {daily_cap}",
+                    candidates[0].account_id()
+                ),
             ));
         }
     }
@@ -254,7 +264,7 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
     if req.stream {
         let mut with_slot = Vec::new();
         for c in &candidates {
-            let gate = state.gate(c.account_id(), upstream_concurrency_limit()).await;
+            let gate = state.gate(c.account_id(), state.config().concurrency).await;
             if gate.free_stream_slots().await > 0 {
                 with_slot.push(c.clone());
             }
@@ -265,9 +275,7 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
         } else if with_slot.is_empty() && use_upstream_stream {
             if state.config().stream_degrade {
                 use_upstream_stream = false;
-                println!(
-                    "[pool] {model}: 流式名额已满，改用非流式上游并本地合成 SSE（不占名额）"
-                );
+                println!("[pool] {model}: 流式名额已满，改用非流式上游并本地合成 SSE（不占名额）");
             } else {
                 println!(
                     "[pool] {model}: 流式名额已满，排队等待（如需自动降级设 CODEARTS_STREAM_DEGRADE=1）"
@@ -294,7 +302,7 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
 
     for (idx, catalog) in candidates.iter().enumerate() {
         let gate = state
-            .gate(catalog.account_id(), upstream_concurrency_limit())
+            .gate(catalog.account_id(), state.config().concurrency)
             .await;
 
         // 撞上 TM.00001041 时的重试次数。窗口是按本地时钟估算的，两个请求
@@ -304,25 +312,28 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
 
         loop {
             // 等槽位。流式走滑动窗口 + 并发池，非流式只占本地并发池。
-            let guard =
-                match tokio::time::timeout(ACQUIRE_TIMEOUT, gate.acquire(use_upstream_stream)).await
-                {
-                    Ok(Ok(g)) => g,
-                    Ok(Err(e)) => {
-                        eprintln!("[{}] {model}: {e}", catalog.account_id());
-                        last = Some(ApiError::unavailable(e));
-                        break;
-                    }
-                    Err(_) => {
-                        println!("[{}] {model}: 等待并发槽位超时", catalog.account_id());
-                        last = Some(ApiError::new(
-                            StatusCode::TOO_MANY_REQUESTS,
-                            "rate_limit_error",
-                            "等待并发槽位超时，请稍后重试",
-                        ));
-                        break;
-                    }
-                };
+            let guard = match tokio::time::timeout(
+                ACQUIRE_TIMEOUT,
+                gate.acquire(use_upstream_stream),
+            )
+            .await
+            {
+                Ok(Ok(g)) => g,
+                Ok(Err(e)) => {
+                    eprintln!("[{}] {model}: {e}", catalog.account_id());
+                    last = Some(ApiError::unavailable(e));
+                    break;
+                }
+                Err(_) => {
+                    println!("[{}] {model}: 等待并发槽位超时", catalog.account_id());
+                    last = Some(ApiError::new(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limit_error",
+                        "等待并发槽位超时，请稍后重试",
+                    ));
+                    break;
+                }
+            };
 
             let outcome = attempt(
                 state,
@@ -332,6 +343,7 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
                 use_upstream_stream,
                 req.stream,
                 chat_id.as_deref(),
+                started,
                 guard,
                 gate.clone(),
             )
@@ -339,7 +351,6 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
 
             match outcome {
                 Ok(Attempt::Done(outcome)) => {
-                    catalog.note_success();
                     gate.note_success().await;
                     if let Some(key) = req.session_key.as_ref() {
                         state.pins.pin(key, catalog.account_id()).await;
@@ -350,7 +361,6 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
                     error,
                     switch_account,
                 }) => {
-                    catalog.note_failure();
                     gate.note_failure(&error.message).await;
                     // 模型级失败（该账号没有这个模型 / 该模型额度耗尽）只让这一个
                     // 模型冷却，不要把整个账号拖下水。
@@ -380,6 +390,7 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
                             &model,
                             catalog.account_id(),
                             started.elapsed().as_millis() as i64,
+                            req.stream,
                             format!("{}: {}", error.code, error.message),
                         ))
                         .await;
@@ -414,18 +425,6 @@ enum Attempt {
     },
 }
 
-/// 本地在途流式请求上限。
-///
-/// 注意这**不是**上游会话数：上游会话已由账号级 `x-ot-session-id` 收敛为 1 个，
-/// 3 会话限制不再适用。这里只是本地保护，默认给较宽松的值。
-fn upstream_concurrency_limit() -> usize {
-    std::env::var("CODEARTS_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(8)
-}
-
 /// 对单个账号发一次请求。
 ///
 /// `upstream_stream` 是**实际打给上游**的形态；`client_stream` 是客户端要的形态。
@@ -440,6 +439,7 @@ async fn attempt(
     upstream_stream: bool,
     client_stream: bool,
     chat_id: Option<&str>,
+    started: Instant,
     guard: SlotGuard,
     gate: std::sync::Arc<crate::concurrency::AccountGate>,
 ) -> Result<Attempt, ApiError> {
@@ -456,7 +456,11 @@ async fn attempt(
     let benefit = !catalog.is_agent_channel(model).await;
     let headers = catalog.sign_headers(&body_bytes, benefit, model).await;
 
-    let mut request = state.http.post(TARGET).body(body_bytes);
+    let mut request = state
+        .http
+        .post(TARGET)
+        .timeout(UPSTREAM_IDLE_TIMEOUT)
+        .body(body_bytes);
     for (k, v) in headers {
         if let (Ok(name), Ok(value)) = (
             header::HeaderName::from_bytes(k.as_bytes()),
@@ -535,36 +539,34 @@ async fn attempt(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                return Ok(classify_failure(
-                    StatusCode::OK,
-                    &code,
-                    &msg,
-                ));
+                return Ok(classify_failure(StatusCode::OK, &code, &msg));
             }
             if let Some(choices) = result.get_mut("choices").and_then(|c| c.as_array_mut()) {
                 for choice in choices {
-                    if choice.get("finish_reason").map(|v| v.is_null()).unwrap_or(true) {
+                    if choice
+                        .get("finish_reason")
+                        .map(|v| v.is_null())
+                        .unwrap_or(true)
+                    {
                         choice["finish_reason"] = json!("stop");
                     }
                 }
             }
             let usage = result.get("usage").cloned();
-            record_usage(
-                state,
-                catalog,
-                model,
-                &account_id,
-                true,
-                usage.as_ref(),
-            )
-            .await;
+            record_usage(state, model, &account_id, true, started, usage.as_ref()).await;
             let stream = single_chunk_stream(result);
             return Ok(Attempt::Done(Outcome::Stream(stream)));
         }
 
-        let model_owned = model.to_string();
-        let account_owned = account_id.clone();
-        let stream = sse_stream(upstream, guard, gate, state.clone(), model_owned, account_owned);
+        let stream = sse_stream(
+            upstream,
+            guard,
+            gate,
+            state.clone(),
+            model.to_string(),
+            account_id.clone(),
+            started,
+        );
         return Ok(Attempt::Done(Outcome::Stream(stream)));
     }
 
@@ -611,10 +613,10 @@ async fn attempt(
 
     record_usage(
         state,
-        catalog,
         model,
         &account_id,
         client_stream,
+        started,
         result.get("usage"),
     )
     .await;
@@ -623,9 +625,9 @@ async fn attempt(
     // 把完整结果拆成 SSE 帧返回，客户端体验不变。
     if client_stream {
         let chunk = chat_chunk_from_completion(&result);
-        return Ok(Attempt::Done(Outcome::Stream(paced_stream(
-            vec![chunk, result],
-        ))));
+        return Ok(Attempt::Done(Outcome::Stream(paced_stream(vec![
+            chunk, result,
+        ]))));
     }
 
     Ok(Attempt::Done(Outcome::Json(result)))
@@ -634,16 +636,20 @@ async fn attempt(
 /// 记录一条用量，并把 token 计入该账号的当日预算。
 async fn record_usage(
     state: &WebState,
-    catalog: &std::sync::Arc<crate::models::Catalog>,
     model: &str,
     account_id: &str,
     stream: bool,
+    started: Instant,
     usage: Option<&Value>,
 ) {
     state
         .usage
         .record(crate::usage::UsageRecord::from_upstream(
-            model, account_id, 0, stream, usage,
+            model,
+            account_id,
+            started.elapsed().as_millis() as i64,
+            stream,
+            usage,
         ))
         .await;
 
@@ -651,12 +657,12 @@ async fn record_usage(
         .and_then(|u| u.get("total_tokens"))
         .and_then(|v| v.as_i64())
     {
-        let gate = state
-            .gate(account_id, upstream_concurrency_limit())
+        state
+            .gate(account_id, state.config().concurrency)
+            .await
+            .add_daily_tokens(total)
             .await;
-        gate.add_daily_tokens(total).await;
     }
-    let _ = catalog;
 }
 
 /// 把「首帧 chunk + 完整对象带 usage」组成一个两帧流。
@@ -821,6 +827,17 @@ pub fn chat_chunk_from_completion(result: &Value) -> Value {
     chunk
 }
 
+/// 上游字节流解码结果：终止前完成 usage 与每日额度记账。
+struct StreamCompletion {
+    usage: Option<Value>,
+    result: Result<(), ApiError>,
+}
+
+enum DecoderEvent {
+    Event(Result<StreamEvent, ApiError>),
+    Complete(StreamCompletion),
+}
+
 /// 把上游 SSE 逐行转成 `StreamEvent`，并在结束时归还槽位。
 fn sse_stream(
     upstream: reqwest::Response,
@@ -829,100 +846,126 @@ fn sse_stream(
     state: WebState,
     model: String,
     account: String,
+    started: Instant,
 ) -> EventStream {
     let byte_stream = upstream.bytes_stream();
-
     Box::pin(async_stream::stream! {
-        // guard 必须在整个流的生命周期内持有；drop 时触发 60s 冷却后归还槽位。
         let _guard = guard;
-        let mut upstream_stream = byte_stream;
-        let mut buffer: Vec<u8> = Vec::new();
-        let mut saw_done = false;
-        let mut last_usage: Option<Value> = None;
+        let mut inner = Box::pin(decode_sse(byte_stream));
+        let mut completion = None;
+        while let Some(item) = inner.next().await {
+            match item {
+                DecoderEvent::Event(event) => yield event,
+                DecoderEvent::Complete(done) => { completion = Some(done); break; }
+            }
+        }
+        let Some(completion) = completion else { return };
+        match completion.result {
+            Ok(()) => {
+                record_usage(&state, &model, &account, true, started, completion.usage.as_ref()).await;
+                yield Ok(StreamEvent::Done);
+            }
+            Err(error) => {
+                state.usage.record(crate::usage::UsageRecord::failed(
+                    &model,
+                    &account,
+                    started.elapsed().as_millis() as i64,
+                    true,
+                    format!("{}: {}", error.code, error.message),
+                )).await;
+                gate.note_failure(&error.message).await;
+                yield Err(error);
+            }
+        }
+    })
+}
 
+/// 在 yield 终态前完成读取，避免 async-stream 在 Done 处暂停而漏记账。
+fn decode_sse<S, E>(bytes: S) -> impl Stream<Item = DecoderEvent> + Send
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    use async_stream::stream;
+    stream! {
+        let mut buffer = Vec::new();
+        let mut saw_done = false;
+        let mut usage = None;
+        let mut failure = None;
+        let mut bytes = Box::pin(bytes);
         let mut ticker = tokio::time::interval(KEEPALIVE);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await; // 第一次立即触发，跳过
+        ticker.tick().await;
 
-        loop {
+        'read: loop {
             tokio::select! {
-                chunk = upstream_stream.next() => {
-                    let Some(chunk) = chunk else { break };
-                    let Ok(chunk) = chunk else { break };
-                    buffer.extend_from_slice(&chunk);
-
+                chunk = bytes.next() => {
+                    match chunk {
+                        Some(Ok(chunk)) => buffer.extend_from_slice(&chunk),
+                        Some(Err(e)) => {
+                            failure = Some(ApiError::new(StatusCode::BAD_GATEWAY, "upstream_network_error", format!("读取上游流失败: {e}")));
+                            break;
+                        }
+                        None => break,
+                    }
                     while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
                         let line: Vec<u8> = buffer.drain(..=pos).collect();
-                        let line = &line[..line.len().saturating_sub(1)];
-
-                        match crate::stream::forward_stream_line(line) {
-                            crate::stream::StreamAction::Skip => {}
-                            crate::stream::StreamAction::Done => {
-                                saw_done = true;
-                                // 跳出双层循环，统一走下面的收尾逻辑（记录用量）
-                                break;
-                            }
-                            crate::stream::StreamAction::Passthrough => {}
+                        match crate::stream::forward_stream_line(&line[..line.len() - 1]) {
+                            crate::stream::StreamAction::Skip | crate::stream::StreamAction::Passthrough => {}
+                            crate::stream::StreamAction::Done => { saw_done = true; break 'read; }
                             crate::stream::StreamAction::Chunk(value) => {
-                                if let Some(u) = value.get("usage") {
-                                    if !u.is_null() {
-                                        last_usage = Some(u.clone());
-                                    }
+                                if let Some(u) = value.get("usage").filter(|u| !u.is_null()) {
+                                    usage = Some(u.clone());
                                 }
-                                yield Ok(StreamEvent::Chunk(value));
+                                yield DecoderEvent::Event(Ok(StreamEvent::Chunk(value)));
                             }
                             crate::stream::StreamAction::Error(value) => {
-                                let code = value
-                                    .get("error")
-                                    .and_then(|e| e.get("code"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let msg = value
-                                    .get("error")
-                                    .and_then(|e| e.get("message"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                yield Err(ApiError::new(
-                                    StatusCode::BAD_GATEWAY,
-                                    if code.is_empty() { "upstream_error".to_string() } else { code },
-                                    msg,
-                                ));
-                                return;
+                                failure = Some(business_stream_error(&value));
+                                break 'read;
                             }
                         }
                     }
-                    if saw_done {
-                        break;
-                    }
                 }
-                _ = ticker.tick() => {
-                    // SSE 注释帧：不产生内容，只保活
-                    yield Ok(StreamEvent::Chunk(Value::Null));
-                }
+                _ = ticker.tick() => yield DecoderEvent::Event(Ok(StreamEvent::Chunk(Value::Null))),
             }
         }
 
-        // 无论正常结束还是上游断流，都补一个 [DONE]，
-        // 否则客户端会以为响应被截断。
-        yield Ok(StreamEvent::Done);
-
-        state.usage.record(crate::usage::UsageRecord::from_upstream(
-            &model,
-            &account,
-            0,
-            true,
-            last_usage.as_ref(),
-        )).await;
-        if let Some(total) = last_usage
-            .as_ref()
-            .and_then(|u| u.get("total_tokens"))
-            .and_then(|v| v.as_i64())
-        {
-            gate.add_daily_tokens(total).await;
+        if !saw_done && failure.is_none() && !buffer.is_empty() {
+            match crate::stream::forward_stream_line(&buffer) {
+                crate::stream::StreamAction::Done => saw_done = true,
+                crate::stream::StreamAction::Chunk(value) => {
+                    if let Some(u) = value.get("usage").filter(|u| !u.is_null()) {
+                        usage = Some(u.clone());
+                    }
+                    yield DecoderEvent::Event(Ok(StreamEvent::Chunk(value)));
+                }
+                crate::stream::StreamAction::Error(value) => failure = Some(business_stream_error(&value)),
+                _ => {}
+            }
         }
-    })
+        if !saw_done && failure.is_none() {
+            failure = Some(ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "upstream_incomplete_response",
+                "上游连接在 [DONE] 前结束，响应可能不完整",
+            ));
+        }
+        yield DecoderEvent::Complete(StreamCompletion { usage, result: failure.map_or(Ok(()), Err) });
+    }
+}
+
+fn business_stream_error(value: &Value) -> ApiError {
+    let error = value.get("error");
+    let code = error
+        .and_then(|e| e.get("code"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("upstream_error");
+    let msg = error
+        .and_then(|e| e.get("message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("上游返回业务错误");
+    ApiError::new(StatusCode::BAD_GATEWAY, code, msg)
 }
 
 /// 构造 SSE 响应体（OpenAI 风格 `data: {...}\n\n`）。
@@ -953,7 +996,7 @@ pub fn openai_sse_body(mut stream: EventStream) -> Response {
                 }
             }
         }
-        yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n"));
     };
     sse_response(axum::body::Body::from_stream(body))
 }
@@ -1023,6 +1066,40 @@ mod tests {
             "tools": []
         });
         assert!(!tool_turn(&empty_tools));
+    }
+
+    #[tokio::test]
+    async fn decoder_distinguishes_completion_from_truncation() {
+        let complete = decode_sse(futures_util::stream::iter(vec![Ok::<_, String>(
+            Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]",
+            ),
+        )]));
+        let events: Vec<_> = complete.collect().await;
+        assert!(matches!(
+            events.last(),
+            Some(DecoderEvent::Complete(StreamCompletion {
+                result: Ok(()),
+                ..
+            }))
+        ));
+
+        let truncated = decode_sse(futures_util::stream::iter(vec![Ok::<_, String>(
+            Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"),
+        )]));
+        let events: Vec<_> = truncated.collect().await;
+        assert!(
+            matches!(events.last(), Some(DecoderEvent::Complete(StreamCompletion { result: Err(e), .. })) if e.code == "upstream_incomplete_response")
+        );
+
+        let failed = decode_sse(futures_util::stream::iter(vec![
+            Ok::<_, String>(Bytes::from_static(b"data: {\"choices\":[]}\n\n")),
+            Err("connection reset".to_string()),
+        ]));
+        let events: Vec<_> = failed.collect().await;
+        assert!(
+            matches!(events.last(), Some(DecoderEvent::Complete(StreamCompletion { result: Err(e), .. })) if e.code == "upstream_network_error")
+        );
     }
 
     #[test]

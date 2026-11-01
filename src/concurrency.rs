@@ -104,10 +104,7 @@ impl AccountGate {
         self.stream_concurrent.available_permits()
     }
 
-    /// 获取一个槽位。
-    ///
-    /// 流式：先在滑动窗口里预约名额（不够就等到窗口里最老的那个过期），
-    /// 再占用一个并发许可。非流式：只占本地并发许可，上游不限制。
+    /// 获取一个本地在途请求许可，持到响应体结束。
     pub async fn acquire(&self, stream: bool) -> Result<SlotGuard, String> {
         if !stream {
             let permit = self
@@ -184,8 +181,10 @@ impl AccountGate {
     /// 让某个模型在这个账号上冷却一段时间。
     pub async fn cool_model(&self, model: &str, secs: u64) {
         let mut st = self.state.write().await;
-        st.model_cooldowns
-            .insert(model.to_string(), Instant::now() + Duration::from_secs(secs));
+        st.model_cooldowns.insert(
+            model.to_string(),
+            Instant::now() + Duration::from_secs(secs),
+        );
     }
 
     /// 累加当日 token 消耗，跨日自动归零。
@@ -254,7 +253,7 @@ impl AccountGate {
     }
 }
 
-/// 占用的槽位。drop 时立即归还并发许可；窗口记录会自己过期。
+/// 占用的槽位。drop 时立即归还本地并发许可。
 pub struct SlotGuard {
     permit: Option<OwnedSemaphorePermit>,
     stream: bool,
@@ -281,7 +280,7 @@ impl Drop for SlotGuard {
                 }
             });
         }
-        // 并发许可立即归还；窗口里的启动记录负责「60 秒内最多 3 个」。
+        // 许可与统计计数都在 guard 生命周期结束时归还。
         drop(self.permit.take());
     }
 }
@@ -496,7 +495,9 @@ mod tests {
 
     #[test]
     fn detects_auth_error() {
-        assert!(is_auth_error("APIG.0602 Bad request: the security token has expired"));
+        assert!(is_auth_error(
+            "APIG.0602 Bad request: the security token has expired"
+        ));
         assert!(is_auth_error("APIG.0301 verify ak sk signature fail"));
         assert!(!is_auth_error("TM.00001041"));
     }
@@ -582,8 +583,11 @@ mod tests {
     #[test]
     fn session_key_prefers_header() {
         let body = json!({"messages":[{"role":"user","content":"hello"}]});
-        assert_eq!(session_key(&body, Some("chat-123")).as_deref(), Some("hdr:chat-123"));
-        assert_eq!(session_key(&body, Some("")).unwrap().starts_with("msg:"), true);
+        assert_eq!(
+            session_key(&body, Some("chat-123")).as_deref(),
+            Some("hdr:chat-123")
+        );
+        assert!(session_key(&body, Some("")).unwrap().starts_with("msg:"));
     }
 
     #[test]

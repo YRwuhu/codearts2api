@@ -74,7 +74,9 @@ pub fn normalize_roles(body: &mut Map<String, Value>) {
         return;
     };
     for msg in messages {
-        let Some(obj) = msg.as_object_mut() else { continue };
+        let Some(obj) = msg.as_object_mut() else {
+            continue;
+        };
         if obj.get("role").and_then(|r| r.as_str()) == Some("developer") {
             obj.insert("role".to_string(), Value::from("system"));
         }
@@ -167,4 +169,16 @@ mod tests {
         assert!(b.get("reasoning").is_none());
     }
 
+    #[test]
+    fn preserves_multimodal_image_content() {
+        let content = json!([
+            {"type": "text", "text": "描述图片"},
+            {"type": "image_url", "image_url": {
+                "url": "data:image/png;base64,AAA", "detail": "high"
+            }}
+        ]);
+        let mut b = body(json!({"messages": [{"role": "user", "content": content.clone()}]}));
+        normalize_params(&mut b, 1000);
+        assert_eq!(b["messages"][0]["content"], content);
+    }
 }

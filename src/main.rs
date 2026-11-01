@@ -16,10 +16,9 @@ mod usage;
 mod web;
 
 use std::process::ExitCode;
-use std::sync::Arc;
 
-use config::{Account, Config};
-use models::{Catalog, Pool};
+use config::Config;
+use models::Pool;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -88,35 +87,14 @@ fn build_runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|e| format!("创建运行时失败: {e}"))
 }
 
-/// 按配置构建每个启用账号的模型目录。
-async fn build_pool(cfg: &Config, http: reqwest::Client) -> Pool {
-    let enabled: Vec<&Account> = cfg.accounts.iter().filter(|a| a.enabled).collect();
-    let mut catalogs = Vec::new();
-    for account in enabled {
-        // OAuth 账号的 AK/SK 存在 auths/，必须先解析出来；
-        // 直接用 account.clone() 会拿到空凭证，签名时报
-        // "Access or Credential is empty in Authorization"。
-        let resolved = match admin::resolve_account(&http, &cfg.env_dir, account).await {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("[pool] 跳过账号 {}: {e}", account.id);
-                continue;
-            }
-        };
-        let cache_path = cfg.cache_path_for(account);
-        let catalog = Catalog::new(
-            resolved,
-            &cache_path,
-            cfg.benefit_fallback,
-            http.clone(),
-        );
-        // 启动时同步一次真实模型列表；失败则回退到缓存/兜底
-        if !catalog.refresh().await {
-            catalog.load_cache().await;
-        }
-        catalogs.push(Arc::new(catalog));
-    }
-    Pool::new(catalogs)
+/// 服务启动先使用缓存；CLI 等待同步完成后再退出。
+async fn build_pool(cfg: &Config, http: reqwest::Client, wait_for_refresh: bool) -> Pool {
+    Pool::build(cfg, http, wait_for_refresh)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("[pool] {e}");
+            Pool::new(Vec::new())
+        })
 }
 
 fn serve() -> ExitCode {
@@ -138,7 +116,7 @@ fn serve() -> ExitCode {
 
     rt.block_on(async move {
         let http = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .connect_timeout(std::time::Duration::from_secs(30))
             .build()
         {
             Ok(c) => c,
@@ -148,7 +126,7 @@ fn serve() -> ExitCode {
             }
         };
 
-        let pool = build_pool(&cfg, http.clone()).await;
+        let pool = build_pool(&cfg, http.clone(), false).await;
         let merged: Vec<String> = pool
             .merged_models()
             .await
@@ -169,7 +147,10 @@ fn serve() -> ExitCode {
         let account_count = pool.catalogs().len();
         println!("CodeArts OpenAI 兼容代理已启动: http://{addr}");
         println!("OpenAI Base URL: http://{addr}/v1");
-        println!("账号数: {account_count}，合并可用模型 {} 个: {merged:?}", merged.len());
+        println!(
+            "账号数: {account_count}，合并可用模型 {} 个: {merged:?}",
+            merged.len()
+        );
         if account_count > 1 {
             println!("多账号已启用：失败时按配置顺序自动切换");
         }
@@ -210,13 +191,18 @@ fn accounts_cmd() -> ExitCode {
     };
     rt.block_on(async move {
         let http = reqwest::Client::new();
-        let pool = build_pool(&cfg, http).await;
+        let pool = build_pool(&cfg, http, true).await;
         let described = pool.describe().await;
-        println!("{:<18} {:<18} {:<8} {}", "账号", "AK", "状态", "模型数");
+        println!("{:<18} {:<18} {:<8} 模型数", "账号", "AK", "状态");
         println!("{}", "-".repeat(60));
         for account in &cfg.accounts {
             if !account.enabled {
-                println!("{:<18} {:<18} {:<8} -", account.id, account.masked_ak(), "disabled");
+                println!(
+                    "{:<18} {:<18} {:<8} -",
+                    account.id,
+                    account.masked_ak(),
+                    "disabled"
+                );
                 continue;
             }
             let count = described
@@ -268,7 +254,7 @@ fn models_cmd() -> ExitCode {
     };
     rt.block_on(async move {
         let http = reqwest::Client::new();
-        let pool = build_pool(&cfg, http).await;
+        let pool = build_pool(&cfg, http, true).await;
         for m in pool.merged_models().await {
             let ctx = m
                 .context_window
@@ -294,10 +280,7 @@ fn benefit_cmd(args: &[String]) -> ExitCode {
     };
 
     // 可选第二个参数指定账号；未指定时用第一个启用账号
-    let target = args
-        .get(1)
-        .map(|s| s.as_str())
-        .filter(|s| !s.is_empty());
+    let target = args.get(1).map(|s| s.as_str()).filter(|s| !s.is_empty());
     let account = match target {
         Some(id) => cfg.accounts.iter().find(|a| a.id == id),
         None => cfg.accounts.iter().find(|a| a.enabled),
@@ -386,36 +369,40 @@ fn benefit_cmd(args: &[String]) -> ExitCode {
                         }
                     }
                 }),
-            _ => async {
-                match call("GET", "/api/v1/benefit/claim".to_string()).await {
-                    Ok(r) => {
-                        println!("最近签到时间: {}", fmt_claim_time(&r));
-                        match call("POST", "/api/v1/benefit/claim".to_string()).await {
-                            Ok(r2) => {
-                                println!("签到成功，最近签到时间: {}", fmt_claim_time(&r2));
-                                match call("GET", "/api/v1/user/tokens/balance".to_string()).await {
-                                    Ok(b) => {
-                                        let total = b
-                                            .get("total_quota")
-                                            .and_then(|v| v.as_i64())
-                                            .unwrap_or(0);
-                                        let remain = b
-                                            .get("total_balance")
-                                            .and_then(|v| v.as_i64())
-                                            .unwrap_or(0);
-                                        println!("免费额度余额: {remain} / {total}");
-                                        Ok(())
+            _ => {
+                async {
+                    match call("GET", "/api/v1/benefit/claim".to_string()).await {
+                        Ok(r) => {
+                            println!("最近签到时间: {}", fmt_claim_time(&r));
+                            match call("POST", "/api/v1/benefit/claim".to_string()).await {
+                                Ok(r2) => {
+                                    println!("签到成功，最近签到时间: {}", fmt_claim_time(&r2));
+                                    match call("GET", "/api/v1/user/tokens/balance".to_string())
+                                        .await
+                                    {
+                                        Ok(b) => {
+                                            let total = b
+                                                .get("total_quota")
+                                                .and_then(|v| v.as_i64())
+                                                .unwrap_or(0);
+                                            let remain = b
+                                                .get("total_balance")
+                                                .and_then(|v| v.as_i64())
+                                                .unwrap_or(0);
+                                            println!("免费额度余额: {remain} / {total}");
+                                            Ok(())
+                                        }
+                                        Err(e) => Err(e),
                                     }
-                                    Err(e) => Err(e),
                                 }
+                                Err(e) => Err(e),
                             }
-                            Err(e) => Err(e),
                         }
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
                 }
+                .await
             }
-            .await,
         };
 
         match result {
