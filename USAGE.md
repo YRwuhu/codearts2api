@@ -145,6 +145,11 @@ CloudAgent 的 `event: message` 逐条转成 OpenAI `delta` 往下推，客户�
 首帧约 0.3 秒可见，不再是等整轮任务跑完才一次性吐出。`stream: false`
 仍返回聚合后的完整 `chat.completion`。
 
+收到 `event: done` 或终止错误就立即断开上游连接。CloudAgent 发完结果
+并不会主动关连接，以前会一直挂到 600 秒超时（表现是"话说完了却不中断"）。
+积分耗尽、凭证失效这类错误重试没有意义，会直接返回，不再白跑一轮
+ImageId 重试。
+
 `CODEARTS_VISION_MODEL` 可指定回退视觉模型，设为 `off` 则关闭回退。
 诊断结构日志 `CODEARTS_DEBUG_REQUEST_SHAPE=1` 只输出角色、block 类型、
 图片 MIME/大小，不输出正文、base64 或凭证。

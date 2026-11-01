@@ -495,6 +495,7 @@ async fn start_task(
     Ok(response)
 }
 
+/// 非流式：读到 `done` 或终止错误就停，不等上游关连接。
 async fn run_task(
     state: &WebState,
     catalog: &Catalog,
@@ -503,12 +504,36 @@ async fn run_task(
     attachments: &[Value],
     session_id: &str,
 ) -> Result<Vec<u8>, ApiError> {
-    start_task(state, catalog, model, content, attachments, session_id)
-        .await?
-        .bytes()
-        .await
-        .map(|bytes| bytes.to_vec())
-        .map_err(|e| ApiError::unavailable(format!("读取 CloudAgent 任务流失败: {e}")))
+    use futures_util::StreamExt;
+    let response =
+        start_task(state, catalog, model, content, attachments, session_id).await?;
+    let mut bytes = response.bytes_stream();
+    let mut raw: Vec<u8> = Vec::new();
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut acc = TaskAccumulator::default();
+    loop {
+        match bytes.next().await {
+            Some(Ok(chunk)) => {
+                buffer.extend_from_slice(&chunk);
+                raw.extend_from_slice(&chunk);
+            }
+            Some(Err(e)) => {
+                return Err(ApiError::unavailable(format!(
+                    "读取 CloudAgent 任务流失败: {e}"
+                )))
+            }
+            None => break,
+        }
+        while let Some(block) = take_block(&mut buffer) {
+            let delta = acc.feed(&block);
+            // `raw` 已按原始字节保留，重放时不会再走 feed，这里仅用于判断停止。
+            let _ = delta;
+            if acc.should_stop() {
+                return Ok(raw);
+            }
+        }
+    }
+    Ok(raw)
 }
 
 /// 非流式路径：收完整轮任务；首次失败会读会话里的 ImageId 再试一次。
@@ -525,6 +550,10 @@ async fn collect(
     if let Err(error) = &result {
         // 第一次失败的原因通常比"重试也失败"更有诊断价值，别吞掉。
         println!("[cloudagent] {model}: 图像任务未成功（{error}），尝试会话注册的 ImageId");
+        if is_unrecoverable(error) {
+            println!("[cloudagent] {model}: 该错误重试无意义，跳过 ImageId 重试");
+            return Err(ApiError::bad_request(error.clone()));
+        }
         let messages = session_messages(catalog, session_id)
             .await
             .map_err(ApiError::bad_request)?;
@@ -620,6 +649,12 @@ fn stream_task(
                                 None,
                             )));
                         }
+                        if acc.should_stop() {
+                            break;
+                        }
+                    }
+                    if acc.should_stop() {
+                        break;
                     }
                 }
                 if failure.is_none() {
@@ -642,7 +677,12 @@ fn stream_task(
         let usage = acc.usage.clone();
 
         // 还没有任何正文吐出去时，才有资格改走 ImageId 重试，否则会重复输出。
-        if failure.is_none() && !emitted && acc.preview_error(&model, &session_id).is_some() {
+        // 积分耗尽 / 凭证失效这类错误重试也没用，直接放弃省一轮 20 秒。
+        let recoverable = acc
+            .preview_error(&model, &session_id)
+            .map(|error| !is_unrecoverable(&error))
+            .unwrap_or(false);
+        if failure.is_none() && !emitted && recoverable {
             if let Ok(messages) = session_messages(&catalog, &session_id).await {
                 let hints: Vec<(String, String)> = attachments
                     .iter()
@@ -869,6 +909,19 @@ fn response_usage(value: &Value) -> Option<Value> {
     }))
 }
 
+/// 这些上游错误重试也没用，不值得再跑一轮 20 秒的任务。
+///
+/// 积分耗尽是账号侧的账单状态，换了 ImageId 一样失败；以前会白白多跑
+/// 一整轮重试，用户多等 20 秒才看到"积分已耗尽"。
+fn is_unrecoverable(message: &str) -> bool {
+    message.contains("积分已耗尽")
+        || message.contains("quota")
+        || message.contains("insufficient")
+        || message.contains("余额不足")
+        || message.contains("APIG.0301")
+        || message.contains("security token has expired")
+}
+
 /// 逐个 SSE block 累积 CloudAgent 任务状态。
 ///
 /// 流式与聚合两条路径共用同一套解析逻辑：流式逐块 `feed` 并立刻把正文
@@ -973,6 +1026,15 @@ impl TaskAccumulator {
             return Some("CloudAgent 任务在完成事件前结束，响应可能不完整".into());
         }
         None
+    }
+
+    /// 这一轮是否已经可以收尾，不必再等后续帧。
+    ///
+    /// CloudAgent 在 `event: done` 之后**不会主动关闭连接**，还会继续挂着。
+    /// 以前一直读到 EOF，等于白等到 600 秒超时——客户端"话说完了却不断"。
+    /// 收到 done、或者出现不可恢复的终止错误，就该立刻收手。
+    fn should_stop(&self) -> bool {
+        self.done || self.terminal_error.is_some()
     }
 
     /// 收尾：与聚合路径完全一致的错误判定。
