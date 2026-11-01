@@ -4,12 +4,13 @@
 //! 网页上传图片走的是另一条链路：上传附件后用同一账号签名创建 CloudAgent
 //! 会话并提交任务。`Agent-Type: CodeBase` 是该服务路由所必需的请求头。
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{json, Value};
 
-use crate::chat::{ApiError, Outcome, StreamEvent};
+use crate::chat::{ApiError, EventStream, Outcome, StreamEvent};
 use crate::models::{Catalog, BASE_URL};
 use crate::web::WebState;
 
@@ -154,12 +155,15 @@ async fn signed_request(
     body: &[u8],
     accept: &str,
 ) -> Vec<(String, String)> {
+    let session_id = crate::concurrency::account_session_id(&catalog.account().await.session_seed());
     let extra = [
         ("accept", accept),
         ("agent-type", "CodeBase"),
         ("x-requested-with", "XMLHttpRequest"),
         ("x-codearts-doer-scenario-type", "web"),
         ("x-ot-client-type", "web"),
+        ("x-ot-session-id", session_id.as_str()),
+        ("user-session-id", session_id.as_str()),
     ];
     catalog.signed_request(method, url, body, &extra).await
 }
@@ -193,6 +197,123 @@ pub async fn prepare_session(catalog: &Catalog) -> Result<String, String> {
         .ok_or_else(|| "CloudAgent 会话响应缺少 session_id".into())
 }
 
+/// 关闭 CloudAgent 会话。
+///
+/// 上游按账号限制**同时存在的会话数**（实测 3 个）。`prepare_session` 每轮
+/// 都要新建一个会话，若不回收，第 4 次带图请求起就会撞上限并回退视觉模型。
+/// `DELETE /cloudagent/sessions/{id}` 是网页版关闭会话的接口，返回 200。
+async fn close_session(catalog: &Catalog, session_id: &str) {
+    let url = format!("{BASE_URL}/codebaseservice/v1/cloudagent/sessions/{session_id}");
+    let headers = signed_request(catalog, "DELETE", &url, b"", "application/json").await;
+    let mut request = catalog
+        .http_client()
+        .delete(url)
+        .timeout(Duration::from_secs(30));
+    for (key, value) in headers {
+        request = request.header(key, value);
+    }
+    match request.send().await {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => println!(
+            "[cloudagent] 关闭会话 {session_id} 失败：HTTP {}",
+            response.status()
+        ),
+        Err(error) => println!("[cloudagent] 关闭会话 {session_id} 失败：{error}"),
+    }
+}
+
+/// 会话的 RAII 回收句柄。
+///
+/// 用 Drop 而不是在每个 `?` 前手写 close：`execute` 里有多条提前返回路径
+/// （上传失败、任务失败、解析失败），漏掉一处就重新泄漏一个会话。
+pub struct SessionGuard {
+    catalog: Arc<Catalog>,
+    id: String,
+}
+
+impl SessionGuard {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        let catalog = self.catalog.clone();
+        let id = self.id.clone();
+        // Drop 不能 await：在运行时外起一个短任务收尾。请求已完成，
+        // 这里失败也只是多留一个会话，不该影响已经返回给客户端的结果。
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { close_session(&catalog, &id).await });
+        }
+    }
+}
+
+/// 打开一个用完即还的会话。
+pub async fn open_session(catalog: &Arc<Catalog>) -> Result<SessionGuard, String> {
+    let id = prepare_session(catalog).await?;
+    Ok(SessionGuard {
+        catalog: catalog.clone(),
+        id,
+    })
+}
+
+/// 回收此前泄漏的会话，最多保留 `keep` 个。
+///
+/// 老版本没有关闭逻辑，账号上会积压会话，导致新请求一上来就撞
+/// `并发会话数已达上限`。启动时清理一次即可恢复。
+///
+/// 注意：上游的"会话数"统计**所有未删除的会话**，不只是 `ACTIVE`。
+/// 实测账号上 18 个会话、只有 1 个 ACTIVE 时仍报上限，所以这里不能
+/// 按状态过滤，必须连 `IDLE` 一起删。
+pub async fn reclaim_sessions(catalog: &Catalog, keep: usize) {
+    let url = format!("{BASE_URL}/codebaseservice/v1/cloudagent/sessions?page_num=1&page_size=100");
+    let headers = signed_request(catalog, "GET", &url, b"", "application/json").await;
+    let mut request = catalog
+        .http_client()
+        .get(url)
+        .timeout(Duration::from_secs(30));
+    for (key, value) in headers {
+        request = request.header(key, value);
+    }
+    let Ok(response) = request.send().await else {
+        return;
+    };
+    if !response.status().is_success() {
+        return;
+    }
+    let Ok(text) = response.text().await else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    let Some(sessions) = value.get("result").and_then(Value::as_array) else {
+        return;
+    };
+    if sessions.len() <= keep {
+        return;
+    }
+    let mut closed = 0usize;
+    for session in &sessions[..sessions.len() - keep] {
+        if let Some(id) = session.get("session_id").and_then(Value::as_str) {
+            close_session(catalog, id).await;
+            closed += 1;
+        }
+    }
+    if closed > 0 {
+        println!(
+            "[cloudagent] 账号 {} 回收了 {closed} 个遗留会话",
+            catalog.account_id()
+        );
+    }
+}
+
+
+/// 上传图片附件，返回上游的 `attachment_id`。
+///
+/// `content-type` 必须参与签名（multipart 的 boundary 就在里面），
+/// 否则网关报 `APIG.0301 verify ak sk signature fail`。
 async fn upload(
     http: &reqwest::Client,
     catalog: &Catalog,
@@ -334,14 +455,18 @@ fn attachment_retry_prompt(content: &str, hints: &[(String, String)]) -> String 
     text
 }
 
-async fn run_task(
+/// 发起 CloudAgent 任务，返回**未读取**的响应，交给调用方逐块消费。
+///
+/// 不要在这里 `.bytes()`：CloudAgent 一轮任务 20–40 秒、上百帧 SSE，
+/// 收完再返回会让客户端整段时间收不到任何字节（首字延迟 = 任务总时长）。
+async fn start_task(
     state: &WebState,
     catalog: &Catalog,
     model: &str,
     content: &str,
     attachments: &[Value],
     session_id: &str,
-) -> Result<Vec<u8>, ApiError> {
+) -> Result<reqwest::Response, ApiError> {
     let url = format!("{BASE_URL}/codebaseservice/v1/cloudagent/sessions/{session_id}/messages");
     let payload = serde_json::to_vec(&task_body(content, model, attachments))
         .map_err(|e| ApiError::bad_request(format!("序列化附件任务失败: {e}")))?;
@@ -367,40 +492,301 @@ async fn run_task(
             detail,
         ));
     }
-    response
+    Ok(response)
+}
+
+async fn run_task(
+    state: &WebState,
+    catalog: &Catalog,
+    model: &str,
+    content: &str,
+    attachments: &[Value],
+    session_id: &str,
+) -> Result<Vec<u8>, ApiError> {
+    start_task(state, catalog, model, content, attachments, session_id)
+        .await?
         .bytes()
         .await
         .map(|bytes| bytes.to_vec())
         .map_err(|e| ApiError::unavailable(format!("读取 CloudAgent 任务流失败: {e}")))
 }
 
-fn base64_retry_prompt(content: &str, images: &[ImageAttachment]) -> String {
-    let urls = images
-        .iter()
-        .map(|image| {
-            format!(
-                "data:{};base64,{}",
-                image.mime,
-                base64::engine::general_purpose::STANDARD.encode(&image.bytes)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "{content}\n\n本轮图片已在会话中。请使用 analyzeImage 的 imageBase64 参数分析以下 data URL，不要猜 ImageId 或文件路径。工具一旦成功返回图像分析结果，就直接根据该结果回答用户，不要重复调用工具，不要再次分析或尝试 ImageId/路径：\n{urls}"
-    )
+/// 非流式路径：收完整轮任务；首次失败会读会话里的 ImageId 再试一次。
+async fn collect(
+    state: &WebState,
+    catalog: &Catalog,
+    model: &str,
+    content: &str,
+    attachments: &[Value],
+    session_id: &str,
+) -> Result<Value, ApiError> {
+    let raw = run_task(state, catalog, model, content, attachments, session_id).await?;
+    let mut result = parse_events(&raw, model, session_id);
+    if let Err(error) = &result {
+        // 第一次失败的原因通常比"重试也失败"更有诊断价值，别吞掉。
+        println!("[cloudagent] {model}: 图像任务未成功（{error}），尝试会话注册的 ImageId");
+        let messages = session_messages(catalog, session_id)
+            .await
+            .map_err(ApiError::bad_request)?;
+        let hints: Vec<(String, String)> = attachments
+            .iter()
+            .filter_map(|attachment| {
+                image_hint(&messages, attachment["filename"].as_str().unwrap_or(""))
+            })
+            .collect();
+        if !hints.is_empty() {
+            println!("[cloudagent] {model}: 使用会话注册的 ImageId 重试图片任务");
+            let retry = attachment_retry_prompt(content, &hints);
+            let raw = run_task(state, catalog, model, &retry, attachments, session_id).await?;
+            result = parse_events(&raw, model, session_id);
+        }
+    }
+    result.map_err(ApiError::bad_request)
+}
+
+/// 从缓冲区取出一个 SSE block（以空行结束）。
+fn take_block(buffer: &mut Vec<u8>) -> Option<String> {
+    let pos = buffer.windows(2).position(|w| w == b"\n\n")?;
+    let block: Vec<u8> = buffer.drain(..pos + 2).collect();
+    Some(String::from_utf8_lossy(&block[..pos]).replace("\r\n", "\n"))
+}
+
+/// 流式路径：把 CloudAgent 的 `event: message` 逐帧转成 OpenAI delta。
+///
+/// 会话句柄由流持有，直到这一轮结束才关闭；`execute` 一返回就 drop
+/// 会在任务还在跑的时候把会话删掉。
+fn stream_task(
+    state: WebState,
+    catalog: Arc<Catalog>,
+    model: String,
+    content: String,
+    attachments: Vec<Value>,
+    session: SessionGuard,
+    started: std::time::Instant,
+) -> EventStream {
+    Box::pin(async_stream::stream! {
+        use futures_util::StreamExt;
+
+        let session_id = session.id().to_string();
+        let id = format!("chatcmpl-{session_id}");
+        let created = chrono::Utc::now().timestamp();
+        let make_chunk = |delta: Value, finish: Option<&str>, usage: Option<&Value>| {
+            let mut chunk = json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            });
+            if let Some(u) = usage {
+                chunk["usage"] = u.clone();
+            }
+            chunk
+        };
+
+        // 先发 role 帧，让客户端立刻拿到首个字节，不必等到模型出字。
+        yield Ok(StreamEvent::Chunk(make_chunk(
+            json!({"role": "assistant", "content": ""}),
+            None,
+            None,
+        )));
+
+        let mut acc = TaskAccumulator::default();
+        let mut emitted = false;
+        let mut failure: Option<ApiError> = None;
+
+        match start_task(&state, &catalog, &model, &content, &attachments, &session_id).await {
+            Ok(response) => {
+                let mut bytes = response.bytes_stream();
+                let mut buffer: Vec<u8> = Vec::new();
+                loop {
+                    match bytes.next().await {
+                        Some(Ok(chunk)) => buffer.extend_from_slice(&chunk),
+                        Some(Err(e)) => {
+                            failure = Some(ApiError::unavailable(format!(
+                                "读取 CloudAgent 任务流失败: {e}"
+                            )));
+                            break;
+                        }
+                        None => break,
+                    }
+                    while let Some(block) = take_block(&mut buffer) {
+                        let delta = acc.feed(&block);
+                        if !delta.is_empty() {
+                            emitted = true;
+                            yield Ok(StreamEvent::Chunk(make_chunk(
+                                json!({"content": delta}),
+                                None,
+                                None,
+                            )));
+                        }
+                    }
+                }
+                if failure.is_none() {
+                    if let Some(block) = take_block(&mut buffer) {
+                        let delta = acc.feed(&block);
+                        if !delta.is_empty() {
+                            emitted = true;
+                            yield Ok(StreamEvent::Chunk(make_chunk(
+                                json!({"content": delta}),
+                                None,
+                                None,
+                            )));
+                        }
+                    }
+                }
+            }
+            Err(error) => failure = Some(error),
+        }
+
+        let usage = acc.usage.clone();
+
+        // 还没有任何正文吐出去时，才有资格改走 ImageId 重试，否则会重复输出。
+        if failure.is_none() && !emitted && acc.preview_error(&model, &session_id).is_some() {
+            if let Ok(messages) = session_messages(&catalog, &session_id).await {
+                let hints: Vec<(String, String)> = attachments
+                    .iter()
+                    .filter_map(|attachment| {
+                        image_hint(&messages, attachment["filename"].as_str().unwrap_or(""))
+                    })
+                    .collect();
+                if !hints.is_empty() {
+                    println!("[cloudagent] {model}: 使用会话注册的 ImageId 流式重试");
+                    let retry = attachment_retry_prompt(&content, &hints);
+                    acc = TaskAccumulator::default();
+                    match start_task(&state, &catalog, &model, &retry, &attachments, &session_id).await {
+                        Ok(response) => {
+                            let mut bytes = response.bytes_stream();
+                            let mut buffer: Vec<u8> = Vec::new();
+                            loop {
+                                match bytes.next().await {
+                                    Some(Ok(chunk)) => buffer.extend_from_slice(&chunk),
+                                    Some(Err(e)) => {
+                                        failure = Some(ApiError::unavailable(format!(
+                                            "读取 CloudAgent 重试流失败: {e}"
+                                        )));
+                                        break;
+                                    }
+                                    None => break,
+                                }
+                                while let Some(block) = take_block(&mut buffer) {
+                                    let delta = acc.feed(&block);
+                                    if !delta.is_empty() {
+                                        emitted = true;
+                                        yield Ok(StreamEvent::Chunk(make_chunk(
+                                            json!({"content": delta}),
+                                            None,
+                                            None,
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => failure = Some(error),
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = failure {
+            state
+                .usage
+                .record(crate::usage::UsageRecord::failed(
+                    &model,
+                    catalog.account_id(),
+                    started.elapsed().as_millis() as i64,
+                    true,
+                    format!("{}: {}", error.code, error.message),
+                ))
+                .await;
+            yield Err(error);
+            return;
+        }
+
+        let usage = if emitted { acc.usage.clone().or(usage) } else { usage };
+        let doom = acc.content.contains("已检测到 doom loop");
+        let outcome = if emitted {
+            // 已经逐帧发过正文，这里只判定终止条件，不再重复输出内容。
+            if let Some(error) = acc
+                .terminal_error
+                .clone()
+                .filter(|_| !acc.successful_image_analysis)
+            {
+                Err(error)
+            } else if !acc.done {
+                Err("CloudAgent 任务在完成事件前结束，响应可能不完整".to_string())
+            } else {
+                Ok(())
+            }
+        } else {
+            acc.finish(&model, &session_id).map(|_| ())
+        };
+
+        let _completion_session = session;
+
+        match outcome {
+            Ok(()) if !doom => {
+                state
+                    .usage
+                    .record(crate::usage::UsageRecord::from_upstream(
+                        &model,
+                        catalog.account_id(),
+                        started.elapsed().as_millis() as i64,
+                        true,
+                        usage.as_ref(),
+                    ))
+                    .await;
+                if let Some(total) = usage
+                    .as_ref()
+                    .and_then(|u| u.get("total_tokens"))
+                    .and_then(Value::as_i64)
+                {
+                    state
+                        .gate(catalog.account_id(), state.config().concurrency)
+                        .await
+                        .add_daily_tokens(total)
+                        .await;
+                }
+                yield Ok(StreamEvent::Chunk(make_chunk(
+                    json!({}),
+                    Some("stop"),
+                    usage.as_ref(),
+                )));
+                yield Ok(StreamEvent::Done);
+            }
+            Ok(()) => {
+                yield Err(ApiError::bad_request(
+                    "CloudAgent 图像任务重复调用被中止，使用视觉模型回退",
+                ));
+            }
+            Err(message) => {
+                state
+                    .usage
+                    .record(crate::usage::UsageRecord::failed(
+                        &model,
+                        catalog.account_id(),
+                        started.elapsed().as_millis() as i64,
+                        true,
+                        message.clone(),
+                    ))
+                    .await;
+                yield Err(ApiError::bad_request(message));
+            }
+        }
+    })
 }
 
 /// 发送带附件任务，并把 CloudAgent SSE 统一转换为现有 OpenAI 事件流。
 pub async fn execute(
     state: &WebState,
-    catalog: &Catalog,
+    catalog: Arc<Catalog>,
     model: &str,
     body: &Value,
     client_stream: bool,
-    session_id: &str,
+    session: SessionGuard,
 ) -> Result<Outcome, ApiError> {
     let started = std::time::Instant::now();
+    let session_id = session.id().to_string();
     println!("[cloudagent] {model}: 使用附件 + CloudAgent 会话 {session_id}");
     let (content, images) = input_from_messages(body).map_err(|message| {
         ApiError::new(
@@ -413,7 +799,7 @@ pub async fn execute(
     for image in &images {
         let uploaded = upload(
             &state.http,
-            catalog,
+            &catalog,
             image.bytes.clone(),
             &image.filename,
             &image.mime,
@@ -426,35 +812,21 @@ pub async fn execute(
             "mime": uploaded["mime"],
         }));
     }
-    let mut raw = run_task(
-        state,
-        catalog,
-        model,
-        &base64_retry_prompt(&content, &images),
-        &attachments,
-        session_id,
-    )
-    .await?;
-    let mut result = parse_events(&raw, model, session_id);
-    if result.is_err() {
-        println!("[cloudagent] {model}: base64 图像任务未成功，尝试会话注册的 ImageId");
-        let messages = session_messages(catalog, session_id)
-            .await
-            .map_err(ApiError::bad_request)?;
-        let hints: Vec<(String, String)> = attachments
-            .iter()
-            .filter_map(|attachment| {
-                image_hint(&messages, attachment["filename"].as_str().unwrap_or(""))
-            })
-            .collect();
-        if !hints.is_empty() {
-            println!("[cloudagent] {model}: 使用会话注册的 ImageId 重试图片任务");
-            let retry = attachment_retry_prompt(&content, &hints);
-            raw = run_task(state, catalog, model, &retry, &attachments, session_id).await?;
-            result = parse_events(&raw, model, session_id);
-        }
+
+    if client_stream {
+        return Ok(Outcome::Stream(stream_task(
+            state.clone(),
+            catalog,
+            model.to_string(),
+            content,
+            attachments,
+            session,
+            started,
+        )));
     }
-    let result = result.map_err(ApiError::bad_request)?;
+
+    let result = collect(state, &catalog, model, &content, &attachments, &session_id).await?;
+    drop(session);
     if result["choices"][0]["message"]["content"]
         .as_str()
         .is_some_and(|content| content.contains("已检测到 doom loop"))
@@ -484,15 +856,7 @@ pub async fn execute(
             .add_daily_tokens(total)
             .await;
     }
-    if client_stream {
-        let chunk = crate::chat::chat_chunk_from_completion(&result);
-        Ok(Outcome::Stream(Box::pin(futures_util::stream::iter(vec![
-            Ok(StreamEvent::Chunk(chunk)),
-            Ok(StreamEvent::Done),
-        ]))))
-    } else {
-        Ok(Outcome::Json(result))
-    }
+    Ok(Outcome::Json(result))
 }
 
 fn response_usage(value: &Value) -> Option<Value> {
@@ -505,16 +869,24 @@ fn response_usage(value: &Value) -> Option<Value> {
     }))
 }
 
-pub fn parse_events(raw: &[u8], model: &str, session_id: &str) -> Result<Value, String> {
-    let text = String::from_utf8_lossy(raw);
-    let mut content = String::new();
-    let mut image_analysis = None;
-    let mut reasoning = String::new();
-    let mut terminal_error = None;
-    let mut successful_image_analysis = false;
-    let mut usage = None;
-    let mut done = false;
-    for block in text.replace("\r\n", "\n").split("\n\n") {
+/// 逐个 SSE block 累积 CloudAgent 任务状态。
+///
+/// 流式与聚合两条路径共用同一套解析逻辑：流式逐块 `feed` 并立刻把正文
+/// 转成 OpenAI delta，聚合则全部喂完后 `finish`。
+#[derive(Default)]
+struct TaskAccumulator {
+    content: String,
+    reasoning: String,
+    image_analysis: Option<String>,
+    terminal_error: Option<String>,
+    successful_image_analysis: bool,
+    usage: Option<Value>,
+    done: bool,
+}
+
+impl TaskAccumulator {
+    /// 喂一个完整 block（`event:` + `data:` 若干行），返回本次新增的正文增量。
+    fn feed(&mut self, block: &str) -> String {
         let mut event = "";
         let mut data = String::new();
         for line in block.lines() {
@@ -528,10 +900,10 @@ pub fn parse_events(raw: &[u8], model: &str, session_id: &str) -> Result<Value, 
             }
         }
         if data.is_empty() {
-            continue;
+            return String::new();
         }
         let Ok(value) = serde_json::from_str::<Value>(&data) else {
-            continue;
+            return String::new();
         };
         let error_text = value
             .get("error")
@@ -539,13 +911,8 @@ pub fn parse_events(raw: &[u8], model: &str, session_id: &str) -> Result<Value, 
             .and_then(Value::as_str)
             .filter(|message| !message.is_empty());
         if event == "error" || error_text.is_some() {
-            terminal_error = value
-                .get("error")
-                .or_else(|| value.get("error_msg"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| Some(data.clone()));
-            continue;
+            self.terminal_error = error_text.map(str::to_string).or_else(|| Some(data.clone()));
+            return String::new();
         }
         if event == "tool_result" {
             if value.get("tool").and_then(Value::as_str) == Some("analyzeImage")
@@ -555,62 +922,107 @@ pub fn parse_events(raw: &[u8], model: &str, session_id: &str) -> Result<Value, 
                     .and_then(Value::as_str)
                     .is_some_and(|result| !result.trim().is_empty())
             {
-                successful_image_analysis = true;
-                image_analysis = value
+                self.successful_image_analysis = true;
+                self.image_analysis = value
                     .get("result")
                     .and_then(Value::as_str)
                     .map(str::to_string);
             }
             if value.get("status").and_then(Value::as_str) == Some("error") {
-                terminal_error = value
+                self.terminal_error = value
                     .get("error")
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .or_else(|| Some("CloudAgent 工具执行失败".into()));
-                continue;
+                return String::new();
             }
         }
         if event == "thought" {
             if let Some(s) = value.get("content").and_then(Value::as_str) {
-                reasoning.push_str(s);
+                self.reasoning.push_str(s);
             }
         }
         if event == "done" {
-            done = true;
-            usage = response_usage(&value);
+            self.done = true;
+            self.usage = response_usage(&value);
         }
         if event == "message" {
             if let Some(s) = value.get("content").and_then(Value::as_str) {
-                content.push_str(s);
+                self.content.push_str(s);
+                return s.to_string();
             }
         }
+        String::new()
     }
-    if let Some(error) = terminal_error.filter(|_| !successful_image_analysis) {
-        return Err(error);
-    }
-    if content.is_empty() {
-        if let Some(analysis) = image_analysis {
-            content = analysis;
-        } else {
-            return Err("CloudAgent 未返回文本内容；任务可能仍在处理或未完成".into());
+
+    /// 预测 `finish` 会不会失败，用于决定是否值得改走 ImageId 重试。
+    ///
+    /// 与 `finish` 同源但不消耗 `self`，因为后面还要继续用它。
+    fn preview_error(&self, _model: &str, _session_id: &str) -> Option<String> {
+        if let Some(error) = self
+            .terminal_error
+            .clone()
+            .filter(|_| !self.successful_image_analysis)
+        {
+            return Some(error);
         }
+        if self.content.is_empty() && self.image_analysis.is_none() {
+            return Some("CloudAgent 未返回文本内容；任务可能仍在处理或未完成".into());
+        }
+        if !self.done {
+            return Some("CloudAgent 任务在完成事件前结束，响应可能不完整".into());
+        }
+        None
     }
-    if !done {
-        return Err("CloudAgent 任务在完成事件前结束，响应可能不完整".into());
+
+    /// 收尾：与聚合路径完全一致的错误判定。
+    fn finish(mut self, model: &str, session_id: &str) -> Result<Value, String> {
+        if let Some(error) = self
+            .terminal_error
+            .clone()
+            .filter(|_| !self.successful_image_analysis)
+        {
+            return Err(error);
+        }
+        if self.content.is_empty() {
+            return match self.image_analysis.clone() {
+                Some(analysis) => {
+                    self.content = analysis;
+                    Ok(self.completion(model, session_id))
+                }
+                None => Err("CloudAgent 未返回文本内容；任务可能仍在处理或未完成".into()),
+            };
+        }
+        if !self.done {
+            return Err("CloudAgent 任务在完成事件前结束，响应可能不完整".into());
+        }
+        Ok(self.completion(model, session_id))
     }
-    let mut message = json!({"role": "assistant", "content": content});
-    if !reasoning.is_empty() {
-        message["reasoning_content"] = json!(reasoning);
+
+    fn completion(&self, model: &str, session_id: &str) -> Value {
+        let mut message = json!({"role": "assistant", "content": self.content});
+        if !self.reasoning.is_empty() {
+            message["reasoning_content"] = json!(self.reasoning);
+        }
+        json!({
+            "id": format!("chatcmpl-{session_id}"),
+            "object": "chat.completion",
+            "created": chrono::Utc::now().timestamp(),
+            "model": model,
+            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+            "usage": self.usage,
+            "codearts_channel": "cloudagent_attachments",
+        })
     }
-    Ok(json!({
-        "id": format!("chatcmpl-{session_id}"),
-        "object": "chat.completion",
-        "created": chrono::Utc::now().timestamp(),
-        "model": model,
-        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
-        "usage": usage,
-        "codearts_channel": "cloudagent_attachments",
-    }))
+}
+
+pub fn parse_events(raw: &[u8], model: &str, session_id: &str) -> Result<Value, String> {
+    let text = String::from_utf8_lossy(raw).replace("\r\n", "\n");
+    let mut acc = TaskAccumulator::default();
+    for block in text.split("\n\n") {
+        acc.feed(block);
+    }
+    acc.finish(model, session_id)
 }
 
 #[cfg(test)]

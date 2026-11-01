@@ -164,8 +164,8 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
         // 直接接口的视觉标记不覆盖 CloudAgent：优先保留用户选择的模型，
         // 通过网页附件链路处理图像，失败后才使用独立的视觉模型回退。
         if let Some(catalog) = pool.accounts_for(&requested_model).await.into_iter().next() {
-            match crate::cloudagent::prepare_session(&catalog).await {
-                Ok(session_id) => attachment_session = Some((catalog, session_id)),
+            match crate::cloudagent::open_session(&catalog).await {
+                Ok(session) => attachment_session = Some((catalog, session)),
                 Err(error) => println!(
                     "[cloudagent] {requested_model}: 附件通道不可用（{error}），尝试视觉模型回退"
                 ),
@@ -193,18 +193,18 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
         requested_model.clone()
     };
 
-    if let Some((catalog, session_id)) = attachment_session {
+    if let Some((catalog, session)) = attachment_session {
         println!("[cloudagent] {requested_model}: 使用附件 + CloudAgent 通道");
-        match crate::cloudagent::execute(
+        let outcome = crate::cloudagent::execute(
             state,
-            &catalog,
+            catalog.clone(),
             &requested_model,
             &req.body,
             req.stream,
-            &session_id,
+            session,
         )
-        .await
-        {
+        .await;
+        match outcome {
             Ok(outcome) => {
                 if let Some(key) = req.session_key.as_ref() {
                     state.pins.pin(key, catalog.account_id()).await;

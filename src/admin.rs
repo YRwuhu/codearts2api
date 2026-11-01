@@ -553,6 +553,20 @@ pub fn spawn_quota_refresher(state: WebState) {
     });
 }
 
+/// 启动时回收老版本泄漏的 CloudAgent 会话。
+///
+/// 0.5.3 之前每轮带图请求都会新建会话且从不关闭，上游每账号上限 3 个，
+/// 积满后带图请求全部回退视觉模型。这里在启动后清一次，只留 1 个空位。
+pub fn spawn_cloudagent_reclaimer(state: WebState) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+        let pool = state.pool.read().await.clone();
+        for catalog in pool.catalogs() {
+            crate::cloudagent::reclaim_sessions(&catalog, 1).await;
+        }
+    });
+}
+
 async fn refresh_all_quota(state: &WebState) -> usize {
     let cfg = state.config();
     let mut success = 0;

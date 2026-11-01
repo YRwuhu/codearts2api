@@ -133,12 +133,17 @@ CloudAgent；附件任务失败后才回退 `CODEARTS_VISION_MODEL`。纯文本�
 
 附件任务优先使用会话内的 base64 图像，必要时读取服务端注册的内部 `ImageId`，
 不混用上传 `attachment_id`。工具成功后直接回答，避免重复图像调用和循环保护。
-该路径已实测上述四个模型返回正确颜色，Kimi K2.6 VL 的直接图片回退也已验证。
 
-附件通道目前支持 PNG/JPEG/WebP/GIF 的 base64 `data:` URL，单图不超过
-20 MiB；远程图片 URL 需先下载后以 base64 发送。CloudAgent 任务耗时可能长于
-直接聊天请求，当前先等待任务完成再返回兼容的文本流，每次请求创建独立会话，
-仅提交最后一条用户消息的文字和本轮图片。
+附件通道支持 PNG/JPEG/WebP/GIF 的 base64 `data:` URL，单图不超过
+20 MiB；远程图片 URL 需先下载后以 base64 发送。每次请求创建独立会话，
+提交最后一条用户消息的文字和本轮图片，**用完立即 `DELETE` 释放**——
+上游每账号只允许 3 个并存会话，不回收的话第 4 次带图请求起就会被拒
+（`并发会话数已达上限(3个)`）。启动时还会清理旧版本遗留的会话。
+
+`stream: true` 时附件通道是**真流式**：先立刻回一帧 `role`，随后把
+CloudAgent 的 `event: message` 逐条转成 OpenAI `delta` 往下推，客户端
+首帧约 0.3 秒可见，不再是等整轮任务跑完才一次性吐出。`stream: false`
+仍返回聚合后的完整 `chat.completion`。
 
 `CODEARTS_VISION_MODEL` 可指定回退视觉模型，设为 `off` 则关闭回退。
 诊断结构日志 `CODEARTS_DEBUG_REQUEST_SHAPE=1` 只输出角色、block 类型、
