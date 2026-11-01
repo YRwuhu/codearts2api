@@ -140,7 +140,7 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
     let pool = state.pool.read().await.clone();
     pool.ensure_fresh();
 
-    let model = req
+    let requested_model = req
         .body
         .get("model")
         .and_then(|v| v.as_str())
@@ -148,11 +148,35 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
         .or(pool.first_model().await)
         .ok_or_else(|| ApiError::not_found("没有可用模型"))?;
 
-    if !pool.contains(&model).await {
+    if !pool.contains(&requested_model).await {
         return Err(ApiError::not_found(format!(
-            "model '{model}' 不在当前账号可用模型列表中"
+            "model '{requested_model}' 不在当前账号可用模型列表中"
         )));
     }
+
+    let has_images = req
+        .body
+        .as_object()
+        .map(params::has_image_input)
+        .unwrap_or(false);
+    let model = if has_images && !pool.supports_images(&requested_model).await {
+        let vision =
+            std::env::var("CODEARTS_VISION_MODEL").unwrap_or_else(|_| "kimi-k2.6-vl".to_string());
+        if vision.eq_ignore_ascii_case("off") {
+            return Err(ApiError::bad_request(format!(
+                "CodeArts 将模型 {requested_model} 注册为纯文本，不能发送图片；请配置 CODEARTS_VISION_MODEL 为视觉模型"
+            )));
+        }
+        if !pool.contains(&vision).await {
+            return Err(ApiError::bad_request(format!(
+                "模型 {requested_model} 不支持图片，且视觉模型 {vision} 尚未同步；请刷新模型目录或配置 CODEARTS_VISION_MODEL"
+            )));
+        }
+        println!("[vision] {requested_model} 不支持图片，改用 CodeArts 视觉模型 {vision}");
+        vision
+    } else {
+        requested_model
+    };
 
     req.body["model"] = json!(model);
 
@@ -444,6 +468,18 @@ async fn attempt(
     gate: std::sync::Arc<crate::concurrency::AccountGate>,
 ) -> Result<Attempt, ApiError> {
     let account_id = catalog.account_id().to_string();
+    if std::env::var("CODEARTS_DEBUG_REQUEST_SHAPE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        println!(
+            "[request-shape] {model} body_bytes={} chat_headers={} shape={}",
+            serde_json::to_vec(body).map(|b| b.len()).unwrap_or(0),
+            chat_id.is_some(),
+            params::request_shape(body.as_object().unwrap_or(&serde_json::Map::new()))
+        );
+    }
     let body_bytes = serde_json::to_vec(body)
         .map_err(|e| ApiError::bad_request(format!("序列化请求失败: {e}")))?;
 
@@ -734,6 +770,15 @@ fn classify_failure(status: StatusCode, code: &str, msg: &str) -> Attempt {
         };
     }
 
+    if msg.contains("model is not multimodal") {
+        return Attempt::Retry {
+            error: ApiError::bad_request(format!(
+                "模型拒绝了图片或多模态内容，请检查模型视觉能力与图片格式：{msg}"
+            )),
+            switch_account: false,
+        };
+    }
+
     if concurrency::is_concurrency_error(&text) {
         return Attempt::Retry {
             error: ApiError::new(
@@ -760,7 +805,8 @@ fn classify_failure(status: StatusCode, code: &str, msg: &str) -> Attempt {
     if code.contains("4004")
         || msg.contains("benefit not found")
         || msg.contains("not registered")
-        || msg.contains("model is not")
+        || msg.contains("model is not registered")
+        || msg.contains("model is not supported")
     {
         return Attempt::Retry {
             error: ApiError::not_found(format!("该账号无此模型：{msg}")),
@@ -774,6 +820,7 @@ fn classify_failure(status: StatusCode, code: &str, msg: &str) -> Attempt {
         401 => StatusCode::UNAUTHORIZED,
         403 => StatusCode::FORBIDDEN,
         404 => StatusCode::NOT_FOUND,
+        413 => StatusCode::PAYLOAD_TOO_LARGE,
         429 => StatusCode::TOO_MANY_REQUESTS,
         _ => StatusCode::BAD_GATEWAY,
     };
@@ -965,7 +1012,20 @@ fn business_stream_error(value: &Value) -> ApiError {
         .and_then(|e| e.get("message"))
         .and_then(|v| v.as_str())
         .unwrap_or("上游返回业务错误");
-    ApiError::new(StatusCode::BAD_GATEWAY, code, msg)
+    if msg.contains("model is not multimodal") {
+        return ApiError::bad_request(format!(
+            "模型拒绝了图片或多模态内容，请检查模型视觉能力与图片格式：{msg}"
+        ));
+    }
+    let status = StatusCode::from_u16(
+        code.rsplit('.')
+            .next()
+            .and_then(|suffix| suffix.parse::<u16>().ok())
+            .filter(|status| (400..=599).contains(status))
+            .unwrap_or(502),
+    )
+    .unwrap_or(StatusCode::BAD_GATEWAY);
+    ApiError::new(status, code, msg)
 }
 
 /// 构造 SSE 响应体（OpenAI 风格 `data: {...}\n\n`）。
@@ -1100,6 +1160,44 @@ mod tests {
         assert!(
             matches!(events.last(), Some(DecoderEvent::Complete(StreamCompletion { result: Err(e), .. })) if e.code == "upstream_network_error")
         );
+    }
+
+    #[test]
+    fn classifies_multimodal_and_payload_errors_without_failover() {
+        let multimodal = classify_failure(
+            StatusCode::OK,
+            "InferHub.001001005.400",
+            "The request model is not multimodal",
+        );
+        let Attempt::Retry {
+            error,
+            switch_account,
+        } = multimodal
+        else {
+            panic!("expected classified error");
+        };
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(!switch_account);
+
+        let large = classify_failure(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "",
+            "request entity too large",
+        );
+        let Attempt::Retry {
+            error,
+            switch_account,
+        } = large
+        else {
+            panic!("expected classified error");
+        };
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!switch_account);
+
+        let stream = business_stream_error(&json!({"error": {
+            "code": "InferHub.001001005.400", "message": "The request model is not multimodal"
+        }}));
+        assert_eq!(stream.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]

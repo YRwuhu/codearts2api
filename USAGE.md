@@ -105,6 +105,21 @@ Model    : deepseek-v4.1-flash
 
 实测同时 10 个请求全部成功。
 
+## 图片与视觉模型
+
+CodeArts 的模型能力以 `GET /v1/model/builtin`（`Agent-Type: PromptCenter`）为准，
+与模型厂商官方能力不一定相同。当前 `kimi-k3.1-pro` / `kimi-k3` 和
+`deepseek-v4.1-flash` 在该目录中注册为**文本生成**，不能据此认为 CodeArts
+已开放其图片输入。
+
+已实测 `kimi-k2.6-vl` 接受标准 `image_url` 嵌套格式和 base64 PNG。含图片的
+请求如果选择了纯文本模型，代理默认路由到 `kimi-k2.6-vl`；文本请求不改变
+用户选择的模型。响应中的模型 ID 以实际调用为准。
+
+可用 `CODEARTS_VISION_MODEL` 指定其他已注册的视觉模型，设为 `off` 则拒绝
+图片请求而不自动切换。诊断结构日志 `CODEARTS_DEBUG_REQUEST_SHAPE=1` 只输出
+角色、block 类型、图片 MIME/大小，不输出正文、base64 或凭证。
+
 ## 配置项
 
 在 exe 同目录创建 `.env` 可覆盖默认值：
@@ -122,6 +137,9 @@ CODEARTS_MAX_TOKENS_CAP=131072
 
 # 可选：自定义 usage.jsonl 路径
 # CODEARTS_USAGE_ARCHIVE=D:\tools\codearts2api\usage.jsonl
+
+# 含图片请求使用的 CodeArts 视觉模型（off 可关闭自动路由）
+CODEARTS_VISION_MODEL=kimi-k2.6-vl
 
 # 免费额度模型拿不到时是否仍列出兜底清单
 CODEARTS_BENEFIT_FALLBACK=0

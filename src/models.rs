@@ -23,6 +23,8 @@ pub const AGENT_LIST_URL: &str =
     "https://snap-access.cn-north-4.myhuaweicloud.com/v1/agent-center/agents/useragents?offset=0&limit=100";
 pub const AGENT_DETAIL_PATH: &str = "/v1/agent-center/agents/detail";
 pub const OPENGW_BASE: &str = "https://opengw.developer.huaweicloud.com";
+pub const MODEL_BUILTIN_URL: &str =
+    "https://snap-access.cn-north-4.myhuaweicloud.com/v1/model/builtin";
 pub const OPENGW_CONFIG_URL: &str =
     "https://opengw.developer.huaweicloud.com/api/v1/gateway/config";
 
@@ -64,8 +66,32 @@ fn default_channel() -> String {
     "agent".to_string()
 }
 
+/// CodeArts 的视觉能力按注册模型 ID，而非上游厂商模型能力判定。
+/// /v1/model/builtin 是权威来源；这里仅作目录同步失败时的保守兜底。
+fn supports_images(model_id: &str) -> bool {
+    model_id.eq_ignore_ascii_case("kimi-k2.6-vl") || model_id.eq_ignore_ascii_case("qwen3-vl-235b")
+}
+
+fn builtin_model_values(value: &Value) -> Vec<&Value> {
+    value
+        .get("builtinModels")
+        .and_then(|v| v.as_array())
+        .or_else(|| value.as_array())
+        .or_else(|| value.get("models").and_then(|v| v.as_array()))
+        .or_else(|| value.get("data").and_then(|v| v.as_array()))
+        .or_else(|| {
+            value
+                .get("data")
+                .and_then(|v| v.get("models"))
+                .and_then(|v| v.as_array())
+        })
+        .map(|items| items.iter().collect())
+        .unwrap_or_default()
+}
+
 impl ModelInfo {
     fn new(id: String, channel: &str) -> Self {
+        let supports_images = supports_images(&id);
         Self {
             name: Some(id.clone()),
             id,
@@ -75,7 +101,7 @@ impl ModelInfo {
             description: None,
             context_window: None,
             max_tokens: None,
-            supports_images: false,
+            supports_images,
         }
     }
 
@@ -266,12 +292,10 @@ impl Catalog {
             .and_then(|modified| SystemTime::now().duration_since(modified).ok())
             .filter(|age| *age < CACHE_TTL)
             .map(|_| std::time::Instant::now());
+        let models = cache.models;
+        // 缓存保留目录同步时的真实能力；新版本会追加已注册的视觉模型。
         let mut state = self.inner.write().await;
-        state.models = cache
-            .models
-            .into_iter()
-            .map(|m| (m.id.clone(), m))
-            .collect();
+        state.models = models.into_iter().map(|m| (m.id.clone(), m)).collect();
         if cached_at.is_some() {
             state.last_refresh = cached_at;
         }
@@ -418,6 +442,44 @@ impl Catalog {
         }
     }
 
+    /// PromptCenter 的模型目录提供实际注册的图片理解能力。
+    async fn refresh_builtin_models(&self) -> Vec<ModelInfo> {
+        let extra = [
+            ("agent-type", "PromptCenter"),
+            ("x-language", "zh-cn"),
+            ("accept", "application/json"),
+        ];
+        let Ok((200, text)) = self
+            .signed_send("GET", MODEL_BUILTIN_URL, b"", &extra)
+            .await
+        else {
+            return Vec::new();
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            return Vec::new();
+        };
+        builtin_model_values(&value)
+            .into_iter()
+            .filter_map(|model| {
+                let id = model.get("model_id")?.as_str()?;
+                let mut info = ModelInfo::new(id.to_string(), "agent");
+                info.name = model
+                    .get("model_name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                info.description = model
+                    .get("model_desc")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                info.supports_images = model
+                    .get("supports_images")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                Some(info)
+            })
+            .collect()
+    }
+
     /// 从 AgentCenter 同步真实模型列表。成功返回 true。
     pub async fn refresh(&self) -> bool {
         let _guard = self.refresh_lock.lock().await;
@@ -520,7 +582,7 @@ impl Catalog {
                 info.supports_images = params
                     .and_then(|p| p.get("supports_images"))
                     .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                    .unwrap_or_else(|| supports_images(model_id));
                 discovered.push(info);
             }
             if !discovered.is_empty() {
@@ -530,6 +592,15 @@ impl Catalog {
 
         if discovered.is_empty() {
             return false;
+        }
+
+        // AgentCenter 只列文本模型；PromptCenter 还包含已注册的图片理解模型。
+        for info in self.refresh_builtin_models().await {
+            if let Some(existing) = discovered.iter_mut().find(|m| m.id == info.id) {
+                existing.supports_images = info.supports_images;
+            } else if info.supports_images {
+                discovered.push(info);
+            }
         }
 
         // 免费模型不在 AgentCenter 列表里，从网关补；拿不到时按配置决定是否兜底。
@@ -608,6 +679,16 @@ impl Catalog {
 
     pub async fn model(&self, id: &str) -> Option<ModelInfo> {
         self.inner.read().await.models.get(id).cloned()
+    }
+
+    pub async fn supports_images(&self, model_id: &str) -> bool {
+        self.inner
+            .read()
+            .await
+            .models
+            .get(model_id)
+            .map(|m| m.supports_images)
+            .unwrap_or(false)
     }
 
     pub async fn is_agent_channel(&self, id: &str) -> bool {
@@ -740,6 +821,15 @@ impl Pool {
         None
     }
 
+    pub async fn supports_images(&self, model_id: &str) -> bool {
+        for catalog in &self.catalogs {
+            if catalog.contains(model_id).await {
+                return catalog.supports_images(model_id).await;
+            }
+        }
+        false
+    }
+
     pub async fn first_model(&self) -> Option<String> {
         for catalog in &self.catalogs {
             if let Some(id) = catalog.models().await.first().map(|m| m.id.clone()) {
@@ -767,6 +857,26 @@ impl Pool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn registered_vision_models_are_not_mislabeled() {
+        for id in ["kimi-k2.6-vl", "Qwen3-VL-235B"] {
+            assert!(ModelInfo::new(id.to_string(), "agent").supports_images);
+        }
+        for id in [
+            "kimi-k3.1-pro",
+            "deepseek-v4.1-flash",
+            "deepseek-v4.1-flash-1017",
+        ] {
+            assert!(!ModelInfo::new(id.to_string(), "agent").supports_images);
+        }
+    }
+
+    #[test]
+    fn parses_builtin_model_shapes() {
+        let value = json!({"builtinModels": [{"model_id": "kimi-k2.6-vl"}]});
+        assert_eq!(builtin_model_values(&value).len(), 1);
+    }
+
     #[tokio::test]
     async fn fresh_cache_replaces_builtin_fallback_models() {
         let dir = std::env::temp_dir().join(format!("ca2a-cache-test-{}", std::process::id()));
@@ -775,7 +885,7 @@ mod tests {
         let path = dir.join("models.json");
         let cache = CacheFile {
             updated_at: chrono::Utc::now().timestamp(),
-            models: vec![ModelInfo::new("cached-model".to_string(), "agent")],
+            models: vec![ModelInfo::new("kimi-k2.6-vl".to_string(), "agent")],
         };
         tokio::fs::write(&path, serde_json::to_vec(&cache).unwrap())
             .await
@@ -787,9 +897,10 @@ mod tests {
             reqwest::Client::new(),
         );
         catalog.load_cache().await;
-        assert!(catalog.contains("cached-model").await);
+        assert!(catalog.contains("kimi-k2.6-vl").await);
         assert!(!catalog.contains(FALLBACK_AGENT_MODELS[0]).await);
         assert!(catalog.is_fresh());
+        assert!(catalog.model("kimi-k2.6-vl").await.unwrap().supports_images);
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

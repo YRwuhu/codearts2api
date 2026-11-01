@@ -76,6 +76,8 @@ fn print_help() {
   CODEARTS_DAILY_TOKEN_CAP      每账号每日 token 上限，0 = 不限制
   CODEARTS_BENEFIT_FALLBACK     1 = 免费模型拿不到时仍暴露兜底列表
   CODEARTS_MODEL_CACHE          模型缓存路径，默认与 .env 同目录
+  CODEARTS_VISION_MODEL         图片请求使用的视觉模型，默认 kimi-k2.6-vl，off 关闭自动路由
+  CODEARTS_DEBUG_REQUEST_SHAPE  1 = 记录脱敏的图片结构，不记录正文或凭证
 "#
     );
 }

@@ -83,6 +83,76 @@ pub fn normalize_roles(body: &mut Map<String, Value>) {
     }
 }
 
+pub fn has_image_input(body: &Map<String, Value>) -> bool {
+    body.get("messages")
+        .and_then(|v| v.as_array())
+        .map(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(|v| v.as_array())
+                    .map(|parts| {
+                        parts.iter().any(|part| {
+                            matches!(
+                                part.get("type").and_then(|v| v.as_str()),
+                                Some("image_url" | "input_image" | "image")
+                            )
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 只记录多模态消息结构，绝不输出提示词、base64 或凭证。
+pub fn request_shape(body: &Map<String, Value>) -> Value {
+    let messages = body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .map(|messages| {
+            messages
+                .iter()
+                .map(|message| {
+                    let role = message.get("role").cloned().unwrap_or(Value::Null);
+                    let content = match message.get("content") {
+                        Some(Value::Array(parts)) => Value::Array(
+                            parts
+                                .iter()
+                                .map(|part| {
+                                    let mut shape = serde_json::json!({
+                                        "type": part.get("type").cloned().unwrap_or(Value::Null),
+                                        "fields": part.as_object().map(|o| o.keys().collect::<Vec<_>>()),
+                                    });
+                                    if let Some(url) = part
+                                        .get("image_url")
+                                        .and_then(|v| v.get("url"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        let data = url.split_once(',').map(|(_, d)| d).unwrap_or("");
+                                        shape["image"] = serde_json::json!({
+                                            "scheme": url.split(':').next().unwrap_or(""),
+                                            "mime": url.split(';').next().unwrap_or(""),
+                                            "data_chars": data.len(),
+                                            "url": if url.starts_with("data:") { Value::Null } else { Value::String(url.split('?').next().unwrap_or("").to_string()) },
+                                        });
+                                    }
+                                    shape
+                                })
+                                .collect(),
+                        ),
+                        Some(Value::String(_)) => serde_json::json!("text"),
+                        Some(other) => serde_json::json!({"type": other.as_str().map(|_| "text")}),
+                        None => Value::Null,
+                    };
+                    serde_json::json!({"role": role, "content": content})
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({"messages": messages})
+}
+
 /// 上游是否把错误塞进了 HTTP 200。
 pub fn is_business_error(value: &Value) -> bool {
     value.get("error_code").is_some() || value.get("error_msg").is_some()
@@ -167,6 +237,16 @@ mod tests {
         let mut b = body(json!({"reasoning": {"effort": "max"}}));
         normalize_params(&mut b, 65536);
         assert!(b.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn detects_images_only_in_structured_content() {
+        let text = body(json!({"messages":[{"role":"user","content":"image_url"}]}));
+        assert!(!has_image_input(&text));
+        let image = body(json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}
+        ]}]}));
+        assert!(has_image_input(&image));
     }
 
     #[test]
