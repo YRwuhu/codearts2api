@@ -23,6 +23,10 @@ pub fn router(state: AppState) -> Router {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // axum 的 Bytes 提取器默认只收 2 MB，贴大段代码/日志会被本地 413 拦掉
+    // （根本到不了上游）。这里按配置放宽。
+    let body_limit = axum::extract::DefaultBodyLimit::max(state.config().max_body_bytes);
+
     Router::new()
         .route("/v1/models", get(list_models).options(preflight))
         .route("/v1/models/{*model_id}", get(get_model).options(preflight))
@@ -36,6 +40,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/messages/count_tokens",
             post(anthropic_count_tokens).options(preflight),
         )
+        .layer(body_limit)
         .layer(cors)
         .merge(crate::admin::router())
         .merge(crate::web::router())

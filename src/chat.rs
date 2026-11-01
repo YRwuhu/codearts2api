@@ -159,7 +159,26 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
         .as_object()
         .map(params::has_image_input)
         .unwrap_or(false);
-    let model = if has_images && !pool.supports_images(&requested_model).await {
+    let mut attachment_session = None;
+    if has_images
+        && !pool.supports_images(&requested_model).await
+        && std::env::var("CODEARTS_CLOUDAGENT_ATTACHMENTS")
+            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+    {
+        // supports_images 仅表示直接聊天接口接受内嵌图片；网页版还可以通过
+        // 附件 + CloudAgent 会话处理图片。实验通道显式开启，失败自动回退。
+        if let Some(catalog) = pool.accounts_for(&requested_model).await.into_iter().next() {
+            match crate::cloudagent::prepare_session(&catalog).await {
+                Ok(session_id) => attachment_session = Some((catalog, session_id)),
+                Err(error) => println!(
+                    "[cloudagent] {requested_model}: 附件通道不可用（{error}），尝试视觉模型回退"
+                ),
+            }
+        }
+    }
+    let mut model = if attachment_session.is_some() {
+        requested_model.clone()
+    } else if has_images && !pool.supports_images(&requested_model).await {
         let vision =
             std::env::var("CODEARTS_VISION_MODEL").unwrap_or_else(|_| "kimi-k2.6-vl".to_string());
         if vision.eq_ignore_ascii_case("off") {
@@ -175,8 +194,50 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
         println!("[vision] {requested_model} 不支持图片，改用 CodeArts 视觉模型 {vision}");
         vision
     } else {
-        requested_model
+        requested_model.clone()
     };
+
+    if let Some((catalog, session_id)) = attachment_session {
+        println!("[cloudagent] {requested_model}: 使用附件 + CloudAgent 通道");
+        match crate::cloudagent::execute(
+            state,
+            &catalog,
+            &requested_model,
+            &req.body,
+            req.stream,
+            &session_id,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                if let Some(key) = req.session_key.as_ref() {
+                    state.pins.pin(key, catalog.account_id()).await;
+                }
+                return Ok(outcome);
+            }
+            Err(error) if error.code == "cloudagent_invalid_input" => return Err(error),
+            Err(error) => {
+                println!(
+                    "[cloudagent] {requested_model}: 任务失败（{}），回退视觉模型",
+                    error.message
+                );
+                if has_images && !pool.supports_images(&requested_model).await {
+                    let vision = std::env::var("CODEARTS_VISION_MODEL")
+                        .unwrap_or_else(|_| "kimi-k2.6-vl".to_string());
+                    if vision.eq_ignore_ascii_case("off") {
+                        return Err(error);
+                    }
+                    if !pool.contains(&vision).await {
+                        return Err(ApiError::bad_request(format!(
+                            "附件任务失败，且视觉模型 {vision} 尚未同步：{}",
+                            error.message
+                        )));
+                    }
+                    model = vision;
+                }
+            }
+        }
+    }
 
     req.body["model"] = json!(model);
 
@@ -544,7 +605,7 @@ async fn attempt(
             .to_string();
         println!(
             "[{account_id}] {model}: 上游 HTTP {status} {code} {}",
-            &msg[..msg.len().min(200)]
+            msg.chars().take(200).collect::<String>()
         );
         return Ok(classify_failure(status, &code, &msg));
     }

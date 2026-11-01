@@ -127,15 +127,20 @@
     const badge = $('#poolBadge');
     if (badge) {
       const enabled = summary.enabled_count || 0;
-      badge.textContent = enabled > 1 ? ('多账号 · ' + enabled + ' 个启用') : '单账号';
-      badge.className = 'mx-badge ' + (enabled > 1 ? 'mx-badge-success' : '');
+      if (enabled === 0) {
+        badge.textContent = '待登录';
+        badge.className = 'mx-badge mx-badge-error';
+      } else {
+        badge.textContent = enabled > 1 ? ('多账号 · ' + enabled + ' 个启用') : '单账号';
+        badge.className = 'mx-badge ' + (enabled > 1 ? 'mx-badge-success' : '');
+      }
     }
 
     // 概览页账号表
     const tbody = $('#overviewAccounts');
     if (tbody) {
       if (!state.accounts.length) {
-        tbody.innerHTML = '<tr><td colspan="4" class="empty-cell">暂无账号</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="4" class="empty-cell">还没有账号 —— 去「账号」页点「登录华为云」完成首次登录</td></tr>';
       } else {
         tbody.innerHTML = state.accounts.map((a) => `
           <tr>
@@ -174,7 +179,7 @@
     const tbody = $('#accountRows');
     if (!tbody) return;
     if (!state.accounts.length) {
-      tbody.innerHTML = '<tr><td colspan="5" class="empty-cell">还没有账号，点击右上角"添加账号"</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" class="empty-cell">还没有账号，点击上方「登录华为云」扫码登录即可</td></tr>';
       return;
     }
     const health = (state.status && state.status.health) || {};

@@ -1,26 +1,10 @@
-mod admin;
-mod anthropic;
-mod api;
-mod chat;
-mod checkin;
-mod concurrency;
-mod config;
-mod models;
-mod oauth;
-mod params;
-mod quota;
-mod responses;
-mod signer;
-mod stream;
-mod usage;
-mod web;
+pub use codearts2api::config::Config;
+pub use codearts2api::models::Pool;
+use codearts2api::*;
 
 use std::process::ExitCode;
 
-use config::Config;
-use models::Pool;
-
-fn main() -> ExitCode {
+pub fn run() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("serve");
 
@@ -74,6 +58,7 @@ fn print_help() {
   CODEARTS_STREAM_DEGRADE       名额用完时降级非流式，默认 0（关）
   CODEARTS_CONCURRENCY          本地在途流式请求上限，默认 8
   CODEARTS_DAILY_TOKEN_CAP      每账号每日 token 上限，0 = 不限制
+  CODEARTS_MAX_BODY_MB          单请求体上限（MB），默认 32；贴大段代码/日志时调大
   CODEARTS_BENEFIT_FALLBACK     1 = 免费模型拿不到时仍暴露兜底列表
   CODEARTS_MODEL_CACHE          模型缓存路径，默认与 .env 同目录
   CODEARTS_VISION_MODEL         图片请求使用的视觉模型，默认 kimi-k2.6-vl，off 关闭自动路由
@@ -149,12 +134,20 @@ fn serve() -> ExitCode {
         let account_count = pool.catalogs().len();
         println!("CodeArts OpenAI 兼容代理已启动: http://{addr}");
         println!("OpenAI Base URL: http://{addr}/v1");
-        println!(
-            "账号数: {account_count}，合并可用模型 {} 个: {merged:?}",
-            merged.len()
-        );
-        if account_count > 1 {
-            println!("多账号已启用：失败时按配置顺序自动切换");
+        if account_count == 0 {
+            println!();
+            println!("⚠ 还没有可用账号。请打开管理界面登录：");
+            println!("    http://{addr}/#accounts");
+            println!("    点「登录华为云」扫码登录一次即可，无需填写 AK/SK。");
+            println!();
+        } else {
+            println!(
+                "账号数: {account_count}，合并可用模型 {} 个: {merged:?}",
+                merged.len()
+            );
+            if account_count > 1 {
+                println!("多账号已启用：失败时按配置顺序自动切换");
+            }
         }
         println!("管理界面: http://{addr}/");
         println!("按 Ctrl+C 停止");
@@ -184,6 +177,10 @@ fn accounts_cmd() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Err(e) = cfg.require_accounts() {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
     let rt = match build_runtime() {
         Ok(r) => r,
         Err(e) => {
@@ -247,6 +244,10 @@ fn models_cmd() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Err(e) = cfg.require_accounts() {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
     let rt = match build_runtime() {
         Ok(r) => r,
         Err(e) => {
@@ -280,6 +281,10 @@ fn benefit_cmd(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Err(e) = cfg.require_accounts() {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
 
     // 可选第二个参数指定账号；未指定时用第一个启用账号
     let target = args.get(1).map(|s| s.as_str()).filter(|s| !s.is_empty());

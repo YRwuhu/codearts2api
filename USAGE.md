@@ -17,10 +17,14 @@
 codearts2api.exe serve
 ```
 
-首次启动会生成 `.env` 和 `accounts.json`（如果不存在）。看到下面这行就说明起来了：
+首次启动**不需要任何账号**，直接起来再登录即可。看到下面这几行就说明起来了：
 
 ```
 CodeArts OpenAI 兼容代理已启动: http://127.0.0.1:8787
+
+⚠ 还没有可用账号。请打开管理界面登录：
+    http://127.0.0.1:8787/#accounts
+
 管理界面: http://127.0.0.1:8787/
 ```
 
@@ -107,18 +111,36 @@ Model    : deepseek-v4.1-flash
 
 ## 图片与视觉模型
 
-CodeArts 的模型能力以 `GET /v1/model/builtin`（`Agent-Type: PromptCenter`）为准，
-与模型厂商官方能力不一定相同。当前 `kimi-k3.1-pro` / `kimi-k3` 和
-`deepseek-v4.1-flash` 在该目录中注册为**文本生成**，不能据此认为 CodeArts
-已开放其图片输入。
+CodeArts 有两条图片调用路径，能力标记不能混用：
 
-已实测 `kimi-k2.6-vl` 接受标准 `image_url` 嵌套格式和 base64 PNG。含图片的
-请求如果选择了纯文本模型，代理默认路由到 `kimi-k2.6-vl`；文本请求不改变
-用户选择的模型。响应中的模型 ID 以实际调用为准。
+- `/api/v2/chat/completions` 的内嵌图片能力以 `GET /v1/model/builtin`
+  （`Agent-Type: PromptCenter`）中的 `supports_images` 为准。该字段为 `false`
+  只表示这条直接聊天接口拒绝图片，不代表整个 CodeArts 不支持图片。
+- 网页版使用附件 + CloudAgent 会话：先上传图片获得 `attachment_id`，再提交
+  带附件上下文和 `agent: build` 的会话任务。DeepSeek 任务通过图像分析工具
+  处理图片；这条链路同样使用现有 OAuth/AK/SK 凭证，不需要浏览器 Cookie。
 
-可用 `CODEARTS_VISION_MODEL` 指定其他已注册的视觉模型，设为 `off` 则拒绝
-图片请求而不自动切换。诊断结构日志 `CODEARTS_DEBUG_REQUEST_SHAPE=1` 只输出
-角色、block 类型、图片 MIME/大小，不输出正文、base64 或凭证。
+`deepseek-v4.1-flash-1017` 原生具备图像理解能力，但直接聊天接口会返回
+`The request model is not multimodal`。代理已验证网页同款附件协议可复用现有
+OAuth/AK/SK：上传图片、创建会话和提交 DeepSeek 任务均成功，并有真实读图
+返回。但 CloudAgent 的内部 `ImageId` 与上传 `attachment_id` 不同，映射偶尔
+未被图像工具接受，因此该通道暂标为**实验功能**，默认不启用。
+
+含图请求默认按以下顺序处理：直接接口支持的模型走原路径；否则回退到
+`CODEARTS_VISION_MODEL`。纯文本请求始终走原路径。设置
+`CODEARTS_CLOUDAGENT_ATTACHMENTS=1` 可在直接接口不支持的模型上优先尝试
+附件 + CloudAgent；该通道失败时仍回退视觉模型。模型目录的
+`supports_images` 不会被改成 `true`；`supports_attachments` 为实验能力标记，
+默认 `false`，打开开关只影响路由、不改模型厂商元数据。
+
+附件通道目前支持 PNG/JPEG/WebP/GIF 的 base64 `data:` URL，单图不超过
+20 MiB；远程图片 URL 需先下载后以 base64 发送。CloudAgent 任务耗时可能长于
+直接聊天请求，当前先等待任务完成再返回兼容的文本流，每次请求创建独立会话，
+仅提交最后一条用户消息的文字和本轮图片。
+
+`CODEARTS_VISION_MODEL` 可指定回退视觉模型，设为 `off` 则关闭回退。
+诊断结构日志 `CODEARTS_DEBUG_REQUEST_SHAPE=1` 只输出角色、block 类型、
+图片 MIME/大小，不输出正文、base64 或凭证。
 
 ## 配置项
 
@@ -140,6 +162,9 @@ CODEARTS_MAX_TOKENS_CAP=131072
 
 # 含图片请求使用的 CodeArts 视觉模型（off 可关闭自动路由）
 CODEARTS_VISION_MODEL=kimi-k2.6-vl
+
+# 实验：优先尝试网页附件 + CloudAgent 通道（失败仍回退视觉模型）
+CODEARTS_CLOUDAGENT_ATTACHMENTS=0
 
 # 免费额度模型拿不到时是否仍列出兜底清单
 CODEARTS_BENEFIT_FALLBACK=0

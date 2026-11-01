@@ -99,8 +99,11 @@ impl Identity {
         if !self.user_name.is_empty() {
             return self.user_name.clone();
         }
-        if self.user_id.len() > 8 {
-            return format!("{}****", &self.user_id[..8]);
+        // 按字符截取：user_id 可能含非 ASCII 字符，按字节切会 panic。
+        let chars: Vec<char> = self.user_id.chars().collect();
+        if chars.len() > 8 {
+            let head: String = chars[..8].iter().collect();
+            return format!("{head}****");
         }
         if self.user_id.is_empty() {
             "未命名账号".to_string()

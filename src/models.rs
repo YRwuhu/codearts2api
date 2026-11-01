@@ -57,6 +57,9 @@ pub struct ModelInfo {
     pub max_tokens: Option<i64>,
     #[serde(default)]
     pub supports_images: bool,
+    /// 是否尝试网页附件 + CloudAgent 会话通道；不代表内部图片映射已完成。
+    #[serde(default)]
+    pub supports_attachments: bool,
 }
 
 fn default_object() -> String {
@@ -66,8 +69,9 @@ fn default_channel() -> String {
     "agent".to_string()
 }
 
-/// CodeArts 的视觉能力按注册模型 ID，而非上游厂商模型能力判定。
-/// /v1/model/builtin 是权威来源；这里仅作目录同步失败时的保守兜底。
+/// 仅表示 `/api/v2/chat/completions` 接受内嵌图片的能力。
+/// 网页附件 + CloudAgent 会话是另一条链路，不能用此字段否定其图片能力。
+/// /v1/model/builtin 是该直接聊天能力的权威来源；这里仅作目录同步失败时的保守兜底。
 fn supports_images(model_id: &str) -> bool {
     model_id.eq_ignore_ascii_case("kimi-k2.6-vl") || model_id.eq_ignore_ascii_case("qwen3-vl-235b")
 }
@@ -102,6 +106,7 @@ impl ModelInfo {
             context_window: None,
             max_tokens: None,
             supports_images,
+            supports_attachments: false,
         }
     }
 
@@ -116,6 +121,8 @@ impl ModelInfo {
             "supports_images": self.supports_images,
             "vision": self.supports_images,
             "supports_vision": self.supports_images,
+            "supports_attachments": self.supports_attachments && std::env::var("CODEARTS_CLOUDAGENT_ATTACHMENTS")
+                .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")),
             "supports_function_calling": true,
             "supports_tool_calling": true,
             "supports_reasoning": true,
@@ -387,6 +394,29 @@ impl Catalog {
         }
     }
 
+    /// 为附件等其他 CodeArts 端点签名，复用当前账号凭证与续期语义。
+    pub async fn signed_request(
+        &self,
+        method: &str,
+        url: &str,
+        body: &[u8],
+        extra: &[(&str, &str)],
+    ) -> Vec<(String, String)> {
+        let account = self.account().await;
+        let signer = Signer::new(&account.ak, &account.sk);
+        if account.is_oauth() {
+            signer
+                .sign_full(method, url, body, extra, account.security_token())
+                .headers
+        } else {
+            signer.sign(method, url, body, extra).headers
+        }
+    }
+
+    pub fn http_client(&self) -> reqwest::Client {
+        self.http.clone()
+    }
+
     /// 从 opengw 免费额度网关取模型列表；失败返回空。
     async fn refresh_benefit_models(&self) -> Vec<ModelInfo> {
         match self
@@ -431,7 +461,7 @@ impl Catalog {
                 eprintln!(
                     "[{}] 免费模型列表同步失败（HTTP {status}）: {}",
                     self.id,
-                    &text[..text.len().min(200)]
+                    text.chars().take(200).collect::<String>()
                 );
                 Vec::new()
             }
@@ -720,7 +750,13 @@ impl Pool {
         wait_for_refresh: bool,
     ) -> Result<Self, String> {
         let mut catalogs = Vec::new();
+        let mut placeholders = Vec::new();
         for account in cfg.accounts.iter().filter(|a| a.enabled) {
+            if account.looks_like_placeholder() {
+                // 汇总到最后的错误里统一提示，这里只登记，不重复刷屏。
+                placeholders.push(account.id.clone());
+                continue;
+            }
             let resolved = match crate::admin::resolve_account(&http, &cfg.env_dir, account).await {
                 Ok(a) => a,
                 Err(e) => {
@@ -745,7 +781,22 @@ impl Pool {
             catalogs.push(catalog);
         }
         if catalogs.is_empty() {
-            return Err("没有任何账号能成功初始化（OAuth 账号可能需要重新登录）".to_string());
+            // 占位符账号是「还没配置真实凭证」，和凭证失效不是一回事。
+            if !placeholders.is_empty()
+                && placeholders.len() == cfg.accounts.iter().filter(|a| a.enabled).count()
+            {
+                return Err(format!(
+                    "账号 {} 的 AK/SK 还是示例占位符：请填入真实密钥，\
+                     或启动 serve 后在 WebUI 点「登录华为云」",
+                    placeholders.join(", ")
+                ));
+            }
+            // 零账号是首次使用的正常状态（等着从 WebUI 走 OAuth），
+            // 但"配了账号却一个都初始化不了"是真错误。
+            if cfg.accounts.iter().any(|a| a.enabled) {
+                return Err("没有任何账号能成功初始化（OAuth 账号可能需要重新登录）".to_string());
+            }
+            return Ok(Self::new(Vec::new()));
         }
         Ok(Self::new(catalogs))
     }

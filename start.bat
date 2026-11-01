@@ -15,10 +15,14 @@ if not exist "%EXE%" (
 
 set "ENVFILE=.env"
 if not exist "%ENVFILE%" (
-    echo [ERROR] .env not found at %ENVFILE%
-    echo         Copy .env.example to .env and fill CODEARTS_AK / CODEARTS_SK.
-    pause
-    exit /b 1
+    echo [INFO] .env not found - creating a minimal one.
+    echo         No account needed: log in from the web panel after startup.
+    > "%ENVFILE%" (
+        echo # Created by start.bat on first run.
+        echo # Leave AK/SK empty and log in from the web panel instead.
+        echo CODEARTS_PROXY_HOST=127.0.0.1
+        echo CODEARTS_PROXY_PORT=8787
+    )
 )
 
 set "PORT=8787"
@@ -41,6 +45,7 @@ echo ============================================
 echo  CodeArts2API (Rust)  OpenAI-compatible proxy
 echo  Base URL : http://127.0.0.1:%PORT%/v1
 echo  API Key  : codearts  (any non-empty string)
+echo  Web UI   : http://127.0.0.1:%PORT%/   (log in here on first run)
 echo ============================================
 echo.
 

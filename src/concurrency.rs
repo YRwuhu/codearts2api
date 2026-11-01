@@ -369,6 +369,10 @@ impl SessionPins {
         let guard = self.inner.lock().await;
         guard.len()
     }
+
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
 }
 
 /// **账号级**上游会话 ID。

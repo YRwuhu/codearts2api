@@ -257,7 +257,10 @@ pub async fn fetch_quota(
     if !status.is_success() {
         return Quota {
             ok: false,
-            error: Some(format!("HTTP {status}: {}", &text[..text.len().min(200)])),
+            error: Some(format!(
+                "HTTP {status}: {}",
+                text.chars().take(200).collect::<String>()
+            )),
             fetched_at: chrono::Utc::now().timestamp(),
             ..Default::default()
         };

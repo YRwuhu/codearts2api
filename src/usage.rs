@@ -190,6 +190,10 @@ impl UsageStore {
         self.records.lock().await.len()
     }
 
+    pub async fn is_empty(&self) -> bool {
+        self.records.lock().await.is_empty()
+    }
+
     /// 汇总：总体 + 按模型 + 按账号 + 时间序列。
     /// `since_ts` 为 0 表示全部时间。
     pub async fn summarize(&self, since_ts: i64, bucket: &str) -> Value {
