@@ -3,7 +3,6 @@ pub mod anthropic;
 pub mod api;
 pub mod chat;
 pub mod checkin;
-pub mod cloudagent;
 pub mod concurrency;
 pub mod config;
 pub mod models;

@@ -6,7 +6,7 @@
 //!
 //! 多账号场景下每个账号各持一个 `Catalog`，由 `Pool` 负责合并与故障切换。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -55,11 +55,14 @@ pub struct ModelInfo {
     pub context_window: Option<i64>,
     #[serde(default)]
     pub max_tokens: Option<i64>,
+    /// 是否可把图片直接内嵌进 `/api/v2/chat/completions`。
+    ///
+    /// 这一项不能只信上游目录：`/v1/model/builtin` 与 AgentCenter 的
+    /// `supports_images` 只描述 IDE 的图片注入链路，对原生多模态模型会误报
+    /// `false`（2026-11 实测 deepseek-v4.1 系列仍报 false，但直连接口能读图）。
+    /// 因此能力判定要合并「实测 allowlist + 上游标记 + 运行时观察」。
     #[serde(default)]
     pub supports_images: bool,
-    /// 可通过网页附件 + CloudAgent 会话处理图片，独立于直接内嵌图片能力。
-    #[serde(default = "default_true")]
-    pub supports_attachments: bool,
 }
 
 fn default_object() -> String {
@@ -69,15 +72,39 @@ fn default_channel() -> String {
     "agent".to_string()
 }
 
-fn default_true() -> bool {
-    true
-}
+/// 实测可以直接读图的模型（`image_url` + base64 data URL 发进
+/// `/api/v2/chat/completions`）。名单按 2026-11 的实测结果维护，
+/// 这是 `/v1/models` 能力展示的主要依据，也是已知纯文本模型的快速路径。
+///
+/// 新模型不需要等发版：未登记模型第一次带图会先尝试原生，成功即自动学习；
+/// 也可以用 `CODEARTS_EXTRA_VISION_MODELS`（逗号分隔）临时追加。
+pub const NATIVE_VISION_MODELS: [&str; 8] = [
+    "deepseek-v4.1-flash",
+    "deepseek-v4.1-flash-1017",
+    "kimi-k3",
+    "kimi-k3.1-pro",
+    "glm-5.3-flash",
+    "speed",
+    "qwen3-vl-235b",
+    "kimi-k2.6-vl",
+];
 
-/// 仅表示 `/api/v2/chat/completions` 接受内嵌图片的能力。
-/// 网页附件 + CloudAgent 会话是另一条链路，不能用此字段否定其图片能力。
-/// /v1/model/builtin 是该直接聊天能力的权威来源；这里仅作目录同步失败时的保守兜底。
-fn supports_images(model_id: &str) -> bool {
-    model_id.eq_ignore_ascii_case("kimi-k2.6-vl") || model_id.eq_ignore_ascii_case("qwen3-vl-235b")
+/// 模型是否被认定为可直接读图。
+pub fn native_vision(model_id: &str) -> bool {
+    if NATIVE_VISION_MODELS
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case(model_id))
+    {
+        return true;
+    }
+    std::env::var("CODEARTS_EXTRA_VISION_MODELS")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .any(|m| !m.is_empty() && m.eq_ignore_ascii_case(model_id))
+        })
+        .unwrap_or(false)
 }
 
 fn builtin_model_values(value: &Value) -> Vec<&Value> {
@@ -99,7 +126,7 @@ fn builtin_model_values(value: &Value) -> Vec<&Value> {
 
 impl ModelInfo {
     fn new(id: String, channel: &str) -> Self {
-        let supports_images = supports_images(&id);
+        let supports_images = native_vision(&id);
         Self {
             name: Some(id.clone()),
             id,
@@ -110,7 +137,6 @@ impl ModelInfo {
             context_window: None,
             max_tokens: None,
             supports_images,
-            supports_attachments: true,
         }
     }
 
@@ -125,7 +151,6 @@ impl ModelInfo {
             "supports_images": self.supports_images,
             "vision": self.supports_images,
             "supports_vision": self.supports_images,
-            "supports_attachments": self.supports_attachments,
             "supports_function_calling": true,
             "supports_tool_calling": true,
             "supports_reasoning": true,
@@ -303,9 +328,16 @@ impl Catalog {
             .filter(|age| *age < CACHE_TTL)
             .map(|_| std::time::Instant::now());
         let models = cache.models;
-        // 缓存保留目录同步时的真实能力；新版本会追加已注册的视觉模型。
+        // 缓存保留目录同步时的能力，但实测 allowlist 必须能覆盖旧缓存里的
+        // `supports_images=false`（否则升级后的第一次启动还会误报纯文本）。
         let mut state = self.inner.write().await;
-        state.models = models.into_iter().map(|m| (m.id.clone(), m)).collect();
+        state.models = models
+            .into_iter()
+            .map(|mut model| {
+                model.supports_images |= native_vision(&model.id);
+                (model.id.clone(), model)
+            })
+            .collect();
         if cached_at.is_some() {
             state.last_refresh = cached_at;
         }
@@ -504,10 +536,11 @@ impl Catalog {
                     .get("model_desc")
                     .and_then(|v| v.as_str())
                     .map(str::to_string);
-                info.supports_images = model
-                    .get("supports_images")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                info.supports_images = native_vision(id)
+                    || model
+                        .get("supports_images")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                 Some(info)
             })
             .collect()
@@ -612,10 +645,11 @@ impl Catalog {
                     // 上游 model_parameters.max_tokens 恒为 65536，但真实校验器
                     // 允许到 131072。以校验器为准，见 params::UPSTREAM_MAX_OUTPUT_TOKENS。
                     .map(|v| v.max(crate::params::UPSTREAM_MAX_OUTPUT_TOKENS));
-                info.supports_images = params
-                    .and_then(|p| p.get("supports_images"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or_else(|| supports_images(model_id));
+                info.supports_images = native_vision(model_id)
+                    || params
+                        .and_then(|p| p.get("supports_images"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                 discovered.push(info);
             }
             if !discovered.is_empty() {
@@ -630,7 +664,8 @@ impl Catalog {
         // AgentCenter 只列文本模型；PromptCenter 还包含已注册的图片理解模型。
         for info in self.refresh_builtin_models().await {
             if let Some(existing) = discovered.iter_mut().find(|m| m.id == info.id) {
-                existing.supports_images = info.supports_images;
+                // PromptCenter 的旧标记可能是 false，不能把实测能力覆盖掉。
+                existing.supports_images |= info.supports_images;
             } else if info.supports_images {
                 discovered.push(info);
             }
@@ -739,11 +774,19 @@ impl Catalog {
 #[derive(Clone)]
 pub struct Pool {
     catalogs: Vec<Arc<Catalog>>,
+    /// 运行时观察到的原生识图能力：`true` = 成功读过图，`false` = 上游 406 拒绝。
+    ///
+    /// 只存在进程内：用于避免每个带图请求都多付一次 406 往返，也让
+    /// `/v1/models` 能反映实测结果。模型能力是全局的，不按账号区分。
+    vision_observed: Arc<tokio::sync::RwLock<HashMap<String, bool>>>,
 }
 
 impl Pool {
     pub fn new(catalogs: Vec<Arc<Catalog>>) -> Self {
-        Self { catalogs }
+        Self {
+            catalogs,
+            vision_observed: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        }
     }
 
     /// 缓存优先构建账号池；CLI 可选择等待同步完成。
@@ -840,7 +883,15 @@ impl Pool {
                 }
             }
         }
-        merged.into_values().collect()
+        // 运行时观察优先于目录标记：新模型第一次读图成功后立刻在 /v1/models 生效。
+        let hints = self.vision_observed.read().await;
+        let mut models: Vec<ModelInfo> = merged.into_values().collect();
+        for model in models.iter_mut() {
+            if let Some(observed) = hints.get(&model.id) {
+                model.supports_images = *observed;
+            }
+        }
+        models
     }
 
     /// 该模型在哪些账号上可用（保持配置顺序，用于故障切换）。
@@ -895,13 +946,33 @@ impl Pool {
         None
     }
 
+    /// 模型是否能原生读图。
+    ///
+    /// 优先使用运行时观察结果，其次看各账号目录里的能力标记
+    /// （目录标记已经合并了实测 allowlist）。
     pub async fn supports_images(&self, model_id: &str) -> bool {
+        if let Some(hint) = self.vision_hint(model_id).await {
+            return hint;
+        }
         for catalog in &self.catalogs {
             if catalog.contains(model_id).await {
                 return catalog.supports_images(model_id).await;
             }
         }
         false
+    }
+
+    /// 记录一次原生识图观察结果（成功或 406）。
+    pub async fn note_vision(&self, model_id: &str, supported: bool) {
+        self.vision_observed
+            .write()
+            .await
+            .insert(model_id.to_string(), supported);
+    }
+
+    /// 读取运行时观察到的能力；没有观察过则返回 `None`。
+    pub async fn vision_hint(&self, model_id: &str) -> Option<bool> {
+        self.vision_observed.read().await.get(model_id).copied()
     }
 
     pub async fn first_model(&self) -> Option<String> {
@@ -932,17 +1003,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registered_vision_models_are_not_mislabeled() {
-        for id in ["kimi-k2.6-vl", "Qwen3-VL-235B"] {
-            assert!(ModelInfo::new(id.to_string(), "agent").supports_images);
+    fn measured_native_vision_models_are_not_mislabeled() {
+        // 上游目录对这批模型会报 false，但实测直连接口能读图。
+        for id in NATIVE_VISION_MODELS {
+            assert!(
+                ModelInfo::new(id.to_string(), "agent").supports_images,
+                "{id} 应被认定为原生识图模型"
+            );
+            assert!(
+                native_vision(&id.to_uppercase()),
+                "allowlist 匹配应大小写不敏感：{id}"
+            );
         }
-        for id in [
-            "kimi-k3.1-pro",
-            "deepseek-v4.1-flash",
-            "deepseek-v4.1-flash-1017",
-        ] {
-            assert!(!ModelInfo::new(id.to_string(), "agent").supports_images);
+        for id in ["glm-5.3", "GLM-5.2", "openpangu-2.0-pro", "unknown-model"] {
+            assert!(
+                !ModelInfo::new(id.to_string(), "agent").supports_images,
+                "{id} 不应被认定为原生识图模型"
+            );
+            assert!(!native_vision(id), "{id}");
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_vision_observation_overrides_catalog_flag() {
+        let pool = Pool::new(Vec::new());
+        assert!(!pool.supports_images("mystery-model").await);
+        pool.note_vision("mystery-model", true).await;
+        assert_eq!(pool.vision_hint("mystery-model").await, Some(true));
+        assert!(pool.supports_images("mystery-model").await);
+        pool.note_vision("mystery-model", false).await;
+        assert!(!pool.supports_images("mystery-model").await);
     }
 
     #[test]
@@ -959,7 +1049,14 @@ mod tests {
         let path = dir.join("models.json");
         let cache = CacheFile {
             updated_at: chrono::Utc::now().timestamp(),
-            models: vec![ModelInfo::new("kimi-k2.6-vl".to_string(), "agent")],
+            models: vec![
+                ModelInfo::new("kimi-k2.6-vl".to_string(), "agent"),
+                // 旧缓存：上游目录当时把这个模型标成纯文本，升级后必须自愈。
+                ModelInfo {
+                    supports_images: false,
+                    ..ModelInfo::new("deepseek-v4.1-flash".to_string(), "agent")
+                },
+            ],
         };
         tokio::fs::write(&path, serde_json::to_vec(&cache).unwrap())
             .await
@@ -975,6 +1072,14 @@ mod tests {
         assert!(!catalog.contains(FALLBACK_AGENT_MODELS[0]).await);
         assert!(catalog.is_fresh());
         assert!(catalog.model("kimi-k2.6-vl").await.unwrap().supports_images);
+        // 实测 allowlist 要覆盖旧缓存里的 supports_images=false。
+        assert!(
+            catalog
+                .model("deepseek-v4.1-flash")
+                .await
+                .unwrap()
+                .supports_images
+        );
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

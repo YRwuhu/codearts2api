@@ -83,6 +83,101 @@ pub fn normalize_roles(body: &mut Map<String, Value>) {
     }
 }
 
+/// 单张图片解码后的上限。
+///
+/// 与 CodeArts 网页/IDE 的图片约束同一量级；真正的上游限制仍会生效，
+/// 这里只挡住明显异常的 payload，避免白烧一次额度。
+pub const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+/// 原生识图的图片入参校验。
+///
+/// 上游 `/api/v2/chat/completions` 只接受 base64 `data:` URL：远程
+/// `http(s)://` 会被 `400 ModelArts.81001 unsupported image url` 拒绝。
+/// 在发请求前给出可读错误，省掉一次注定失败的往返。
+pub fn validate_image_input(body: &Map<String, Value>) -> Result<(), String> {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for message in messages {
+        let Some(parts) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if !matches!(
+                part.get("type").and_then(Value::as_str),
+                Some("image_url" | "input_image" | "image")
+            ) {
+                continue;
+            }
+            let url = image_url_of(part).ok_or("图片缺少 URL")?;
+            check_image_url(url)?;
+        }
+    }
+    Ok(())
+}
+
+/// 从各家协议的图片块里取出 URL：OpenAI / Responses / Anthropic 三种形状。
+fn image_url_of(part: &Value) -> Option<&str> {
+    part.get("image_url")
+        .and_then(|value| match value {
+            Value::String(url) => Some(url.as_str()),
+            other => other.get("url").and_then(Value::as_str),
+        })
+        .or_else(|| part.get("url").and_then(Value::as_str))
+        .or_else(|| {
+            part.get("source")
+                .and_then(|source| source.get("url").and_then(Value::as_str))
+        })
+}
+
+fn check_image_url(url: &str) -> Result<(), String> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Err(
+            "上游只接受 base64 data URL，不接受远程图片 URL；请在客户端内联图片；\
+             代理下载转码的可选方案见 docs/原生识图改造方案.md 第 5.4 节"
+                .into(),
+        );
+    }
+    let Some(data) = url.strip_prefix("data:") else {
+        return Err("图片必须是 data:image/...;base64,... 格式".into());
+    };
+    let Some((meta, payload)) = data.split_once(',') else {
+        return Err("图片 data URL 格式无效".into());
+    };
+    if !meta
+        .split(';')
+        .any(|value| value.eq_ignore_ascii_case("base64"))
+    {
+        return Err("图片 data URL 必须使用 base64 编码".into());
+    }
+    let mime = meta.split(';').next().unwrap_or("").to_ascii_lowercase();
+    if !matches!(
+        mime.as_str(),
+        "image/png" | "image/jpeg" | "image/jpg" | "image/webp" | "image/gif"
+    ) {
+        return Err(format!("不支持的图片类型 {mime}；支持 PNG/JPEG/WebP/GIF"));
+    }
+    let decoded = base64_decoded_len(payload);
+    if decoded == 0 {
+        return Err("图片内容为空".into());
+    }
+    if decoded > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "单张图片解码后约 {decoded} 字节，超过上限 {MAX_IMAGE_BYTES} 字节"
+        ));
+    }
+    Ok(())
+}
+
+/// 估算 base64 解码后的字节数（不计空白与补位），用于大小校验。
+fn base64_decoded_len(payload: &str) -> usize {
+    let chars = payload
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
+        .count();
+    chars.saturating_mul(3) / 4
+}
+
 pub fn has_image_input(body: &Map<String, Value>) -> bool {
     body.get("messages")
         .and_then(|v| v.as_array())
@@ -247,6 +342,43 @@ mod tests {
             {"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}
         ]}]}));
         assert!(has_image_input(&image));
+    }
+
+    #[test]
+    fn validates_supported_native_image_payloads() {
+        let b = body(json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "看"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+            {"type": "input_image", "image_url": "data:image/jpeg;base64,QUJD"},
+            {"type": "image", "url": "data:image/webp;base64,QUJD"},
+            {"type": "image", "source": {"type": "url", "url": "data:image/gif;base64,QUJD"}}
+        ]}]}));
+        assert!(validate_image_input(&b).is_ok());
+    }
+
+    #[test]
+    fn rejects_remote_and_malformed_image_urls() {
+        for url in [
+            "https://example.com/a.png",
+            "http://example.com/a.png",
+            "data:image/png,QUJD",
+            "data:text/plain;base64,QUJD",
+            "data:image/png;base64,",
+            "not-a-url",
+        ] {
+            let b = body(json!({"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": url}}
+            ]}]}));
+            assert!(validate_image_input(&b).is_err(), "应拒绝该图片 URL：{url}");
+        }
+    }
+
+    #[test]
+    fn estimates_base64_size_for_limits() {
+        assert_eq!(base64_decoded_len(""), 0);
+        assert_eq!(base64_decoded_len("QUJD"), 3);
+        assert_eq!(base64_decoded_len("QUJD\nRA=="), 4);
+        assert!(base64_decoded_len(&"A".repeat(MAX_IMAGE_BYTES / 3 * 4 + 8)) > MAX_IMAGE_BYTES);
     }
 
     #[test]

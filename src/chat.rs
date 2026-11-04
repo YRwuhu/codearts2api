@@ -15,7 +15,7 @@ use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 
 use crate::concurrency::{self, SlotGuard};
-use crate::models::TARGET;
+use crate::models::{Pool, TARGET};
 use crate::params;
 use crate::web::WebState;
 
@@ -136,6 +136,10 @@ pub struct CallRequest {
 }
 
 /// 执行一次聊天请求。
+///
+/// 图片请求走「原生优先」：图片直接发给用户选择的模型；只有上游明确拒绝
+/// （406 not multimodal）时才改用 `CODEARTS_VISION_MODEL` 重发一次。
+/// CloudAgent 附件会话通道已整体移除。
 pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, ApiError> {
     let pool = state.pool.read().await.clone();
     pool.ensure_fresh();
@@ -159,86 +163,110 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
         .as_object()
         .map(params::has_image_input)
         .unwrap_or(false);
-    let mut attachment_session = None;
-    if has_images && !pool.supports_images(&requested_model).await {
-        // 直接接口的视觉标记不覆盖 CloudAgent：优先保留用户选择的模型，
-        // 通过网页附件链路处理图像，失败后才使用独立的视觉模型回退。
-        if let Some(catalog) = pool.accounts_for(&requested_model).await.into_iter().next() {
-            match crate::cloudagent::open_session(&catalog).await {
-                Ok(session) => attachment_session = Some((catalog, session)),
-                Err(error) => println!(
-                    "[cloudagent] {requested_model}: 附件通道不可用（{error}），尝试视觉模型回退"
-                ),
+    if has_images {
+        if let Some(body) = req.body.as_object() {
+            params::validate_image_input(body).map_err(ApiError::bad_request)?;
+        }
+    }
+
+    let mut model = requested_model.clone();
+    if has_images && pool.vision_hint(&requested_model).await == Some(false) {
+        // 已经确认这个模型不读图：直接回退，省掉一次 406 往返。
+        match vision_fallback(&requested_model) {
+            Some(vision) => {
+                println!("[vision] {requested_model}: 已确认不支持原生识图，改用 {vision}");
+                model = vision;
+            }
+            None => {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "model_not_multimodal",
+                    format!(
+                        "模型 {requested_model} 不支持图片输入（上游明确拒绝），且 CODEARTS_VISION_MODEL=off"
+                    ),
+                ));
             }
         }
     }
-    let mut model = if attachment_session.is_some() {
-        requested_model.clone()
-    } else if has_images && !pool.supports_images(&requested_model).await {
-        let vision =
-            std::env::var("CODEARTS_VISION_MODEL").unwrap_or_else(|_| "kimi-k2.6-vl".to_string());
-        if vision.eq_ignore_ascii_case("off") {
-            return Err(ApiError::bad_request(format!(
-                "CodeArts 将模型 {requested_model} 注册为纯文本，不能发送图片；请配置 CODEARTS_VISION_MODEL 为视觉模型"
-            )));
-        }
-        if !pool.wait_for_model(&vision).await {
-            return Err(ApiError::bad_request(format!(
-                "模型 {requested_model} 不支持图片，且视觉模型 {vision} 尚未同步；请刷新模型目录或配置 CODEARTS_VISION_MODEL"
-            )));
-        }
-        println!("[vision] {requested_model} 不支持图片，改用 CodeArts 视觉模型 {vision}");
-        vision
-    } else {
-        requested_model.clone()
-    };
 
-    if let Some((catalog, session)) = attachment_session {
-        println!("[cloudagent] {requested_model}: 使用附件 + CloudAgent 通道");
-        let outcome = crate::cloudagent::execute(
-            state,
-            catalog.clone(),
-            &requested_model,
-            &req.body,
-            req.stream,
-            session,
-        )
-        .await;
-        match outcome {
-            Ok(outcome) => {
-                if let Some(key) = req.session_key.as_ref() {
-                    state.pins.pin(key, catalog.account_id()).await;
-                }
-                return Ok(outcome);
-            }
-            Err(error) if error.code == "cloudagent_invalid_input" => return Err(error),
-            Err(error) => {
-                println!(
-                    "[cloudagent] {requested_model}: 任务失败（{}），回退视觉模型",
-                    error.message
-                );
-                if has_images && !pool.supports_images(&requested_model).await {
-                    let vision = std::env::var("CODEARTS_VISION_MODEL")
-                        .unwrap_or_else(|_| "kimi-k2.6-vl".to_string());
-                    if vision.eq_ignore_ascii_case("off") {
-                        return Err(error);
-                    }
-                    if !pool.wait_for_model(&vision).await {
-                        return Err(ApiError::bad_request(format!(
-                            "附件任务失败，且视觉模型 {vision} 尚未同步：{}",
-                            error.message
-                        )));
-                    }
+    let mut result = run_for_model(state, &pool, &mut req, &model).await;
+
+    let multimodal_error = result
+        .as_ref()
+        .err()
+        .filter(|error| error.code == "model_not_multimodal")
+        .map(|error| error.message.clone());
+    if has_images && model == requested_model {
+        if let Some(message) = multimodal_error {
+            pool.note_vision(&requested_model, false).await;
+            if let Some(vision) = vision_fallback(&requested_model) {
+                if pool.wait_for_model(&vision).await {
+                    println!(
+                        "[vision] {requested_model}: 上游拒绝原生识图（{message}），回退 {vision}"
+                    );
                     model = vision;
+                    result = run_for_model(state, &pool, &mut req, &model).await;
+                } else {
+                    println!("[vision] {requested_model}: 回退模型 {vision} 尚未同步");
                 }
             }
         }
+    }
+
+    match result {
+        Ok(outcome) => {
+            if has_images {
+                pool.note_vision(&model, true).await;
+            }
+            Ok(outcome)
+        }
+        Err(error) => {
+            if has_images && error.code == "model_not_multimodal" {
+                pool.note_vision(&model, false).await;
+            }
+            Err(error)
+        }
+    }
+}
+
+/// 默认的图片回退模型。
+///
+/// 必须是实测支持原生识图的模型；账号没开通时回退不会生效，会返回原始 406。
+pub const DEFAULT_VISION_MODEL: &str = "deepseek-v4.1-flash-1017";
+
+/// 读取回退配置；`off`、空值或与当前模型相同都表示不启用回退。
+fn vision_fallback(current: &str) -> Option<String> {
+    let configured =
+        std::env::var("CODEARTS_VISION_MODEL").unwrap_or_else(|_| DEFAULT_VISION_MODEL.to_string());
+    let configured = configured.trim();
+    if configured.is_empty()
+        || configured.eq_ignore_ascii_case("off")
+        || configured.eq_ignore_ascii_case(current)
+    {
+        return None;
+    }
+    Some(configured.to_string())
+}
+
+/// 按指定模型执行一次完整请求（账号选择、并发槽位、签名、失败重试）。
+///
+/// 现在只处理文本/原生图片；不再有 CloudAgent 附件会话分支。
+async fn run_for_model(
+    state: &WebState,
+    pool: &Pool,
+    req: &mut CallRequest,
+    model: &str,
+) -> Result<Outcome, ApiError> {
+    if !pool.contains(model).await {
+        return Err(ApiError::not_found(format!(
+            "model '{model}' 不在当前账号可用模型列表中"
+        )));
     }
 
     req.body["model"] = json!(model);
 
     let cap = pool
-        .max_tokens_of(&model)
+        .max_tokens_of(model)
         .await
         .unwrap_or(state.config().max_tokens_cap);
 
@@ -261,7 +289,7 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
         }
     }
 
-    let mut candidates = pool.accounts_for(&model).await;
+    let mut candidates = pool.accounts_for(model).await;
     if candidates.is_empty() {
         return Err(ApiError::not_found(format!("model '{model}' 无可用账号")));
     }
@@ -290,7 +318,7 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
             if !gate.available().await {
                 continue;
             }
-            if gate.model_cooling(&model).await {
+            if gate.model_cooling(model).await {
                 continue;
             }
             if daily_cap > 0 && gate.daily_tokens().await >= daily_cap {
@@ -419,7 +447,7 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
             let outcome = attempt(
                 state,
                 catalog,
-                &model,
+                model,
                 &req.body,
                 use_upstream_stream,
                 req.stream,
@@ -442,11 +470,14 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
                     error,
                     switch_account,
                 }) => {
-                    gate.note_failure(&error.message).await;
+                    // 模型能力错误不是账号故障：不计失败、不触发账号冷却。
+                    if error.code != "model_not_multimodal" {
+                        gate.note_failure(&error.message).await;
+                    }
                     // 模型级失败（该账号没有这个模型 / 该模型额度耗尽）只让这一个
                     // 模型冷却，不要把整个账号拖下水。
                     if error.code == "model_not_found" {
-                        gate.cool_model(&model, 300).await;
+                        gate.cool_model(model, 300).await;
                     }
 
                     // 上游说会话满了：本地窗口边界抖动，等一个窗口再试一次。
@@ -468,7 +499,7 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
                     state
                         .usage
                         .record(crate::usage::UsageRecord::failed(
-                            &model,
+                            model,
                             catalog.account_id(),
                             started.elapsed().as_millis() as i64,
                             req.stream,
@@ -827,11 +858,15 @@ fn classify_failure(status: StatusCode, code: &str, msg: &str) -> Attempt {
         };
     }
 
-    if msg.contains("model is not multimodal") {
+    // 模型本身不支持图片：属于客户端能力问题，换账号是徒劳的，也不能计入
+    // 账号失败（否则连续几次带图请求会把账号打冷却）。
+    if msg.contains("model is not multimodal") || code.contains("001001020") {
         return Attempt::Retry {
-            error: ApiError::bad_request(format!(
-                "模型拒绝了图片或多模态内容，请检查模型视觉能力与图片格式：{msg}"
-            )),
+            error: ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "model_not_multimodal",
+                format!("模型不支持图片输入（上游明确拒绝）：{msg}"),
+            ),
             switch_account: false,
         };
     }
@@ -1069,10 +1104,12 @@ fn business_stream_error(value: &Value) -> ApiError {
         .and_then(|e| e.get("message"))
         .and_then(|v| v.as_str())
         .unwrap_or("上游返回业务错误");
-    if msg.contains("model is not multimodal") {
-        return ApiError::bad_request(format!(
-            "模型拒绝了图片或多模态内容，请检查模型视觉能力与图片格式：{msg}"
-        ));
+    if msg.contains("model is not multimodal") || code.contains("001001020") {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "model_not_multimodal",
+            format!("模型不支持图片输入（上游明确拒绝）：{msg}"),
+        );
     }
     let status = StatusCode::from_u16(
         code.rsplit('.')
@@ -1234,6 +1271,23 @@ mod tests {
             panic!("expected classified error");
         };
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.code, "model_not_multimodal");
+        assert!(!switch_account);
+
+        // 上游带业务码的 406 同样归类，不能当成账号故障换号。
+        let by_code = classify_failure(
+            StatusCode::NOT_ACCEPTABLE,
+            "InferHub.001001020.406",
+            "The request model is not multimodal",
+        );
+        let Attempt::Retry {
+            error,
+            switch_account,
+        } = by_code
+        else {
+            panic!("expected classified error");
+        };
+        assert_eq!(error.code, "model_not_multimodal");
         assert!(!switch_account);
 
         let large = classify_failure(

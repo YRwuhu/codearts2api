@@ -111,46 +111,44 @@ Model    : deepseek-v4.1-flash
 
 ## 图片与视觉模型
 
-CodeArts 有两条图片调用路径，能力标记不能混用：
+图片走**模型原生识图**：直接把 base64 `data:` URL 塞进
+`/api/v2/chat/completions` 的 `image_url`，不再经过 CloudAgent 会话、
+附件上传或 `analyzeImage` 工具。上游 200 就是模型自己在看图，`stream: true`
+时是真流式，首帧通常 1–2 秒。
 
-- `/api/v2/chat/completions` 的内嵌图片能力以 `GET /v1/model/builtin`
-  （`Agent-Type: PromptCenter`）中的 `supports_images` 为准。该字段为 `false`
-  只表示这条直接聊天接口拒绝图片，不代表整个 CodeArts 不支持图片。
-- 网页版使用附件 + CloudAgent 会话：先上传图片获得 `attachment_id`，再提交
-  带附件上下文和 `agent: build` 的会话任务。DeepSeek 任务通过图像分析工具
-  处理图片；这条链路同样使用现有 OAuth/AK/SK 凭证，不需要浏览器 Cookie。
+实测可原生读图的模型（2026-11）：
 
-`deepseek-v4.1-flash-1017`、`deepseek-v4.1-flash`、`kimi-k3.1-pro`、`kimi-k3`
-等模型的直接聊天接口可能返回 `The request model is not multimodal`。代理默认
-为这些模型尝试网页附件 + CloudAgent，**保留所选模型负责对话和回答**，图像
-分析由 CloudAgent 的 `analyzeImage` 工具执行。图像工具可能调用独立的视觉
-后端，因此这不是把 base64 直接送进所选模型的 `/api/v2/chat/completions`。
+`deepseek-v4.1-flash-1017`、`deepseek-v4.1-flash`、`kimi-k3`、
+`kimi-k3.1-pro`、`glm-5.3-flash`、`speed`、`Qwen3-VL-235B`、`kimi-k2.6-vl`。
 
-含图请求的优先级为：直接接口支持的模型走原路径；其他模型先走附件 +
-CloudAgent；附件任务失败后才回退 `CODEARTS_VISION_MODEL`。纯文本请求
-始终走原路径。目录的 `supports_images` 不会被改成 `true`，独立的
-`supports_attachments` 表示可尝试附件任务。
+注意：`GET /v1/model/builtin` 和 AgentCenter 里的 `supports_images` 对上面
+多数模型仍报 `false`，它们描述的是 IDE 的图片注入链路，不能当直连接口的
+能力依据。代理以「实测 allowlist + 上游标记 + 运行时观察」合并判断，
+`/v1/models` 里的 `supports_images` / `vision` / `input_modalities` 也按
+合并结果输出。
 
-附件任务优先使用会话内的 base64 图像，必要时读取服务端注册的内部 `ImageId`，
-不混用上传 `attachment_id`。工具成功后直接回答，避免重复图像调用和循环保护。
+带图请求的优先级：
 
-附件通道支持 PNG/JPEG/WebP/GIF 的 base64 `data:` URL，单图不超过
-20 MiB；远程图片 URL 需先下载后以 base64 发送。每次请求创建独立会话，
-提交最后一条用户消息的文字和本轮图片，**用完立即 `DELETE` 释放**——
-上游每账号只允许 3 个并存会话，不回收的话第 4 次带图请求起就会被拒
-（`并发会话数已达上限(3个)`）。启动时还会清理旧版本遗留的会话。
+1. 先按用户所选模型原生发送；
+2. 上游明确 406 `The request model is not multimodal` 时，把该模型记为
+   纯文本，并改用 `CODEARTS_VISION_MODEL`（默认 `deepseek-v4.1-flash-1017`）
+   重发一次；已确认纯文本的模型后续直接回退，不再多打一次 406；
+3. `CODEARTS_VISION_MODEL=off` 或回退模型不可用 → 返回 400 并说明原因。
 
-`stream: true` 时附件通道是**真流式**：先立刻回一帧 `role`，随后把
-CloudAgent 的 `event: message` 逐条转成 OpenAI `delta` 往下推，客户端
-首帧约 0.3 秒可见，不再是等整轮任务跑完才一次性吐出。`stream: false`
-仍返回聚合后的完整 `chat.completion`。
+已知纯文本模型：`glm-5.3`、`GLM-5.2`、`glm-5.2-sft-harmony`、
+`openpangu-2.0-pro`、`openpangu-2.0-flash`。对这些模型带图会自动回退。
 
-收到 `event: done` 或终止错误就立即断开上游连接。CloudAgent 发完结果
-并不会主动关连接，以前会一直挂到 600 秒超时（表现是"话说完了却不中断"）。
-积分耗尽、凭证失效这类错误重试没有意义，会直接返回，不再白跑一轮
-ImageId 重试。
+图片约束：
 
-`CODEARTS_VISION_MODEL` 可指定回退视觉模型，设为 `off` 则关闭回退。
+- 只接受 base64 `data:image/...;base64,...`；远程 `http(s)://` 图片 URL
+  会直接返回 400（上游只认 data URL）。可选方案 B（代理下载远程图片再转
+  base64）见 `docs/原生识图改造方案.md` 第 5.4 节；
+- 支持 PNG / JPEG / WebP / GIF；单图解码后不超过 20 MiB；一条消息可多图；
+- 校验在本地完成，参数错误不会白烧上游额度。
+
+新模型不用等发版：未登记模型第一次带图会先尝试原生，成功即自动学习为可用；
+也可以 `CODEARTS_EXTRA_VISION_MODELS=model-a,model-b` 显式追加。
+
 诊断结构日志 `CODEARTS_DEBUG_REQUEST_SHAPE=1` 只输出角色、block 类型、
 图片 MIME/大小，不输出正文、base64 或凭证。
 
@@ -172,8 +170,11 @@ CODEARTS_MAX_TOKENS_CAP=131072
 # 可选：自定义 usage.jsonl 路径
 # CODEARTS_USAGE_ARCHIVE=D:\tools\codearts2api\usage.jsonl
 
-# 含图片请求失败时使用的 CodeArts 回退视觉模型（off 可关闭回退）
-CODEARTS_VISION_MODEL=kimi-k2.6-vl
+# 纯文本模型收到图片时回退的视觉模型（默认 deepseek-v4.1-flash-1017，off 关闭回退）
+CODEARTS_VISION_MODEL=deepseek-v4.1-flash-1017
+
+# 额外声明支持原生识图的模型（逗号分隔），新模型不用改代码
+# CODEARTS_EXTRA_VISION_MODELS=my-new-vl-model
 
 # 免费额度模型拿不到时是否仍列出兜底清单
 CODEARTS_BENEFIT_FALLBACK=0

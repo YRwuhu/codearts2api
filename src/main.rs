@@ -61,7 +61,8 @@ fn print_help() {
   CODEARTS_MAX_BODY_MB          单请求体上限（MB），默认 32；贴大段代码/日志时调大
   CODEARTS_BENEFIT_FALLBACK     1 = 免费模型拿不到时仍暴露兜底列表
   CODEARTS_MODEL_CACHE          模型缓存路径，默认与 .env 同目录
-  CODEARTS_VISION_MODEL         图片请求使用的视觉模型，默认 kimi-k2.6-vl，off 关闭自动路由
+  CODEARTS_VISION_MODEL         纯文本模型收到图片时回退的视觉模型，默认 deepseek-v4.1-flash-1017，off 关闭回退
+  CODEARTS_EXTRA_VISION_MODELS  逗号分隔：额外声明支持原生识图的模型，新模型不用改代码
   CODEARTS_DEBUG_REQUEST_SHAPE  1 = 记录脱敏的图片结构，不记录正文或凭证
 "#
     );
@@ -159,7 +160,6 @@ fn serve() -> ExitCode {
         // 后台定时任务：定期刷新额度并落盘，供 WebUI 与 /api/quota 使用
         admin::spawn_quota_refresher(state.clone());
         admin::spawn_checkin_scheduler(state.clone());
-        admin::spawn_cloudagent_reclaimer(state.clone());
 
         let app = api::router(state);
         if let Err(e) = axum::serve(listener, app).await {
