@@ -145,6 +145,12 @@ pub struct CallRequest {
 /// 的失败上；流内 406 直接作为终止错误返回客户端（但不计入账号失败）。
 /// CloudAgent 附件会话通道已整体移除。
 pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, ApiError> {
+    // 提示词清洗：把会被上游内容安全网关误判的 ZCode 注入片段改写掉。
+    // 三种对外协议进入这里时都已归一化成 chat 格式，所以只接这一处。
+    if let Some(fired) = crate::sanitize::apply(&mut req.body) {
+        println!("[sanitize] 已改写 WAF 触发片段：{fired}");
+    }
+
     let pool = state.pool.read().await.clone();
     pool.ensure_fresh();
 

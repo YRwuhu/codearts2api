@@ -92,8 +92,43 @@ codearts2api.exe benefit claim   手动签到领额度
 | `CODEARTS_PROXY_HOST` | `127.0.0.1` | 监听地址 |
 | `CODEARTS_CONCURRENCY` | `8` | 本地并发上限 |
 | `CODEARTS_DAILY_TOKEN_CAP` | `0` | 每账号每日 token 上限，0 不限 |
+| `CODEARTS_SANITIZE` | 开 | 设为 `0` / `off` 关闭提示词清洗 |
+| `CODEARTS_SANITIZE_RULES` | `sanitize.json` | 自定义规则文件路径（不存在则用内置规则） |
 
 其余的看 `.env.example`。
+
+### 提示词清洗（WAF 误拦截）
+
+ZCode 会把仓库的 git 上下文注入到消息里，其中这一句会被上游内容安全网关判成
+提示词注入，整单返回 `InferHub.ModelArts.81011.403` 和一段固定拒答：
+
+```
+Main branch (you will usually use this for PRs): master
+```
+
+代理在发往上游前把它改写成等价的 `Default git branch: master`（移植自
+[honlnk/zcode-prompt-sanitizer](https://github.com/honlnk/zcode-prompt-sanitizer)，MIT）。
+只改请求、不碰响应，默认作用于 `system` 和 `user` 消息；命中时打印
+`[sanitize] 已改写 …`。
+
+需要更多规则时在代理目录放一个 `sanitize.json`（**一旦提供就整体替换内置规则**）：
+
+```json
+{
+  "rules": [
+    {
+      "id": "my-phrase",
+      "enabled": true,
+      "scopes": ["system", "user"],
+      "match": "要替换的原文",
+      "replacement": "替换后的文本"
+    }
+  ]
+}
+```
+
+`scopes` 可选 `system` / `user` / `assistant` / `tool`；`replacement` 留空表示删除。
+匹配是纯字面量，不支持正则。
 
 ## 测试
 

@@ -10,6 +10,7 @@ pub mod oauth;
 pub mod params;
 pub mod quota;
 pub mod responses;
+pub mod sanitize;
 pub mod signer;
 pub mod stream;
 pub mod usage;
