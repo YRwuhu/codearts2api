@@ -22,3 +22,6 @@ auths/
 .idea/
 Thumbs.db
 desktop.ini
+
+# 发布产物校验文件（由构建流程生成）
+SHA256SUMS.txt
