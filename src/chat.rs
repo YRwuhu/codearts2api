@@ -31,6 +31,20 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(180);
 /// 上游仍报会话满时的重试次数（窗口边界抖动）。
 const SATURATION_RETRIES: usize = 2;
 
+/// 上游内容审核误拦截时的立即重试次数。
+///
+/// 这类错误（`InferHub.ModelArts.81011.403`）是流内的业务错误帧、token 为 0，
+/// 上游根本没有真正处理请求；重新发一次往往就过了。超过次数后照常把错误返回
+/// 客户端，不要无限重试烧额度。
+const WAF_RETRIES: usize = 5;
+
+/// 流式响应开始转发前的探测窗口。
+///
+/// WAF 误拦截的 error 帧出现在任何正文之前（实测 2–23 秒）。在这段时间内看到
+/// 它才能整单重试；一旦已经往客户端吐过正文增量，重试就会让客户端看到两份
+/// 内容，只能把错误如实返回。
+const WAF_PROBE_WINDOW: Duration = Duration::from_secs(30);
+
 /// 每次重试前等待多久——足够让窗口里最早的那个流滑出去。
 const SATURATION_BACKOFF: Duration = Duration::from_secs(8);
 
@@ -470,6 +484,8 @@ async fn run_for_model(
 
     let started = std::time::Instant::now();
     let mut last: Option<ApiError> = None;
+    // 内容审核误拦截的重试次数：跨账号累计，但始终原号重试（换号无意义）。
+    let mut waf_retries = 0usize;
 
     for (idx, catalog) in candidates.iter().enumerate() {
         let gate = state.gate(catalog.account_id(), config.concurrency).await;
@@ -530,6 +546,24 @@ async fn run_for_model(
                     error,
                     switch_account,
                 }) => {
+                    // 内容审核误拦截：请求根本没到模型（token=0），原样立即重试。
+                    // 不记账号失败、不写失败用量——真正失败时才记一次。
+                    if error.code == "waf_blocked" {
+                        if waf_retries < WAF_RETRIES {
+                            waf_retries += 1;
+                            println!(
+                                "[{}] {model}: 上游内容审核误拦截，立即重试 ({}/{WAF_RETRIES})",
+                                catalog.account_id(),
+                                waf_retries
+                            );
+                            continue;
+                        }
+                        println!(
+                            "[{}] {model}: 内容审核误拦截重试 {WAF_RETRIES} 次仍失败，返回错误",
+                            catalog.account_id()
+                        );
+                    }
+
                     // 模型能力错误不是账号故障：不计失败、不触发账号冷却。
                     if is_account_failure(&error.code) {
                         gate.note_failure(&error.message).await;
@@ -755,16 +789,30 @@ async fn attempt(
             ]))));
         }
 
-        let stream = sse_stream(
-            upstream,
-            guard,
-            gate,
-            state.clone(),
-            model.to_string(),
-            account_id.clone(),
-            started,
-        );
-        return Ok(Attempt::Done(Outcome::Stream(stream)));
+        let mut decoder = decoder_for(upstream);
+        match probe_stream(&mut decoder).await {
+            ProbeOutcome::Waf(error) => {
+                // 还没向客户端输出任何正文，整单重试是安全的。
+                return Ok(Attempt::Retry {
+                    error,
+                    switch_account: false,
+                });
+            }
+            ProbeOutcome::Ready { prefix, completion } => {
+                let stream = sse_stream(
+                    decoder,
+                    prefix,
+                    completion,
+                    guard,
+                    gate,
+                    state.clone(),
+                    model.to_string(),
+                    account_id.clone(),
+                    started,
+                );
+                return Ok(Attempt::Done(Outcome::Stream(stream)));
+            }
+        }
     }
 
     // 非流式
@@ -920,14 +968,25 @@ fn tool_turn(body: &Value) -> bool {
 ///
 /// `model_not_multimodal` 是上游对**模型能力**的拒绝：换账号、续凭证都改变不了
 /// 结果，记进失败只会把健康的账号打成冷却（连续 3 次即触发）。
+/// 内容审核误拦截同理——它是请求内容触发的，与账号健康无关；连续几次误拦截
+/// 也不该把账号打成冷却。
 /// 其余错误（429/401/5xx/网络）仍然按账号故障处理。
 fn is_account_failure(code: &str) -> bool {
-    code != "model_not_multimodal"
+    code != "model_not_multimodal" && code != "waf_blocked"
 }
 
 /// 把上游错误归类：可换号的账号级错误 vs 客户端错误。
 fn classify_failure(status: StatusCode, code: &str, msg: &str) -> Attempt {
     let text = format!("{code} {msg}");
+
+    // 上游内容审核误拦截。这类请求 token 为 0、模型根本没跑，原样重发往往
+    // 就能过；交由 run_for_model 立即重试，不要记账号失败。
+    if is_waf_block(code, msg) {
+        return Attempt::Retry {
+            error: ApiError::new(StatusCode::FORBIDDEN, "waf_blocked", msg.to_string()),
+            switch_account: false,
+        };
+    }
 
     // max_tokens 超限：告诉客户端真实上限，别只说 "param invalid"
     if msg.contains("max_tokens should be between") {
@@ -1050,9 +1109,115 @@ enum DecoderEvent {
     Complete(StreamCompletion),
 }
 
+type Decoder = std::pin::Pin<Box<dyn Stream<Item = DecoderEvent> + Send>>;
+
+fn decoder_for(upstream: reqwest::Response) -> Decoder {
+    Box::pin(decode_sse(upstream.bytes_stream()))
+}
+
+enum ProbeOutcome {
+    /// 流内出现内容审核误拦截，且还没吐出任何正文：可以整单重试。
+    Waf(ApiError),
+    /// 可以开始向客户端转发；`prefix` 是探测期间缓存的事件。
+    Ready {
+        prefix: Vec<Result<StreamEvent, ApiError>>,
+        completion: Option<StreamCompletion>,
+    },
+}
+
+/// 在上游 SSE 转发前短暂探测，识别内容审核误拦截。
+///
+/// WAF 错误以流内 error 帧返回，token 为 0，且出现在任何正文之前。只要在
+/// **第一个非空增量之前**看到它，就能整单重试而不让客户端看到两份内容；一旦
+/// 已经出现正文（content / reasoning / tool_calls），重试就不可行，只能如实
+/// 转发错误。
+///
+/// 若 `WAF_PROBE_WINDOW` 内什么都没等到（慢模型），同样放行——不能为了探测
+/// 把首字延迟无限拉长。
+async fn probe_stream(decoder: &mut Decoder) -> ProbeOutcome {
+    let mut prefix: Vec<Result<StreamEvent, ApiError>> = Vec::new();
+    let deadline = tokio::time::Instant::now() + WAF_PROBE_WINDOW;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, decoder.next()).await {
+            Err(_) | Ok(None) => break,
+            Ok(Some(DecoderEvent::Event(event))) => {
+                // 心跳帧没有内容，不占客户端带宽也不影响判定，直接丢弃。
+                if matches!(&event, Ok(StreamEvent::Chunk(Value::Null))) {
+                    continue;
+                }
+                let meaningful =
+                    !matches!(&event, Ok(StreamEvent::Chunk(v)) if !chunk_has_output(v));
+                prefix.push(event);
+                if meaningful {
+                    break;
+                }
+            }
+            Ok(Some(DecoderEvent::Complete(done))) => {
+                return match done.result {
+                    Err(error) if is_waf_block(&error.code, &error.message) => ProbeOutcome::Waf(
+                        ApiError::new(StatusCode::FORBIDDEN, "waf_blocked", error.message),
+                    ),
+                    result => ProbeOutcome::Ready {
+                        prefix,
+                        completion: Some(StreamCompletion {
+                            usage: done.usage,
+                            result,
+                        }),
+                    },
+                };
+            }
+        }
+    }
+    ProbeOutcome::Ready {
+        prefix,
+        completion: None,
+    }
+}
+
+/// 这个 chunk 是否已经带上了真正的模型输出。
+fn chunk_has_output(value: &Value) -> bool {
+    let Some(choices) = value.get("choices").and_then(|c| c.as_array()) else {
+        return false;
+    };
+    choices.iter().any(|choice| {
+        let Some(delta) = choice.get("delta") else {
+            return false;
+        };
+        let text = |key: &str| {
+            delta
+                .get(key)
+                .and_then(Value::as_str)
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        };
+        text("content")
+            || text("reasoning_content")
+            || delta
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+                .map(|calls| !calls.is_empty())
+                .unwrap_or(false)
+    })
+}
+
+/// 上游内容审核误拦截的识别。
+///
+/// CodeArts 返回 `InferHub.ModelArts.81011.403` + 一段固定拒答文案，token 为 0。
+/// 这不是账号或参数问题，原样重试常常就能通过。
+fn is_waf_block(code: &str, message: &str) -> bool {
+    code.contains("81011") || message.contains("我无法提供关于您提问内容的建议")
+}
+
 /// 把上游 SSE 逐行转成 `StreamEvent`，并在结束时归还槽位。
+#[allow(clippy::too_many_arguments)]
 fn sse_stream(
-    upstream: reqwest::Response,
+    mut decoder: Decoder,
+    prefix: Vec<Result<StreamEvent, ApiError>>,
+    completion: Option<StreamCompletion>,
     guard: SlotGuard,
     gate: std::sync::Arc<crate::concurrency::AccountGate>,
     state: WebState,
@@ -1060,15 +1225,18 @@ fn sse_stream(
     account: String,
     started: Instant,
 ) -> EventStream {
-    let byte_stream = upstream.bytes_stream();
     Box::pin(async_stream::stream! {
         let _guard = guard;
-        let mut inner = Box::pin(decode_sse(byte_stream));
-        let mut completion = None;
-        while let Some(item) = inner.next().await {
-            match item {
-                DecoderEvent::Event(event) => yield event,
-                DecoderEvent::Complete(done) => { completion = Some(done); break; }
+        for event in prefix {
+            yield event;
+        }
+        let mut completion = completion;
+        if completion.is_none() {
+            while let Some(item) = decoder.next().await {
+                match item {
+                    DecoderEvent::Event(event) => yield event,
+                    DecoderEvent::Complete(done) => { completion = Some(done); break; }
+                }
             }
         }
         let Some(completion) = completion else { return };
@@ -1187,6 +1355,11 @@ fn business_stream_error(value: &Value) -> ApiError {
             "model_not_multimodal",
             format!("模型不支持图片输入（上游明确拒绝）：{msg}"),
         );
+    }
+    // 流内出现内容审核误拦截：统一成 waf_blocked，既不会把账号计成失败，
+    // 也便于上层在多协议错误体里识别。
+    if is_waf_block(code, msg) {
+        return ApiError::new(StatusCode::FORBIDDEN, "waf_blocked", msg);
     }
     let status = StatusCode::from_u16(
         code.rsplit('.')
@@ -1392,6 +1565,8 @@ mod tests {
     fn multimodal_rejection_is_not_an_account_failure() {
         // 模型能力错误换号无用，不能把健康账号打成冷却。
         assert!(!is_account_failure("model_not_multimodal"));
+        // 内容审核误拦截与账号健康无关，同样不计失败。
+        assert!(!is_account_failure("waf_blocked"));
         for code in [
             "rate_limit_error",
             "authentication_error",
@@ -1399,6 +1574,109 @@ mod tests {
             "upstream_unavailable",
         ] {
             assert!(is_account_failure(code), "{code} 应计入账号失败");
+        }
+    }
+
+    #[test]
+    fn recognizes_waf_refusal() {
+        assert!(is_waf_block(
+            "InferHub.ModelArts.81011.403",
+            "抱歉，我无法提供关于您提问内容的建议。作为 AI 编程助手，我更擅长协助您处理代码编写"
+        ));
+        // 只有文案、码被归一化过时也要能认出来。
+        assert!(is_waf_block("", "抱歉，我无法提供关于您提问内容的建议"));
+        assert!(!is_waf_block(
+            "invalid_request_error",
+            "max_tokens too large"
+        ));
+
+        let classified = classify_failure(
+            StatusCode::FORBIDDEN,
+            "InferHub.ModelArts.81011.403",
+            "抱歉，我无法提供关于您提问内容的建议",
+        );
+        let Attempt::Retry {
+            error,
+            switch_account,
+        } = classified
+        else {
+            panic!("expected classified error");
+        };
+        assert_eq!(error.code, "waf_blocked");
+        assert!(!switch_account, "内容审核误拦截不该换号");
+
+        let stream = business_stream_error(&json!({"error": {
+            "code": "InferHub.ModelArts.81011.403",
+            "message": "抱歉，我无法提供关于您提问内容的建议"
+        }}));
+        assert_eq!(stream.code, "waf_blocked");
+    }
+
+    #[test]
+    fn detects_first_real_output_in_chunks() {
+        // 只有 role 的空增量不算输出
+        assert!(!chunk_has_output(
+            &json!({"choices": [{"delta": {"content": "", "role": "assistant"}}]})
+        ));
+        assert!(chunk_has_output(
+            &json!({"choices": [{"delta": {"content": "你"}}]})
+        ));
+        assert!(chunk_has_output(
+            &json!({"choices": [{"delta": {"reasoning_content": "想"}}]})
+        ));
+        assert!(chunk_has_output(&json!({"choices": [{"delta": {
+            "tool_calls": [{"index": 0, "function": {"name": "Bash"}}]
+        }}]})));
+        assert!(!chunk_has_output(&json!({"choices": []})));
+        assert!(!chunk_has_output(&json!(null)));
+    }
+
+    #[tokio::test]
+    async fn probe_retries_only_before_any_output() {
+        use futures_util::stream::iter;
+
+        // 错误帧出现在正文之前 → 可以整单重试
+        let waf = || StreamCompletion {
+            usage: None,
+            result: Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "InferHub.ModelArts.81011.403",
+                "抱歉，我无法提供关于您提问内容的建议",
+            )),
+        };
+        let mut decoder: Decoder = Box::pin(iter(vec![
+            DecoderEvent::Event(Ok(StreamEvent::Chunk(
+                json!({"choices": [{"delta": {"content": "", "role": "assistant"}}]}),
+            ))),
+            DecoderEvent::Complete(waf()),
+        ]));
+        assert!(matches!(
+            probe_stream(&mut decoder).await,
+            ProbeOutcome::Waf(error) if error.code == "waf_blocked"
+        ));
+
+        // 已经出现正文 → 不能再重试；后续错误由转发流原样抛出
+        let mut decoder: Decoder = Box::pin(iter(vec![
+            DecoderEvent::Event(Ok(StreamEvent::Chunk(
+                json!({"choices": [{"delta": {"content": "你好"}}]}),
+            ))),
+            DecoderEvent::Complete(waf()),
+        ]));
+        match probe_stream(&mut decoder).await {
+            ProbeOutcome::Ready { prefix, completion } => {
+                assert_eq!(prefix.len(), 1);
+                assert!(completion.is_none(), "未读到的错误留给后续流处理");
+            }
+            ProbeOutcome::Waf(_) => panic!("已经输出正文后不应重试"),
+        }
+
+        // 正常流：第一个正文增量到达就放行
+        let mut decoder: Decoder = Box::pin(iter(vec![DecoderEvent::Event(Ok(
+            StreamEvent::Chunk(json!({"choices": [{"delta": {"content": "hi"}}]})),
+        ))]));
+        match probe_stream(&mut decoder).await {
+            ProbeOutcome::Ready { prefix, .. } => assert_eq!(prefix.len(), 1),
+            ProbeOutcome::Waf(_) => panic!("正常响应不应判成 WAF"),
         }
     }
 
