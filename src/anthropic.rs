@@ -62,6 +62,10 @@ pub fn to_chat_request(req: &Value) -> Result<Value, ApiError> {
         let mut parts: Vec<Value> = Vec::new();
         let mut tool_calls: Vec<Value> = Vec::new();
         let mut tool_results: Vec<Value> = Vec::new();
+        // tool_result 里的图片：上游不接受 tool 消息带图，只能另发用户消息。
+        // 但**必须排在全部 tool 消息之后**——插在中间会截断工具链，上游会回
+        // "an assistant message with 'tool_calls' must be followed by tool messages"。
+        let mut result_images: Vec<Value> = Vec::new();
 
         for block in blocks {
             match block.get("type").and_then(|v| v.as_str()) {
@@ -100,7 +104,8 @@ pub fn to_chat_request(req: &Value) -> Result<Value, ApiError> {
                     if !images.is_empty() {
                         // 上游只接受用户消息中的图片。截图必须单独保留，不能被
                         // blocks_to_text 丢掉，也不能把 base64 塞进工具文本。
-                        tool_results.push(json!({"role": "user", "content": images}));
+                        // 先攒着，等所有 tool 消息发完再补一条，见下方 extend。
+                        result_images.extend(images);
                     }
                 }
                 // thinking / redacted_thinking / cache_control 等：上游没有对应概念
@@ -113,33 +118,20 @@ pub fn to_chat_request(req: &Value) -> Result<Value, ApiError> {
         }
 
         if !tool_calls.is_empty() {
-            let content_value = if parts.is_empty() {
-                Value::Null
-            } else if parts.iter().all(|p| p.get("type") == Some(&json!("text"))) {
-                json!(parts
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n"))
-            } else {
-                Value::Array(parts)
-            };
             messages.push(json!({
                 "role": "assistant",
-                "content": content_value,
+                "content": parts_content(parts),
                 "tool_calls": tool_calls,
             }));
-        } else if !parts.is_empty() {
-            let content_value = if parts.iter().all(|p| p.get("type") == Some(&json!("text"))) {
-                json!(parts
-                    .iter()
-                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n"))
-            } else {
-                Value::Array(parts)
-            };
-            messages.push(json!({"role": role, "content": content_value}));
+            if !result_images.is_empty() {
+                messages.push(json!({"role": "user", "content": result_images}));
+            }
+        } else if !parts.is_empty() || !result_images.is_empty() {
+            // 工具链之后才轮到图片和正文，保证上面那条 assistant 的
+            // tool_calls 全部被连续的 tool 消息应答过。
+            let mut merged = parts;
+            merged.extend(result_images);
+            messages.push(json!({"role": role, "content": parts_content(merged)}));
         }
     }
 
@@ -192,6 +184,21 @@ pub fn to_chat_request(req: &Value) -> Result<Value, ApiError> {
     }
 
     Ok(out)
+}
+
+/// 正文 parts → chat 的 `content`：纯文本合成字符串，含图片就保留数组。
+fn parts_content(parts: Vec<Value>) -> Value {
+    if parts.is_empty() {
+        return Value::Null;
+    }
+    if parts.iter().all(|p| p.get("type") == Some(&json!("text"))) {
+        return json!(parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+    Value::Array(parts)
 }
 
 fn convert_tool_choice(tc: &Value) -> Value {
@@ -739,6 +746,59 @@ mod tests {
             ])
         );
         assert!(!messages[0].to_string().contains("base64"));
+    }
+
+    /// 线上真实事故（ZCode + 一次 5 个工具调用）：第一个 tool_result 带截图时，
+    /// 旧实现把图片作为 user 消息插进了工具链中间，后面 4 个结果全成孤儿，上游报
+    /// "an assistant message with 'tool_calls' must be followed by tool messages"。
+    #[test]
+    fn keeps_tool_chain_contiguous_when_result_has_image() {
+        let req = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "看这个仓库"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "Read_8", "name": "Read", "input": {}},
+                    {"type": "tool_use", "id": "Read_9", "name": "Read", "input": {}},
+                    {"type": "tool_use", "id": "Bash_12", "name": "Bash", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "Read_8", "content": [
+                        {"type": "image", "source": {
+                            "type": "base64", "media_type": "image/png", "data": "AAA"
+                        }}
+                    ]},
+                    {"type": "tool_result", "tool_use_id": "Read_9", "content": "text"},
+                    {"type": "tool_result", "tool_use_id": "Bash_12", "content": "ok"}
+                ]}
+            ]
+        });
+        let chat = to_chat_request(&req).unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+
+        // 顺序必须是 assistant → 三条连续 tool → 图片 user 消息
+        assert_eq!(messages[1]["role"], "assistant");
+        let ids: Vec<&str> = messages[2..5]
+            .iter()
+            .map(|m| m["tool_call_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["Read_8", "Read_9", "Bash_12"]);
+        for msg in &messages[2..5] {
+            assert_eq!(msg["role"], "tool");
+        }
+        assert_eq!(messages[5]["role"], "user");
+        assert_eq!(
+            messages[5]["content"],
+            json!([{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}])
+        );
+
+        // 兜底修复函数跑一遍也不能再改动它
+        let mut patched = chat.as_object().unwrap().clone();
+        crate::params::repair_tool_pairs(&mut patched);
+        assert_eq!(
+            Value::Array(patched["messages"].as_array().unwrap().clone()),
+            Value::Array(messages.clone())
+        );
     }
 
     #[test]

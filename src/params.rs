@@ -5,7 +5,9 @@
 //!    max_output_tokens），上游只认 max_tokens 且超限时返回 HTTP 200 + 业务错误；
 //! 2. 上游业务错误可能出现在 200 的 JSON 或 SSE 流里，必须翻译成可识别的形态。
 
-use serde_json::{Map, Value};
+use std::collections::{BTreeMap, VecDeque};
+
+use serde_json::{json, Map, Value};
 
 /// 上游各模型真正接受的 max_tokens 硬上限。
 ///
@@ -55,8 +57,159 @@ pub fn normalize_params(body: &mut Map<String, Value>, cap: i64) -> Option<(i64,
     body.remove("reasoning");
 
     normalize_roles(body);
+    repair_tool_pairs(body);
 
     capped_now
+}
+
+/// 修复 `tool_calls` / `tool` 消息配对，避免上游 400。
+///
+/// 上游对工具链的要求是：assistant 的每条 `tool_calls` 必须被**紧随其后、
+/// 连续排列**的 `role: "tool"` 消息逐条应答。任何消息插进这段连续区间都会
+/// 让后半段全部变成孤儿，报成：
+///
+/// ```text
+/// Invalid request: an assistant message with 'tool_calls' must be followed by
+/// tool messages responding to each 'tool_call_id'. The following tool_call_ids
+/// did not have response messages: Read:9, Read:10, Read:11, Bash:12
+/// ```
+///
+/// 实测来源是 `anthropic::to_chat_request`：某个 `tool_result` 带截图时，它会
+/// 在工具链中间补一条 `role: "user"` 的图片消息（上游不接受 tool 带图），把
+/// 后面几个 tool 结果全隔断了。适配层已改为把图片排到最后，这里再做一次
+/// 兜底归一化——直通 `/v1/chat/completions` 的客户端也可能发出同样的形状。
+///
+/// 处理方式：
+/// 1. 属于某条 assistant `tool_calls` 的 tool 消息提前到紧邻位置（保持原序）；
+/// 2. 完全没有对应 `tool_calls` 的孤儿 tool 消息降级为 user 文本，否则上游会
+///    因未知 `tool_call_id` 直接拒绝；
+/// 3. 缺失结果的 `tool_call_id` 补一条占位 tool 消息，说明该调用被中断。
+pub fn repair_tool_pairs(body: &mut Map<String, Value>) {
+    let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return;
+    };
+
+    let len = messages.len();
+    let has_tools = messages
+        .iter()
+        .any(|m| is_tool_message(m) || has_tool_calls(m));
+    if !has_tools {
+        return;
+    }
+
+    // 第一遍：按 id 把 tool 消息排成队列，再给每条 tool_calls 分配具体下标。
+    // 不在这里搬运消息，避免复制带 base64 的大 payload。
+    let mut available: BTreeMap<String, VecDeque<usize>> = BTreeMap::new();
+    for (idx, msg) in messages.iter().enumerate() {
+        if is_tool_message(msg) {
+            available
+                .entry(tool_call_id(msg))
+                .or_default()
+                .push_back(idx);
+        }
+    }
+
+    // tool_calls 各 id → 对应的 tool 消息下标（缺失为 None），以及该 tool 消息
+    // 已被哪条 assistant 认领。
+    let mut plan: BTreeMap<usize, Vec<(String, Option<usize>)>> = BTreeMap::new();
+    let mut claimed = vec![false; len];
+    for (idx, msg) in messages.iter().enumerate() {
+        if !has_tool_calls(msg) {
+            continue;
+        }
+        let slots = tool_call_ids(msg)
+            .into_iter()
+            .map(|id| {
+                let origin = available.get_mut(&id).and_then(|queue| queue.pop_front());
+                if let Some(origin) = origin {
+                    claimed[origin] = true;
+                }
+                (id, origin)
+            })
+            .collect();
+        plan.insert(idx, slots);
+    }
+
+    // 第二遍：按原顺序重建；被认领的 tool 消息在对应 assistant 处落地，
+    // 未认领的孤儿降级为 user，缺失的结果补占位。
+    let mut slots: Vec<Option<Value>> = std::mem::take(messages).into_iter().map(Some).collect();
+    let mut rebuilt: Vec<Value> = Vec::with_capacity(len + 8);
+
+    for idx in 0..len {
+        if slots[idx].as_ref().is_some_and(is_tool_message) {
+            if claimed[idx] {
+                // 已被认领：若排在 assistant 之前，先留在原位，等 assistant
+                // 处理时再取走；若排在后面，则已被取走（slots 为 None），
+                // 上面的 is_some_and 已经不成立。两种情况都不在这里落地。
+                continue;
+            }
+            if let Some(orphan) = slots[idx].take() {
+                rebuilt.push(relabel_as_user(orphan));
+            }
+            continue;
+        }
+
+        if let Some(msg) = slots[idx].take() {
+            rebuilt.push(msg);
+        }
+        let Some(calls) = plan.remove(&idx) else {
+            continue;
+        };
+        for (id, origin) in calls {
+            match origin.and_then(|origin| slots[origin].take()) {
+                Some(result) => rebuilt.push(result),
+                None => rebuilt.push(json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": TOOL_RESULT_LOST,
+                })),
+            }
+        }
+    }
+
+    *messages = rebuilt;
+}
+
+fn is_tool_message(msg: &Value) -> bool {
+    msg.get("role").and_then(|r| r.as_str()) == Some("tool")
+}
+
+/// 上游对「工具调用后没等到结果」的兜底文案。
+const TOOL_RESULT_LOST: &str = "该工具调用未返回结果（对话被中断或客户端未回传），请重新发起。";
+
+fn has_tool_calls(msg: &Value) -> bool {
+    msg.get("tool_calls")
+        .and_then(|v| v.as_array())
+        .map(|calls| !calls.is_empty())
+        .unwrap_or(false)
+}
+
+fn tool_call_ids(msg: &Value) -> Vec<String> {
+    msg.get("tool_calls")
+        .and_then(|v| v.as_array())
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|c| c.get("id").and_then(|v| v.as_str()))
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn tool_call_id(msg: &Value) -> String {
+    msg.get("tool_call_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 孤儿 tool 消息 → 用户消息。内容原样保留（文本或多模态数组），只是换掉
+/// 承载它的角色；`tool_call_id` 一并丢掉，避免上游把它当未知字段。
+fn relabel_as_user(msg: Value) -> Value {
+    let content = msg.get("content").cloned().unwrap_or(json!(""));
+    json!({"role": "user", "content": content})
 }
 
 /// 把上游不认的 message 角色映射成它认识的。
@@ -426,5 +579,110 @@ mod tests {
         let mut b = body(json!({"messages": [{"role": "user", "content": content.clone()}]}));
         normalize_params(&mut b, 1000);
         assert_eq!(b["messages"][0]["content"], content);
+    }
+
+    /// 线上真实事故：一次调用 5 个工具，第一个结果带截图，适配层在工具链
+    /// 中间插了一条 user 图片消息，后面 4 个 tool 结果全变成孤儿。
+    #[test]
+    fn reorders_tool_results_split_by_interleaved_message() {
+        let mut b = body(json!({"messages": [
+            {"role": "user", "content": "看这个仓库"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "Read_8", "type": "function", "function": {"name": "Read", "arguments": "{}"}},
+                {"id": "Read_9", "type": "function", "function": {"name": "Read", "arguments": "{}"}},
+                {"id": "Read_10", "type": "function", "function": {"name": "Read", "arguments": "{}"}},
+                {"id": "Read_11", "type": "function", "function": {"name": "Read", "arguments": "{}"}},
+                {"id": "Bash_12", "type": "function", "function": {"name": "Bash", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "Read_8", "content": "shot"},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}
+            ]},
+            {"role": "tool", "tool_call_id": "Read_9", "content": "a"},
+            {"role": "tool", "tool_call_id": "Read_10", "content": "b"},
+            {"role": "tool", "tool_call_id": "Read_11", "content": "c"},
+            {"role": "tool", "tool_call_id": "Bash_12", "content": "d"}
+        ]}));
+        normalize_params(&mut b, 1000);
+
+        let msgs = b["messages"].as_array().unwrap();
+        // assistant 之后必须紧跟 5 条连续 tool 消息，且顺序与 tool_calls 一致
+        assert_eq!(msgs[1]["role"], "assistant");
+        let ids: Vec<&str> = msgs[2..7]
+            .iter()
+            .map(|m| m["tool_call_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["Read_8", "Read_9", "Read_10", "Read_11", "Bash_12"]);
+        for msg in &msgs[2..7] {
+            assert_eq!(msg["role"], "tool");
+        }
+        // 被打断的图片消息仍在，只是挪到了工具链之后
+        let image_msg = msgs[7..]
+            .iter()
+            .find(|m| m["content"].is_array())
+            .expect("图片消息不能丢");
+        assert_eq!(image_msg["role"], "user");
+        assert_eq!(msgs.len(), 8);
+    }
+
+    #[test]
+    fn backfills_missing_tool_result_instead_of_dropping_call() {
+        // 只回传了前两个结果：缺的补占位，不能删 tool_calls（否则又对不上号）
+        let mut b = body(json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                {"id": "c2", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                {"id": "c3", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c2", "content": "ok"}
+        ]}));
+        normalize_params(&mut b, 1000);
+
+        let msgs = b["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 5);
+        let ids: Vec<&str> = msgs[2..5]
+            .iter()
+            .map(|m| m["tool_call_id"].as_str().unwrap())
+            .collect();
+        // 按 tool_calls 的声明顺序补齐，c2 的真实结果被提到它该在的位置
+        assert_eq!(ids, ["c1", "c2", "c3"]);
+        assert_eq!(msgs[3]["content"], "ok");
+        assert!(msgs[2]["content"].as_str().unwrap().contains("未返回结果"));
+    }
+
+    #[test]
+    fn demotes_orphan_tool_message_without_losing_content() {
+        // 前面没有 assistant 认领这条 tool：上游会因未知 tool_call_id 拒绝，
+        // 改成 user 保留内容。
+        let mut b = body(json!({"messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "ghost", "content": "残缺结果"}
+        ]}));
+        normalize_params(&mut b, 1000);
+
+        let msgs = b["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "残缺结果");
+        assert!(msgs[1].get("tool_call_id").is_none());
+    }
+
+    #[test]
+    fn leaves_healthy_tool_chains_untouched() {
+        let healthy = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            {"role": "user", "content": "谢谢"}
+        ]);
+        let mut b = body(json!({"messages": healthy.clone()}));
+        normalize_params(&mut b, 1000);
+        assert_eq!(
+            Value::Array(b["messages"].as_array().unwrap().clone()),
+            healthy
+        );
     }
 }
