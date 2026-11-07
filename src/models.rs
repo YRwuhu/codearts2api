@@ -6,9 +6,9 @@
 //!
 //! 多账号场景下每个账号各持一个 `Catalog`，由 `Pool` 负责合并与故障切换。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -89,22 +89,37 @@ pub const NATIVE_VISION_MODELS: [&str; 8] = [
     "kimi-k2.6-vl",
 ];
 
+/// 实测 allowlist + `CODEARTS_EXTRA_VISION_MODELS` 的合并结果，小写化后缓存。
+///
+/// 能力判定会被目录同步、缓存合并、`/v1/models` 反复调用，逐个模型读环境变量
+/// 是 O(模型数 × 刷新次数) 的无谓开销。
+fn vision_allowlist() -> &'static HashSet<String> {
+    static ALLOWLIST: OnceLock<HashSet<String>> = OnceLock::new();
+    ALLOWLIST.get_or_init(|| {
+        let mut set: HashSet<String> = NATIVE_VISION_MODELS
+            .iter()
+            .map(|m| m.to_ascii_lowercase())
+            .collect();
+        if let Ok(extra) = std::env::var("CODEARTS_EXTRA_VISION_MODELS") {
+            set.extend(parse_extra_vision_models(&extra));
+        }
+        set
+    })
+}
+
+/// 解析 `CODEARTS_EXTRA_VISION_MODELS`：逗号分隔、忽略空白与空项、小写化。
+fn parse_extra_vision_models(value: &str) -> HashSet<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(|m| m.to_ascii_lowercase())
+        .collect()
+}
+
 /// 模型是否被认定为可直接读图。
 pub fn native_vision(model_id: &str) -> bool {
-    if NATIVE_VISION_MODELS
-        .iter()
-        .any(|m| m.eq_ignore_ascii_case(model_id))
-    {
-        return true;
-    }
-    std::env::var("CODEARTS_EXTRA_VISION_MODELS")
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .any(|m| !m.is_empty() && m.eq_ignore_ascii_case(model_id))
-        })
-        .unwrap_or(false)
+    vision_allowlist().contains(&model_id.to_ascii_lowercase())
 }
 
 fn builtin_model_values(value: &Value) -> Vec<&Value> {
@@ -429,29 +444,6 @@ impl Catalog {
         }
     }
 
-    /// 为附件等其他 CodeArts 端点签名，复用当前账号凭证与续期语义。
-    pub async fn signed_request(
-        &self,
-        method: &str,
-        url: &str,
-        body: &[u8],
-        extra: &[(&str, &str)],
-    ) -> Vec<(String, String)> {
-        let account = self.account().await;
-        let signer = Signer::new(&account.ak, &account.sk);
-        if account.is_oauth() {
-            signer
-                .sign_full(method, url, body, extra, account.security_token())
-                .headers
-        } else {
-            signer.sign(method, url, body, extra).headers
-        }
-    }
-
-    pub fn http_client(&self) -> reqwest::Client {
-        self.http.clone()
-    }
-
     /// 从 opengw 免费额度网关取模型列表；失败返回空。
     async fn refresh_benefit_models(&self) -> Vec<ModelInfo> {
         match self
@@ -749,16 +741,6 @@ impl Catalog {
         self.inner.read().await.models.get(id).cloned()
     }
 
-    pub async fn supports_images(&self, model_id: &str) -> bool {
-        self.inner
-            .read()
-            .await
-            .models
-            .get(model_id)
-            .map(|m| m.supports_images)
-            .unwrap_or(false)
-    }
-
     pub async fn is_agent_channel(&self, id: &str) -> bool {
         self.inner
             .read()
@@ -946,22 +928,6 @@ impl Pool {
         None
     }
 
-    /// 模型是否能原生读图。
-    ///
-    /// 优先使用运行时观察结果，其次看各账号目录里的能力标记
-    /// （目录标记已经合并了实测 allowlist）。
-    pub async fn supports_images(&self, model_id: &str) -> bool {
-        if let Some(hint) = self.vision_hint(model_id).await {
-            return hint;
-        }
-        for catalog in &self.catalogs {
-            if catalog.contains(model_id).await {
-                return catalog.supports_images(model_id).await;
-            }
-        }
-        false
-    }
-
     /// 记录一次原生识图观察结果（成功或 406）。
     pub async fn note_vision(&self, model_id: &str, supported: bool) {
         self.vision_observed
@@ -1027,12 +993,22 @@ mod tests {
     #[tokio::test]
     async fn runtime_vision_observation_overrides_catalog_flag() {
         let pool = Pool::new(Vec::new());
-        assert!(!pool.supports_images("mystery-model").await);
+        assert_eq!(pool.vision_hint("mystery-model").await, None);
         pool.note_vision("mystery-model", true).await;
         assert_eq!(pool.vision_hint("mystery-model").await, Some(true));
-        assert!(pool.supports_images("mystery-model").await);
         pool.note_vision("mystery-model", false).await;
-        assert!(!pool.supports_images("mystery-model").await);
+        assert_eq!(pool.vision_hint("mystery-model").await, Some(false));
+    }
+
+    #[test]
+    fn parses_extra_vision_models_from_env_value() {
+        let parsed = parse_extra_vision_models(" My-VL, kimi-k4 ,,  ,Glm-6 ");
+        assert!(parsed.contains("my-vl"));
+        assert!(parsed.contains("kimi-k4"));
+        assert!(parsed.contains("glm-6"));
+        assert_eq!(parsed.len(), 3);
+        assert!(parse_extra_vision_models("").is_empty());
+        assert!(parse_extra_vision_models("  ,  ").is_empty());
     }
 
     #[test]

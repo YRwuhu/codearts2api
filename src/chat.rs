@@ -139,10 +139,18 @@ pub struct CallRequest {
 ///
 /// 图片请求走「原生优先」：图片直接发给用户选择的模型；只有上游明确拒绝
 /// （406 not multimodal）时才改用 `CODEARTS_VISION_MODEL` 重发一次。
+///
+/// 注意：流式请求一旦开始输出就不能再回退——此时响应头已经发出、客户端已在
+/// 渲染，换模型重发只会让它看到两份内容。所以回退只发生在**尚未输出任何字节**
+/// 的失败上；流内 406 直接作为终止错误返回客户端（但不计入账号失败）。
 /// CloudAgent 附件会话通道已整体移除。
 pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, ApiError> {
     let pool = state.pool.read().await.clone();
     pool.ensure_fresh();
+
+    // Config 是一次请求里要反复读的东西（并发上限、日额度、开关），
+    // 每次 state.config() 都会克隆整份配置（含账号列表），这里只取一次。
+    let config = state.config();
 
     let requested_model = req
         .body
@@ -158,54 +166,55 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
         )));
     }
 
-    let has_images = req
-        .body
-        .as_object()
-        .map(params::has_image_input)
-        .unwrap_or(false);
-    if has_images {
-        if let Some(body) = req.body.as_object() {
-            params::validate_image_input(body).map_err(ApiError::bad_request)?;
-        }
-    }
+    let has_images = match req.body.as_object() {
+        Some(body) => params::validate_image_input(body).map_err(ApiError::bad_request)?,
+        None => false,
+    };
 
     let mut model = requested_model.clone();
     if has_images && pool.vision_hint(&requested_model).await == Some(false) {
         // 已经确认这个模型不读图：直接回退，省掉一次 406 往返。
         match vision_fallback(&requested_model) {
-            Some(vision) => {
+            VisionFallback::Use(vision) => {
+                if !pool.wait_for_model(&vision).await {
+                    return Err(vision_unavailable(&requested_model, &vision));
+                }
                 println!("[vision] {requested_model}: 已确认不支持原生识图，改用 {vision}");
                 model = vision;
             }
-            None => {
+            other => {
                 return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     "model_not_multimodal",
                     format!(
-                        "模型 {requested_model} 不支持图片输入（上游明确拒绝），且 CODEARTS_VISION_MODEL=off"
+                        "模型 {requested_model} 不支持图片输入（上游明确拒绝）：{}",
+                        other.reason()
                     ),
                 ));
             }
         }
     }
 
-    let mut result = run_for_model(state, &pool, &mut req, &model).await;
+    let mut result = run_for_model(state, &config, &pool, &mut req, &model).await;
 
-    let multimodal_error = result
-        .as_ref()
-        .err()
-        .filter(|error| error.code == "model_not_multimodal")
-        .map(|error| error.message.clone());
-    if has_images && model == requested_model {
-        if let Some(message) = multimodal_error {
+    // 只有「还没输出任何东西」的 406 才能回退：Outcome::Stream 代表上游已经
+    // 接受了请求并开始吐字节，此时换模型会污染客户端看到的流。
+    let can_fallback = !matches!(result, Ok(Outcome::Stream(_)));
+    if has_images && model == requested_model && can_fallback {
+        let rejected = result
+            .as_ref()
+            .err()
+            .filter(|error| error.code == "model_not_multimodal")
+            .map(|error| error.message.clone());
+        if let Some(message) = rejected {
             pool.note_vision(&requested_model, false).await;
-            if let Some(vision) = vision_fallback(&requested_model) {
+            if let VisionFallback::Use(vision) = vision_fallback(&requested_model) {
                 if pool.wait_for_model(&vision).await {
                     println!(
                         "[vision] {requested_model}: 上游拒绝原生识图（{message}），回退 {vision}"
                     );
                     model = vision;
-                    result = run_for_model(state, &pool, &mut req, &model).await;
+                    result = run_for_model(state, &config, &pool, &mut req, &model).await;
                 } else {
                     println!("[vision] {requested_model}: 回退模型 {vision} 尚未同步");
                 }
@@ -215,7 +224,9 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
 
     match result {
         Ok(outcome) => {
-            if has_images {
+            // 只有完整落地的响应才算「这个模型确实能读图」；流式在拿到响应头
+            // 时就返回了，那时还没读到任何模型输出，记 true 会让能力缓存偏乐观。
+            if has_images && matches!(outcome, Outcome::Json(_)) {
                 pool.note_vision(&model, true).await;
             }
             Ok(outcome)
@@ -234,18 +245,62 @@ pub async fn execute(state: &WebState, mut req: CallRequest) -> Result<Outcome, 
 /// 必须是实测支持原生识图的模型；账号没开通时回退不会生效，会返回原始 406。
 pub const DEFAULT_VISION_MODEL: &str = "deepseek-v4.1-flash-1017";
 
-/// 读取回退配置；`off`、空值或与当前模型相同都表示不启用回退。
-fn vision_fallback(current: &str) -> Option<String> {
+/// `CODEARTS_VISION_MODEL` 的解析结果。
+///
+/// 分开建模是因为「不启用回退」有三种完全不同的原因，给用户的建议也不同：
+/// 关闭、没填、以及配的正好就是当前模型（常见于单模型部署）。
+#[derive(Debug, PartialEq, Eq)]
+enum VisionFallback {
+    Use(String),
+    Off,
+    Empty,
+    SameAsCurrent,
+}
+
+impl VisionFallback {
+    /// 不可回退时给调用方看的说明。
+    fn reason(&self) -> &'static str {
+        match self {
+            VisionFallback::Use(_) => "已配置回退模型",
+            VisionFallback::Off => "CODEARTS_VISION_MODEL=off（已关闭回退）",
+            VisionFallback::Empty => "CODEARTS_VISION_MODEL 为空",
+            VisionFallback::SameAsCurrent => "CODEARTS_VISION_MODEL 与当前模型相同，回退没有意义",
+        }
+    }
+}
+
+/// 读取回退配置；`off`、空值或与当前模型相同都不启用回退。
+fn vision_fallback(current: &str) -> VisionFallback {
     let configured =
         std::env::var("CODEARTS_VISION_MODEL").unwrap_or_else(|_| DEFAULT_VISION_MODEL.to_string());
+    classify_vision_fallback(&configured, current)
+}
+
+/// `vision_fallback` 的纯函数部分，便于单测。
+fn classify_vision_fallback(configured: &str, current: &str) -> VisionFallback {
     let configured = configured.trim();
-    if configured.is_empty()
-        || configured.eq_ignore_ascii_case("off")
-        || configured.eq_ignore_ascii_case(current)
-    {
-        return None;
+    if configured.is_empty() {
+        return VisionFallback::Empty;
     }
-    Some(configured.to_string())
+    if configured.eq_ignore_ascii_case("off") {
+        return VisionFallback::Off;
+    }
+    if configured.eq_ignore_ascii_case(current) {
+        return VisionFallback::SameAsCurrent;
+    }
+    VisionFallback::Use(configured.to_string())
+}
+
+/// 回退模型在目录里找不到时的错误：说清是回退链路的问题，而不是调用方选错了模型。
+fn vision_unavailable(requested: &str, vision: &str) -> ApiError {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "model_not_multimodal",
+        format!(
+            "模型 {requested} 不支持图片输入，回退模型 {vision} 尚未同步或当前账号未开通；\
+             请刷新模型目录，或把 CODEARTS_VISION_MODEL 改成可用模型"
+        ),
+    )
 }
 
 /// 按指定模型执行一次完整请求（账号选择、并发槽位、签名、失败重试）。
@@ -253,6 +308,7 @@ fn vision_fallback(current: &str) -> Option<String> {
 /// 现在只处理文本/原生图片；不再有 CloudAgent 附件会话分支。
 async fn run_for_model(
     state: &WebState,
+    config: &crate::config::Config,
     pool: &Pool,
     req: &mut CallRequest,
     model: &str,
@@ -268,7 +324,7 @@ async fn run_for_model(
     let cap = pool
         .max_tokens_of(model)
         .await
-        .unwrap_or(state.config().max_tokens_cap);
+        .unwrap_or(config.max_tokens_cap);
 
     if let Some(obj) = req.body.as_object_mut() {
         if let Some((orig, capped)) = params::normalize_params(obj, cap) {
@@ -311,10 +367,10 @@ async fn run_for_model(
     // 多账号时先剔除冷却中 / 该模型正在冷却 / 当日额度用尽的；
     // 全都不可用时退回完整列表（排队等），而不是直接拒绝。
     if candidates.len() > 1 {
-        let daily_cap = state.config().daily_token_cap;
+        let daily_cap = config.daily_token_cap;
         let mut ready = Vec::new();
         for c in &candidates {
-            let gate = state.gate(c.account_id(), state.config().concurrency).await;
+            let gate = state.gate(c.account_id(), config.concurrency).await;
             if !gate.available().await {
                 continue;
             }
@@ -334,9 +390,9 @@ async fn run_for_model(
     // 单账号但额度/模型被挡时，明确告诉调用方原因，别静默失败。
     if candidates.len() == 1 {
         let gate = state
-            .gate(candidates[0].account_id(), state.config().concurrency)
+            .gate(candidates[0].account_id(), config.concurrency)
             .await;
-        let daily_cap = state.config().daily_token_cap;
+        let daily_cap = config.daily_token_cap;
         if daily_cap > 0 && gate.daily_tokens().await >= daily_cap {
             return Err(ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -366,14 +422,14 @@ async fn run_for_model(
     // 边生成边渲染/边执行体验，而这正是"工具调用和编辑文件很怪"的根源。
     let mut use_upstream_stream = req.stream;
     let tool_turn = req.stream && tool_turn(&req.body);
-    if tool_turn && state.config().tool_turn_plain {
+    if tool_turn && config.tool_turn_plain {
         use_upstream_stream = false;
     }
 
     if req.stream {
         let mut with_slot = Vec::new();
         for c in &candidates {
-            let gate = state.gate(c.account_id(), state.config().concurrency).await;
+            let gate = state.gate(c.account_id(), config.concurrency).await;
             if gate.free_stream_slots().await > 0 {
                 with_slot.push(c.clone());
             }
@@ -382,7 +438,7 @@ async fn run_for_model(
             // 有槽位的账号排前面
             candidates = with_slot;
         } else if with_slot.is_empty() && use_upstream_stream {
-            if state.config().stream_degrade {
+            if config.stream_degrade {
                 use_upstream_stream = false;
                 println!("[pool] {model}: 流式名额已满，改用非流式上游并本地合成 SSE（不占名额）");
             } else {
@@ -410,9 +466,7 @@ async fn run_for_model(
     let mut last: Option<ApiError> = None;
 
     for (idx, catalog) in candidates.iter().enumerate() {
-        let gate = state
-            .gate(catalog.account_id(), state.config().concurrency)
-            .await;
+        let gate = state.gate(catalog.account_id(), config.concurrency).await;
 
         // 撞上 TM.00001041 时的重试次数。窗口是按本地时钟估算的，两个请求
         // 同时越过边界时仍可能有一个被上游拒掉；重试一次几乎总能成功，
@@ -471,7 +525,7 @@ async fn run_for_model(
                     switch_account,
                 }) => {
                     // 模型能力错误不是账号故障：不计失败、不触发账号冷却。
-                    if error.code != "model_not_multimodal" {
+                    if is_account_failure(&error.code) {
                         gate.note_failure(&error.message).await;
                     }
                     // 模型级失败（该账号没有这个模型 / 该模型额度耗尽）只让这一个
@@ -677,9 +731,22 @@ async fn attempt(
                 }
             }
             let usage = result.get("usage").cloned();
-            record_usage(state, model, &account_id, true, started, usage.as_ref()).await;
-            let stream = single_chunk_stream(result);
-            return Ok(Attempt::Done(Outcome::Stream(stream)));
+            record_usage(
+                state,
+                &gate,
+                model,
+                &account_id,
+                true,
+                started,
+                usage.as_ref(),
+            )
+            .await;
+            // 与「客户端要流式、上游走非流式」那条路径保持同一形态，
+            // 顺带把 usage 单独补一帧（旧的单帧包装会把它丢掉）。
+            let chunk = chat_chunk_from_completion(&result);
+            return Ok(Attempt::Done(Outcome::Stream(paced_stream(vec![
+                chunk, result,
+            ]))));
         }
 
         let stream = sse_stream(
@@ -737,6 +804,7 @@ async fn attempt(
 
     record_usage(
         state,
+        &gate,
         model,
         &account_id,
         client_stream,
@@ -758,8 +826,11 @@ async fn attempt(
 }
 
 /// 记录一条用量，并把 token 计入该账号的当日预算。
+///
+/// 调用方已持有该账号的 `gate`，直接复用，避免再按账号查表并克隆一次配置。
 async fn record_usage(
     state: &WebState,
+    gate: &crate::concurrency::AccountGate,
     model: &str,
     account_id: &str,
     stream: bool,
@@ -781,11 +852,7 @@ async fn record_usage(
         .and_then(|u| u.get("total_tokens"))
         .and_then(|v| v.as_i64())
     {
-        state
-            .gate(account_id, state.config().concurrency)
-            .await
-            .add_daily_tokens(total)
-            .await;
+        gate.add_daily_tokens(total).await;
     }
 }
 
@@ -841,6 +908,15 @@ fn tool_turn(body: &Value) -> bool {
         .and_then(|t| t.as_array())
         .map(|t| !t.is_empty())
         .unwrap_or(false)
+}
+
+/// 该错误是否应当计入账号失败。
+///
+/// `model_not_multimodal` 是上游对**模型能力**的拒绝：换账号、续凭证都改变不了
+/// 结果，记进失败只会把健康的账号打成冷却（连续 3 次即触发）。
+/// 其余错误（429/401/5xx/网络）仍然按账号故障处理。
+fn is_account_failure(code: &str) -> bool {
+    code != "model_not_multimodal"
 }
 
 /// 把上游错误归类：可换号的账号级错误 vs 客户端错误。
@@ -922,15 +998,6 @@ fn classify_failure(status: StatusCode, code: &str, msg: &str) -> Attempt {
     }
 }
 
-/// 上游对 stream=true 回了普通 JSON 时，包成一次性的流。
-fn single_chunk_stream(result: Value) -> EventStream {
-    let chunk = chat_chunk_from_completion(&result);
-    Box::pin(futures_util::stream::iter(vec![
-        Ok(StreamEvent::Chunk(chunk)),
-        Ok(StreamEvent::Done),
-    ]))
-}
-
 /// 把 `chat.completion` 转成单帧 `chat.completion.chunk`。
 pub fn chat_chunk_from_completion(result: &Value) -> Value {
     let mut choices = Vec::new();
@@ -1001,7 +1068,7 @@ fn sse_stream(
         let Some(completion) = completion else { return };
         match completion.result {
             Ok(()) => {
-                record_usage(&state, &model, &account, true, started, completion.usage.as_ref()).await;
+                record_usage(&state, &gate, &model, &account, true, started, completion.usage.as_ref()).await;
                 yield Ok(StreamEvent::Done);
             }
             Err(error) => {
@@ -1012,7 +1079,11 @@ fn sse_stream(
                     true,
                     format!("{}: {}", error.code, error.message),
                 )).await;
-                gate.note_failure(&error.message).await;
+                // 流内 406 是模型能力问题，不是账号故障；计进失败会让连续几次
+                // 带图请求把账号打成冷却。这里与 run_for_model 共用同一判定。
+                if is_account_failure(&error.code) {
+                    gate.note_failure(&error.message).await;
+                }
                 yield Err(error);
             }
         }
@@ -1309,6 +1380,47 @@ mod tests {
             "code": "InferHub.001001005.400", "message": "The request model is not multimodal"
         }}));
         assert_eq!(stream.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn multimodal_rejection_is_not_an_account_failure() {
+        // 模型能力错误换号无用，不能把健康账号打成冷却。
+        assert!(!is_account_failure("model_not_multimodal"));
+        for code in [
+            "rate_limit_error",
+            "authentication_error",
+            "upstream_network_error",
+            "upstream_unavailable",
+        ] {
+            assert!(is_account_failure(code), "{code} 应计入账号失败");
+        }
+    }
+
+    #[test]
+    fn classifies_vision_fallback_reasons() {
+        assert_eq!(
+            classify_vision_fallback("", "glm-5.3"),
+            VisionFallback::Empty
+        );
+        assert_eq!(
+            classify_vision_fallback("  OFF  ", "glm-5.3"),
+            VisionFallback::Off
+        );
+        // 配的正好是当前模型：不能报成 off。
+        assert_eq!(
+            classify_vision_fallback("GLM-5.3", "glm-5.3"),
+            VisionFallback::SameAsCurrent
+        );
+        assert_eq!(
+            classify_vision_fallback(" deepseek-v4.1-flash-1017 ", "glm-5.3"),
+            VisionFallback::Use("deepseek-v4.1-flash-1017".to_string())
+        );
+        // 三种「不启用」的文案必须能区分开。
+        assert_ne!(
+            VisionFallback::SameAsCurrent.reason(),
+            VisionFallback::Off.reason()
+        );
+        assert_ne!(VisionFallback::Empty.reason(), VisionFallback::Off.reason());
     }
 
     #[test]

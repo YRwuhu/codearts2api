@@ -133,7 +133,15 @@ Model    : deepseek-v4.1-flash
 2. 上游明确 406 `The request model is not multimodal` 时，把该模型记为
    纯文本，并改用 `CODEARTS_VISION_MODEL`（默认 `deepseek-v4.1-flash-1017`）
    重发一次；已确认纯文本的模型后续直接回退，不再多打一次 406；
-3. `CODEARTS_VISION_MODEL=off` 或回退模型不可用 → 返回 400 并说明原因。
+3. `CODEARTS_VISION_MODEL=off`（或为空、或配成与当前模型相同）或回退模型
+   未同步 → 返回 400 并说明具体原因。
+
+**流式请求只有在还没输出任何内容时才回退。** 响应头一旦发出、客户端已经开始
+渲染，换模型重发只会让它看到两份内容。因此：
+
+- `stream: false`：完整的一次回退（原生 → 406 → 回退模型）；
+- `stream: true`：上游在流里回 406 时直接作为终止错误返回客户端，不重发；
+  这类拒绝**不计入账号失败**，不会把账号打成冷却。
 
 已知纯文本模型：`glm-5.3`、`GLM-5.2`、`glm-5.2-sft-harmony`、
 `openpangu-2.0-pro`、`openpangu-2.0-flash`。对这些模型带图会自动回退。
@@ -141,13 +149,14 @@ Model    : deepseek-v4.1-flash
 图片约束：
 
 - 只接受 base64 `data:image/...;base64,...`；远程 `http(s)://` 图片 URL
-  会直接返回 400（上游只认 data URL）。可选方案 B（代理下载远程图片再转
-  base64）见 `docs/原生识图改造方案.md` 第 5.4 节；
+  会直接返回 400（上游只认 data URL，传链接会被 `ModelArts.81001` 拒绝），
+  请先在客户端把图片内联；
 - 支持 PNG / JPEG / WebP / GIF；单图解码后不超过 20 MiB；一条消息可多图；
 - 校验在本地完成，参数错误不会白烧上游额度。
 
-新模型不用等发版：未登记模型第一次带图会先尝试原生，成功即自动学习为可用；
-也可以 `CODEARTS_EXTRA_VISION_MODELS=model-a,model-b` 显式追加。
+新模型不用等发版：未登记模型第一次带图会先尝试原生，成功即自动学习为可用
+（只在上游完整返回后记录，流式请求不记账）；也可以
+`CODEARTS_EXTRA_VISION_MODELS=model-a,model-b` 显式追加。
 
 诊断结构日志 `CODEARTS_DEBUG_REQUEST_SHAPE=1` 只输出角色、block 类型、
 图片 MIME/大小，不输出正文、base64 或凭证。

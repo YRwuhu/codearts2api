@@ -89,31 +89,40 @@ pub fn normalize_roles(body: &mut Map<String, Value>) {
 /// 这里只挡住明显异常的 payload，避免白烧一次额度。
 pub const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
-/// 原生识图的图片入参校验。
+/// 原生识图的图片入参校验，返回 `true` 表示请求里确实带了图片。
 ///
 /// 上游 `/api/v2/chat/completions` 只接受 base64 `data:` URL：远程
 /// `http(s)://` 会被 `400 ModelArts.81001 unsupported image url` 拒绝。
 /// 在发请求前给出可读错误，省掉一次注定失败的往返。
-pub fn validate_image_input(body: &Map<String, Value>) -> Result<(), String> {
+///
+/// 顺带把「有没有图片」一起算出来，调用方不必再遍历一遍整个 body。
+pub fn validate_image_input(body: &Map<String, Value>) -> Result<bool, String> {
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
-        return Ok(());
+        return Ok(false);
     };
+    let mut found = false;
     for message in messages {
         let Some(parts) = message.get("content").and_then(Value::as_array) else {
             continue;
         };
         for part in parts {
-            if !matches!(
-                part.get("type").and_then(Value::as_str),
-                Some("image_url" | "input_image" | "image")
-            ) {
+            if !is_image_part(part) {
                 continue;
             }
+            found = true;
             let url = image_url_of(part).ok_or("图片缺少 URL")?;
             check_image_url(url)?;
         }
     }
-    Ok(())
+    Ok(found)
+}
+
+/// 该 content part 是否是图片块（三种协议归一化后的形状）。
+fn is_image_part(part: &Value) -> bool {
+    matches!(
+        part.get("type").and_then(Value::as_str),
+        Some("image_url" | "input_image" | "image")
+    )
 }
 
 /// 从各家协议的图片块里取出 URL：OpenAI / Responses / Anthropic 三种形状。
@@ -133,8 +142,8 @@ fn image_url_of(part: &Value) -> Option<&str> {
 fn check_image_url(url: &str) -> Result<(), String> {
     if url.starts_with("http://") || url.starts_with("https://") {
         return Err(
-            "上游只接受 base64 data URL，不接受远程图片 URL；请在客户端内联图片；\
-             代理下载转码的可选方案见 docs/原生识图改造方案.md 第 5.4 节"
+            "上游只接受 base64 data URL，不接受远程图片 URL；请先在客户端把图片内联为 \
+             data:image/...;base64,..."
                 .into(),
         );
     }
@@ -157,47 +166,43 @@ fn check_image_url(url: &str) -> Result<(), String> {
     ) {
         return Err(format!("不支持的图片类型 {mime}；支持 PNG/JPEG/WebP/GIF"));
     }
-    let decoded = base64_decoded_len(payload);
+    let decoded = base64_decoded_len_capped(payload, MAX_IMAGE_BYTES);
     if decoded == 0 {
         return Err("图片内容为空".into());
     }
     if decoded > MAX_IMAGE_BYTES {
         return Err(format!(
-            "单张图片解码后约 {decoded} 字节，超过上限 {MAX_IMAGE_BYTES} 字节"
+            "单张图片超过上限 {MAX_IMAGE_BYTES} 字节（约 {} MiB）",
+            MAX_IMAGE_BYTES / 1024 / 1024
         ));
     }
     Ok(())
 }
 
-/// 估算 base64 解码后的字节数（不计空白与补位），用于大小校验。
-fn base64_decoded_len(payload: &str) -> usize {
-    let chars = payload
-        .bytes()
-        .filter(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
-        .count();
+/// 估算 base64 解码后的字节数（不计空白与补位），超过 `limit` 就提前返回。
+///
+/// 一张 20 MiB 的图片对应约 27 MB 的 base64 字符串；全量扫完没有意义，
+/// 达到上限即可判定超限并停止。
+fn base64_decoded_len_capped(payload: &str, limit: usize) -> usize {
+    // 解码后字节数 ≈ 有效字符数 * 3 / 4，反推需要扫描的字符数上限。
+    let max_chars = limit.saturating_mul(4) / 3 + 4;
+    let mut chars = 0usize;
+    for byte in payload.bytes() {
+        if byte.is_ascii_whitespace() || byte == b'=' {
+            continue;
+        }
+        chars += 1;
+        if chars > max_chars {
+            return chars.saturating_mul(3) / 4;
+        }
+    }
     chars.saturating_mul(3) / 4
 }
 
-pub fn has_image_input(body: &Map<String, Value>) -> bool {
-    body.get("messages")
-        .and_then(|v| v.as_array())
-        .map(|messages| {
-            messages.iter().any(|message| {
-                message
-                    .get("content")
-                    .and_then(|v| v.as_array())
-                    .map(|parts| {
-                        parts.iter().any(|part| {
-                            matches!(
-                                part.get("type").and_then(|v| v.as_str()),
-                                Some("image_url" | "input_image" | "image")
-                            )
-                        })
-                    })
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
+/// 估算 base64 解码后的字节数（不计空白与补位），用于大小校验。
+#[cfg(test)]
+fn base64_decoded_len(payload: &str) -> usize {
+    base64_decoded_len_capped(payload, usize::MAX / 4)
 }
 
 /// 只记录多模态消息结构，绝不输出提示词、base64 或凭证。
@@ -336,12 +341,32 @@ mod tests {
 
     #[test]
     fn detects_images_only_in_structured_content() {
+        // 字符串里的 image_url 只是文本，不算图片入参。
         let text = body(json!({"messages":[{"role":"user","content":"image_url"}]}));
-        assert!(!has_image_input(&text));
+        assert_eq!(validate_image_input(&text), Ok(false));
+
         let image = body(json!({"messages":[{"role":"user","content":[
             {"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}
         ]}]}));
-        assert!(has_image_input(&image));
+        assert_eq!(validate_image_input(&image), Ok(true));
+    }
+
+    #[test]
+    fn reports_found_images_in_every_supported_shape() {
+        let multi = body(json!({"messages": [
+            {"role": "user", "content": "先看这张"},
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+                {"type": "input_image", "image_url": "data:image/jpeg;base64,QUJD"}
+            ]}
+        ]}));
+        assert_eq!(validate_image_input(&multi), Ok(true));
+
+        // 没有 messages 也没有图片：不算带图，也不报错。
+        let empty = body(json!({"messages": []}));
+        assert_eq!(validate_image_input(&empty), Ok(false));
+        let bare = body(json!({}));
+        assert_eq!(validate_image_input(&bare), Ok(false));
     }
 
     #[test]
@@ -353,7 +378,7 @@ mod tests {
             {"type": "image", "url": "data:image/webp;base64,QUJD"},
             {"type": "image", "source": {"type": "url", "url": "data:image/gif;base64,QUJD"}}
         ]}]}));
-        assert!(validate_image_input(&b).is_ok());
+        assert_eq!(validate_image_input(&b), Ok(true));
     }
 
     #[test]
@@ -379,6 +404,15 @@ mod tests {
         assert_eq!(base64_decoded_len("QUJD"), 3);
         assert_eq!(base64_decoded_len("QUJD\nRA=="), 4);
         assert!(base64_decoded_len(&"A".repeat(MAX_IMAGE_BYTES / 3 * 4 + 8)) > MAX_IMAGE_BYTES);
+    }
+
+    #[test]
+    fn stops_scanning_once_the_limit_is_exceeded() {
+        // 远超上限的 payload 只需扫到阈值，没必要全量遍历 27 MB。
+        let huge = "A".repeat(MAX_IMAGE_BYTES / 3 * 4 * 4);
+        assert!(base64_decoded_len_capped(&huge, MAX_IMAGE_BYTES) > MAX_IMAGE_BYTES);
+        // 刚好在上限内仍要精确。
+        assert_eq!(base64_decoded_len_capped("QUJD", MAX_IMAGE_BYTES), 3);
     }
 
     #[test]
