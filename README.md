@@ -79,6 +79,7 @@ codearts2api.exe benefit claim   手动签到领额度
 - 同一对话会固定路由到同一账号（prompt cache 是账号级的）。
 - 支持模型原生识图：图片直接内嵌发送，不再绕网页附件会话；纯文本模型收到图片会自动回退视觉模型（`CODEARTS_VISION_MODEL`，设为 `off` 可关闭）。
 - 上游内容审核误拦截（`InferHub.ModelArts.81011.403`，返回一段固定拒答）会自动立即重试，最多 5 次，不计账号失败。
+- `/v1/responses` 完整兼容 Codex / ZCode：思维链走 reasoning summary 事件，`response.completed` 带齐 usage，不会把思维链当正文显示。
 - 服务启动后自动签到领每日免费额度，不用管。
 - 默认只监听本机。改成 `0.0.0.0` 的话同网段谁都能用你的额度，自己掂量。
 - 用量数据存在 `usage.jsonl`，面板里能看趋势和明细。

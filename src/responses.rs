@@ -316,11 +316,15 @@ pub fn from_chat_completion(completion: &Value, original: &Value) -> Value {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if !reasoning_text.is_empty() {
+            // 推理内容只能进 reasoning item 的 `summary`（`summary_text` 块）。
+            // 绝不能复制成 `output_text`：ZCode/Codex 会把它当正文渲染，表现就是
+            // "思维链变成了正常回复"。只用思维链、没有正文的轮次由 summary 承载，
+            // 客户端据此知道模型确实产出了内容，不会判定为空响应后反复重试。
             output.push(json!({
                 "type": "reasoning",
                 "id": format!("rs_{}", crate::chat::uuid_ish()),
-                "summary": [],
-                "content": [{"type": "reasoning_text", "text": reasoning_text}],
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": reasoning_text}],
             }));
         }
 
@@ -328,13 +332,6 @@ pub fn from_chat_completion(completion: &Value, original: &Value) -> Value {
             if !content.is_empty() {
                 output_text = content.to_string();
             }
-        }
-
-        // 上游在 max_output_tokens 偏小时可能只吐 reasoning、content 为空，
-        // 甚至干脆没有 content 字段。此时如果 output 为空，客户端会看到
-        // "completed 但什么都没有"。用推理内容兜底，避免静默空响应。
-        if output_text.is_empty() && !reasoning_text.is_empty() {
-            output_text = reasoning_text.to_string();
         }
 
         if !output_text.is_empty() {
@@ -366,20 +363,10 @@ pub fn from_chat_completion(completion: &Value, original: &Value) -> Value {
         }
     }
 
-    let usage = completion.get("usage");
-    let input_tokens = usage
-        .and_then(|u| u.get("prompt_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let output_tokens = usage
-        .and_then(|u| u.get("completion_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let reasoning_tokens = usage
-        .and_then(|u| u.get("completion_tokens_details"))
-        .and_then(|d| d.get("reasoning_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+    let usage = completion
+        .get("usage")
+        .map(usage_from_chat)
+        .unwrap_or_else(|| usage_from_chat(&json!({})));
 
     json!({
         "id": id,
@@ -392,17 +379,47 @@ pub fn from_chat_completion(completion: &Value, original: &Value) -> Value {
         "parallel_tool_calls": true,
         "tool_choice": original.get("tool_choice").cloned().unwrap_or(json!("auto")),
         "tools": original.get("tools").cloned().unwrap_or(json!([])),
-        "usage": {
-            "input_tokens": input_tokens,
-            "input_tokens_details": {"cached_tokens": 0},
-            "output_tokens": output_tokens,
-            "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
-            "total_tokens": input_tokens + output_tokens,
-        },
+        "usage": usage,
         "error": Value::Null,
         "incomplete_details": Value::Null,
         "instructions": original.get("instructions").cloned().unwrap_or(Value::Null),
         "metadata": original.get("metadata").cloned().unwrap_or(json!({})),
+    })
+}
+
+/// chat 风格 usage → Responses 风格 usage。
+///
+/// 上游给的是 `prompt_tokens` / `completion_tokens`，而 Responses 客户端的
+/// schema 要求 `input_tokens` / `output_tokens` 且**必须存在**；直接透传会让
+/// `response.completed` 整帧校验失败。
+fn usage_from_chat(chat: &Value) -> Value {
+    let input = chat
+        .get("prompt_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let output = chat
+        .get("completion_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let reasoning = chat
+        .get("completion_tokens_details")
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let cached = chat
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    json!({
+        "input_tokens": input,
+        "input_tokens_details": {"cached_tokens": cached},
+        "output_tokens": output,
+        "output_tokens_details": {"reasoning_tokens": reasoning},
+        "total_tokens": chat
+            .get("total_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(input + output),
     })
 }
 
@@ -428,6 +445,12 @@ pub fn stream_body(stream: EventStream, model: Option<&str>) -> Response {
         let mut message_index = 0;
         let mut tool_items: std::collections::BTreeMap<i64, ResponseTool> =
             std::collections::BTreeMap::new();
+        // 上游 usage 通常在最后一个 choices 为空的帧里；`response.completed` 的
+        // usage 在 ZCode/Responses 客户端 schema 里是**必填**字段，缺了整帧会被
+        // 判为非法、降级成 unknown_chunk，客户端就永远收不到 finish。
+        let mut usage: Option<Value> = None;
+        // finish_reason 决定结束事件是 completed 还是 incomplete。
+        let mut finish_reason: Option<String> = None;
 
         // response.created
         sequence += 1;
@@ -462,13 +485,30 @@ pub fn stream_body(stream: EventStream, model: Option<&str>) -> Response {
                     yield ": keepalive\n\n".to_string();
                 }
                 Ok(StreamEvent::Chunk(chunk)) => {
+                    // usage 帧的 choices 是空数组，必须在取 choices 之前先收下。
+                    if let Some(u) = chunk.get("usage").filter(|u| !u.is_null()) {
+                        usage = Some(u.clone());
+                    }
                     let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) else {
                         continue;
                     };
                     for choice in choices {
+                        if let Some(reason) = choice
+                            .get("finish_reason")
+                            .and_then(|v| v.as_str())
+                            .filter(|r| !r.is_empty())
+                        {
+                            finish_reason = Some(reason.to_string());
+                        }
                         let Some(delta) = choice.get("delta") else { continue };
 
-                        // 推理内容 → reasoning item
+                        // 推理内容 → reasoning item。
+                        //
+                        // 事件名必须是 `response.reasoning_summary_text.delta`：
+                        // ZCode 的 Responses 解析器只认这个（以及 output_text /
+                        // function_call_arguments 的 delta）。旧版发的是
+                        // `reasoning_text.delta`，不在白名单里，整段思维链被丢弃，
+                        // 客户端就认为这轮"零输出"，进而重发同一请求。
                         if let Some(r) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
                             if !r.is_empty() {
                                 if !reasoning_open {
@@ -484,18 +524,29 @@ pub fn stream_body(stream: EventStream, model: Option<&str>) -> Response {
                                         "item": {
                                             "type": "reasoning",
                                             "id": reasoning_id,
-                                            "summary": [],
+                                            "status": "in_progress",
                                         }
                                     }));
-                                    reasoning_text.push_str(r);
+                                    sequence += 1;
+                                    yield sse_event("response.reasoning_summary_part.added", json!({
+                                        "type": "response.reasoning_summary_part.added",
+                                        "sequence_number": sequence,
+                                        "item_id": reasoning_id,
+                                        "output_index": reasoning_index,
+                                        "summary_index": 0,
+                                        "part": {"type": "summary_text", "text": ""},
+                                    }));
                                 }
+                                // 累加必须放在"是否首次"判断之外，否则 done 事件里的
+                                // 全文只有第一个增量。
+                                reasoning_text.push_str(r);
                                 sequence += 1;
-                                yield sse_event("response.reasoning_text.delta", json!({
-                                    "type": "response.reasoning_text.delta",
+                                yield sse_event("response.reasoning_summary_text.delta", json!({
+                                    "type": "response.reasoning_summary_text.delta",
                                     "sequence_number": sequence,
                                     "item_id": reasoning_id,
                                     "output_index": reasoning_index,
-                                    "content_index": 0,
+                                    "summary_index": 0,
                                     "delta": r,
                                 }));
                             }
@@ -534,8 +585,10 @@ pub fn stream_body(stream: EventStream, model: Option<&str>) -> Response {
                                         "content_index": 0,
                                         "part": {"type": "output_text", "text": "", "annotations": []},
                                     }));
-                                    message_text.push_str(text);
                                 }
+                                // 与思维链同理：每个增量都要累加，否则收尾事件里的
+                                // 全文只有首段。
+                                message_text.push_str(text);
                                 sequence += 1;
                                 yield sse_event("response.output_text.delta", json!({
                                     "type": "response.output_text.delta",
@@ -555,7 +608,15 @@ pub fn stream_body(stream: EventStream, model: Option<&str>) -> Response {
                                 let func = call.get("function");
                                 let name = func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("");
                                 let args = func.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("");
-                                let is_new = {
+                                // 上游首个工具帧可能只有 index/type，没有名字和参数。
+                                // 这类空帧不能标记"已开始"，否则真正的首个有效帧会被
+                                // 当成后续帧，客户端永远收不到 output_item.added，
+                                // 后续 arguments.delta 全被丢弃。
+                                let has_payload = !name.is_empty() || !args.is_empty();
+                                if !has_payload {
+                                    continue;
+                                }
+                                let (is_new, item_id, call_id, tool_name, output_index) = {
                                     let entry = tool_items.entry(idx).or_insert_with(|| {
                                         item_index += 1;
                                         ResponseTool {
@@ -572,19 +633,25 @@ pub fn stream_body(stream: EventStream, model: Option<&str>) -> Response {
                                             entry.call_id = id.to_string();
                                         }
                                     }
+                                    // 上游偶尔不给 call id。留空会让客户端回传工具结果时
+                                    // 无法匹配 `function_call_output.call_id`，整条工具链
+                                    // 断掉（表现为"工具调用之后就没反应了"）。补一个稳定的
+                                    // 本地 id，保证一轮内 call_id 前后一致。
+                                    if entry.call_id.is_empty() {
+                                        entry.call_id = format!("call_{}", crate::chat::uuid_ish());
+                                    }
                                     entry.name.push_str(name);
                                     entry.arguments.push_str(args);
                                     let is_new = !entry.started;
                                     entry.started = true;
-                                    is_new
+                                    (
+                                        is_new,
+                                        entry.item_id.clone(),
+                                        entry.call_id.clone(),
+                                        entry.name.clone(),
+                                        entry.output_index,
+                                    )
                                 };
-                                let (item_id, call_id, tool_name, output_index) = {
-                                    let entry = tool_items.get(&idx).expect("tool exists");
-                                    (entry.item_id.clone(), entry.call_id.clone(), entry.name.clone(), entry.output_index)
-                                };
-                                if !tool_items.get(&idx).map(|t| !t.arguments.is_empty() || !t.name.is_empty()).unwrap_or(false) {
-                                    continue;
-                                }
                                 if is_new {
                                     sequence += 1;
                                     yield sse_event("response.output_item.added", json!({
@@ -632,19 +699,35 @@ pub fn stream_body(stream: EventStream, model: Option<&str>) -> Response {
         }
 
         // 收尾：每个 item 使用创建时的 ID 与 output_index。
+        //
+        // 这里同时构造 `response.completed` 里要回放的完整 output 数组。
+        let mut output_items: Vec<Value> = Vec::new();
+
         if reasoning_open {
             sequence += 1;
-            yield sse_event("response.reasoning_text.done", json!({
-                "type": "response.reasoning_text.done", "sequence_number": sequence,
+            yield sse_event("response.reasoning_summary_text.done", json!({
+                "type": "response.reasoning_summary_text.done", "sequence_number": sequence,
                 "item_id": reasoning_id, "output_index": reasoning_index,
-                "content_index": 0, "text": reasoning_text,
+                "summary_index": 0, "text": reasoning_text,
             }));
+            sequence += 1;
+            yield sse_event("response.reasoning_summary_part.done", json!({
+                "type": "response.reasoning_summary_part.done", "sequence_number": sequence,
+                "item_id": reasoning_id, "output_index": reasoning_index,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": reasoning_text},
+            }));
+            let item = json!({
+                "type": "reasoning", "id": reasoning_id, "status": "completed",
+                "summary": [{"type": "summary_text", "text": reasoning_text}],
+            });
             sequence += 1;
             yield sse_event("response.output_item.done", json!({
                 "type": "response.output_item.done", "sequence_number": sequence,
                 "output_index": reasoning_index,
-                "item": {"type": "reasoning", "id": reasoning_id, "summary": []},
+                "item": item.clone(),
             }));
+            output_items.push(item);
         }
         if text_open {
             sequence += 1;
@@ -661,42 +744,75 @@ pub fn stream_body(stream: EventStream, model: Option<&str>) -> Response {
             }));
         }
         if output_item_open {
+            // done 事件必须带完整 content；只发 id/role 会让客户端拿到空消息。
+            let item = json!({
+                "type": "message", "id": message_id, "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": message_text, "annotations": []}],
+            });
             sequence += 1;
             yield sse_event("response.output_item.done", json!({
                 "type": "response.output_item.done", "sequence_number": sequence,
                 "output_index": message_index,
-                "item": {"type": "message", "id": message_id, "status": "completed", "role": "assistant"},
+                "item": item.clone(),
             }));
+            output_items.push(item);
         }
 
         for tool in tool_items.values() {
+            if !tool.started {
+                continue;
+            }
             sequence += 1;
             yield sse_event("response.function_call_arguments.done", json!({
                 "type": "response.function_call_arguments.done", "sequence_number": sequence,
                 "item_id": tool.item_id, "output_index": tool.output_index,
                 "arguments": tool.arguments,
             }));
+            let item = json!({
+                "type": "function_call", "id": tool.item_id,
+                "call_id": tool.call_id, "name": tool.name,
+                "arguments": tool.arguments, "status": "completed",
+            });
             sequence += 1;
             yield sse_event("response.output_item.done", json!({
                 "type": "response.output_item.done", "sequence_number": sequence,
                 "output_index": tool.output_index,
-                "item": {
-                    "type": "function_call", "id": tool.item_id,
-                    "call_id": tool.call_id, "name": tool.name,
-                    "arguments": tool.arguments, "status": "completed",
-                }
+                "item": item.clone(),
             }));
+            output_items.push(item);
         }
 
+        // `usage` 在 Responses 客户端 schema 里是必填项。上游因为 406 等原因没有
+        // 给出用量时补零，保证整帧合法；否则客户端会把 completed 当未知事件丢掉。
+        let usage = usage
+            .as_ref()
+            .map(usage_from_chat)
+            .unwrap_or_else(|| usage_from_chat(&json!({})));
+        // 上游 finish_reason=length 表示被输出上限截断，对应 incomplete。
+        let truncated = finish_reason.as_deref() == Some("length");
+        let status = if truncated { "incomplete" } else { "completed" };
+        let event = if truncated { "response.incomplete" } else { "response.completed" };
+        let incomplete_details = if truncated {
+            json!({"reason": "max_output_tokens"})
+        } else {
+            Value::Null
+        };
+
         sequence += 1;
-        yield sse_event("response.completed", json!({
-            "type": "response.completed",
+        yield sse_event(event, json!({
+            "type": event,
             "sequence_number": sequence,
             "response": {
                 "id": response_id,
                 "object": "response",
-                "status": "completed",
+                "created_at": chrono::Utc::now().timestamp(),
+                "status": status,
                 "model": model,
+                "output": output_items,
+                "usage": usage,
+                "error": Value::Null,
+                "incomplete_details": incomplete_details,
             }
         }));
     };
@@ -832,6 +948,187 @@ mod tests {
         assert_eq!(added["item"]["id"], done["item_id"]);
         assert_eq!(added["output_index"], delta["output_index"]);
         assert_eq!(done["arguments"], "{}");
+    }
+
+    /// 把 SSE 响应体拆成事件数组，供流式测试断言。
+    async fn collect_events(stream: EventStream) -> Vec<Value> {
+        let body = stream_body(stream, Some("m")).into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        text.split("\n\n")
+            .filter_map(|block| block.lines().find_map(|line| line.strip_prefix("data: ")))
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    /// ZCode / OpenAI Responses SDK 的 schema 里 `usage` 是必填对象，缺了整个
+    /// completed 帧会被判非法丢弃，客户端就永远收不到 finish。
+    #[tokio::test]
+    async fn completed_event_carries_required_usage() {
+        let stream: EventStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamEvent::Chunk(
+                json!({"choices":[{"delta":{"content":"hi"}}]}),
+            )),
+            Ok(StreamEvent::Chunk(json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    "total_tokens": 18,
+                    "completion_tokens_details": {"reasoning_tokens": 3}
+                }
+            }))),
+            Ok(StreamEvent::Done),
+        ]));
+        let events = collect_events(stream).await;
+        let completed = events
+            .iter()
+            .find(|e| e["type"] == "response.completed")
+            .expect("completed event");
+        assert_eq!(completed["response"]["usage"]["input_tokens"], 11);
+        assert_eq!(completed["response"]["usage"]["output_tokens"], 7);
+        assert_eq!(completed["response"]["usage"]["total_tokens"], 18);
+        assert_eq!(
+            completed["response"]["usage"]["output_tokens_details"]["reasoning_tokens"],
+            3
+        );
+        // 上游没给 usage 时也不能缺字段，否则同样被判非法。
+        let events = collect_events(Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamEvent::Chunk(
+                json!({"choices":[{"delta":{"content":"hi"}}]}),
+            )),
+            Ok(StreamEvent::Done),
+        ])))
+        .await;
+        let completed = events
+            .iter()
+            .find(|e| e["type"] == "response.completed")
+            .unwrap();
+        assert_eq!(completed["response"]["usage"]["input_tokens"], 0);
+        assert_eq!(completed["response"]["usage"]["output_tokens"], 0);
+    }
+
+    /// 思维链必须走 `reasoning_summary_text.delta`；旧版用的
+    /// `reasoning_text.delta` 不在客户端白名单里，会被整段丢弃。
+    #[tokio::test]
+    async fn reasoning_uses_summary_events_and_keeps_full_text() {
+        let stream: EventStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamEvent::Chunk(
+                json!({"choices":[{"delta":{"reasoning_content":"想"}}]}),
+            )),
+            Ok(StreamEvent::Chunk(
+                json!({"choices":[{"delta":{"reasoning_content":"一下"}}]}),
+            )),
+            Ok(StreamEvent::Done),
+        ]));
+        let events = collect_events(stream).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "response.reasoning_summary_text.delta"),
+            "must emit reasoning_summary_text.delta"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["type"] == "response.reasoning_text.delta"),
+            "reasoning_text.delta is not recognized by clients"
+        );
+        let done = events
+            .iter()
+            .find(|e| e["type"] == "response.reasoning_summary_text.done")
+            .unwrap();
+        // 每个增量都要累加，收尾事件必须是全文。
+        assert_eq!(done["text"], "想一下");
+        let completed = events
+            .iter()
+            .find(|e| e["type"] == "response.completed")
+            .unwrap();
+        let reasoning = &completed["response"]["output"][0];
+        assert_eq!(reasoning["type"], "reasoning");
+        assert_eq!(reasoning["summary"][0]["text"], "想一下");
+    }
+
+    /// 思维链不能复制成正文；只有思维链时也应当是 reasoning item + 合法 usage，
+    /// 而不是伪装成 `output_text`（那正是"思维链变成正常回复"的来源）。
+    #[test]
+    fn reasoning_never_leaks_into_output_text() {
+        let completion = json!({
+            "id": "c1",
+            "created": 1,
+            "model": "m",
+            "choices": [{
+                "message": {"role": "assistant", "content": "", "reasoning_content": "内部推理"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}
+        });
+        let response = from_chat_completion(&completion, &json!({}));
+        assert_eq!(response["output_text"], "");
+        assert_eq!(response["output"][0]["type"], "reasoning");
+        assert_eq!(response["output"][0]["summary"][0]["text"], "内部推理");
+        assert_eq!(response["usage"]["input_tokens"], 5);
+        assert_eq!(response["usage"]["output_tokens"], 2);
+    }
+
+    /// 正文增量必须全部累加，收尾事件里的全文不能只有第一段。
+    #[tokio::test]
+    async fn output_text_done_contains_all_deltas() {
+        let stream: EventStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamEvent::Chunk(
+                json!({"choices":[{"delta":{"content":"你好"}}]}),
+            )),
+            Ok(StreamEvent::Chunk(
+                json!({"choices":[{"delta":{"content":"，世界"}}]}),
+            )),
+            Ok(StreamEvent::Done),
+        ]));
+        let events = collect_events(stream).await;
+        let done = events
+            .iter()
+            .find(|e| e["type"] == "response.output_text.done")
+            .unwrap();
+        assert_eq!(done["text"], "你好，世界");
+        let item_done = events
+            .iter()
+            .filter(|e| e["type"] == "response.output_item.done")
+            .find(|e| e["item"]["type"] == "message")
+            .unwrap();
+        assert_eq!(item_done["item"]["content"][0]["text"], "你好，世界");
+    }
+
+    /// 上游首个工具帧可能只有 index/type（无名字无参数）。它不能被当成"已开始"，
+    /// 否则后续正确的工具帧发不出 output_item.added，客户端的参数 delta 全丢。
+    #[tokio::test]
+    async fn skips_empty_tool_frames_without_losing_item_start() {
+        let stream: EventStream = Box::pin(futures_util::stream::iter(vec![
+            Ok(StreamEvent::Chunk(
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"type":"function"}]}}]}),
+            )),
+            Ok(StreamEvent::Chunk(
+                json!({"choices":[{"delta":{"tool_calls":[{
+                    "index":0,"id":"call-1","function":{"name":"Bash","arguments":"{\"a\":"}
+                }]}}]}),
+            )),
+            Ok(StreamEvent::Chunk(
+                json!({"choices":[{"delta":{"tool_calls":[{
+                    "index":0,"function":{"arguments":"1}"}
+                }]}}]}),
+            )),
+            Ok(StreamEvent::Done),
+        ]));
+        let events = collect_events(stream).await;
+        let added: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["type"] == "response.output_item.added")
+            .collect();
+        assert_eq!(added.len(), 1, "tool item must be announced exactly once");
+        assert_eq!(added[0]["item"]["name"], "Bash");
+        let done = events
+            .iter()
+            .find(|e| e["type"] == "response.function_call_arguments.done")
+            .unwrap();
+        assert_eq!(done["arguments"], "{\"a\":1}");
     }
 
     #[test]

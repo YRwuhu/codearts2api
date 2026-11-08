@@ -273,6 +273,26 @@ OAuth 会话过期，到「账号」页重新点「登录华为云」。
 另外旧版在"名额已满"时会静默降级为非流式，客户端看到的是本地合成的
 伪流式，工具调用的增量帧全部丢失。现在默认不降级。
 
+### 思维链显示成正式回复 / 工具调用后一直重复同一句话
+
+现象：思维链直接出现在回复正文里；或者模型反复输出同一段话、工具始终不执行，
+最后报 `empty model response`。
+
+根因在 `/v1/responses`（Codex / ZCode 走的这条路）的流式适配，共四处：
+
+1. `response.completed` 少了 `usage` 字段。Responses 客户端把 `usage` 当
+   **必填**，整帧校验失败后被当成未知事件丢弃 → 客户端收不到结束信号，
+   于是重发同一个请求，模型再吐一遍同样内容。
+2. 思维链用了 `response.reasoning_text.delta`，而客户端只认
+   `response.reasoning_summary_text.delta` → 思维链被整体丢弃，客户端认为
+   这轮零输出，同样触发重试。
+3. 非流式路径在正文为空时拿思维链冒充 `output_text` → 思维链显示成回复。
+4. 增量文本的累加写在了"仅首次"分支里 → 收尾事件的全文只有第一段。
+
+修复后：`usage` 必填且补齐、思维链改走 `reasoning_summary_*` 事件、
+`output` 里的 reasoning item 只放 `summary`、所有增量完整累加、工具帧缺
+`call_id` 时本地补稳定 id。若仍看到旧行为，请确认运行的是新编译的 exe。
+
 ### Claude Code 连不上 / 报 404
 
 确认 `ANTHROPIC_BASE_URL` 是 **不带** `/v1` 的
