@@ -19,8 +19,23 @@ use crate::models::{Pool, TARGET};
 use crate::params;
 use crate::web::WebState;
 
-/// 聊天上游的空闲读取上限；不再限制整段流的总时长。
-const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+/// 上游「发出请求到收到响应头」的上限。
+///
+/// 超过它基本是上游排队/限流异常，此时还没有任何输出，换号重试是安全的。
+/// 响应头之后的整段流**不设总时长**——慢模型单次思考能跑 20~30 分钟。
+const UPSTREAM_TTFB_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 上游流「连续多久没有读到任何字节」才算死流；每读到一帧即重置。
+///
+/// 实测 kimi-k3.1-pro 的思考增量稳定在 ~90 字/秒，5 分钟零字节只可能是连接卡死，
+/// 不是模型慢。
+const UPSTREAM_IDLE_READ_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 空闲超时后该模型退避多久。
+///
+/// 这是「这条流卡住了」，不是「这个账号坏了」：不打账号冷却，免得慢模型把健康
+/// 账号拖进连续失败计数。
+const MODEL_IDLE_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// 同一账号内，请求排队等槽位的最长时间。
 ///
@@ -564,8 +579,11 @@ async fn run_for_model(
                         );
                     }
 
-                    // 模型能力错误不是账号故障：不计失败、不触发账号冷却。
-                    if is_account_failure(&error.code) {
+                    // 空闲超时只退避该模型；账号本身没有故障。
+                    if error.code == "upstream_idle_timeout" {
+                        gate.cool_model(model, MODEL_IDLE_COOLDOWN.as_secs()).await;
+                    } else if is_account_failure(&error.code) {
+                        // 模型能力错误不是账号故障：不计失败、不触发账号冷却。
                         gate.note_failure(&error.message).await;
                     }
                     // 模型级失败（该账号没有这个模型 / 该模型额度耗尽）只让这一个
@@ -674,11 +692,7 @@ async fn attempt(
     let benefit = !catalog.is_agent_channel(model).await;
     let headers = catalog.sign_headers(&body_bytes, benefit, model).await;
 
-    let mut request = state
-        .http
-        .post(TARGET)
-        .timeout(UPSTREAM_IDLE_TIMEOUT)
-        .body(body_bytes);
+    let mut request = state.http.post(TARGET).body(body_bytes);
     for (k, v) in headers {
         if let (Ok(name), Ok(value)) = (
             header::HeaderName::from_bytes(k.as_bytes()),
@@ -693,14 +707,30 @@ async fn attempt(
             .header("Session-Id", concurrency::upstream_session_id(cid));
     }
 
-    let upstream = match request.send().await {
-        Ok(r) => r,
-        Err(e) => {
+    // reqwest 的 RequestBuilder::timeout 是「连上之后必须在 deadline 前读完 body」
+    // 的总时长（实现是 TotalTimeoutBody），用它等于给长思考设了硬上限。这里只用
+    // tokio 框住「发请求到收到响应头」，body 交给下游的每读空闲守卫。
+    let upstream = match tokio::time::timeout(UPSTREAM_TTFB_TIMEOUT, request.send()).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             return Ok(Attempt::Retry {
                 error: ApiError::new(
                     StatusCode::BAD_GATEWAY,
                     "upstream_network_error",
                     format!("upstream error: {e}"),
+                ),
+                switch_account: true,
+            })
+        }
+        Err(_) => {
+            return Ok(Attempt::Retry {
+                error: ApiError::new(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "upstream_ttfb_timeout",
+                    format!(
+                        "上游 {} 秒未返回响应头",
+                        UPSTREAM_TTFB_TIMEOUT.as_secs()
+                    ),
                 ),
                 switch_account: true,
             })
@@ -744,7 +774,10 @@ async fn attempt(
 
         // 上游偶尔对 stream=true 回普通 JSON
         if !content_type.contains("text/event-stream") {
-            let raw = upstream.bytes().await.unwrap_or_default();
+            let raw = match read_body(upstream).await {
+                Ok(raw) => raw,
+                Err(error) => return Ok(Attempt::Retry { error, switch_account: true }),
+            };
             let mut result = crate::stream::parse_upstream(&raw);
             if let Some(err) = result.get("error") {
                 let code = err
@@ -816,18 +849,9 @@ async fn attempt(
     }
 
     // 非流式
-    let raw = match upstream.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            return Ok(Attempt::Retry {
-                error: ApiError::new(
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_network_error",
-                    format!("读取上游响应失败: {e}"),
-                ),
-                switch_account: true,
-            })
-        }
+    let raw = match read_body(upstream).await {
+        Ok(raw) => raw,
+        Err(error) => return Ok(Attempt::Retry { error, switch_account: true }),
     };
     let mut result = crate::stream::parse_upstream(&raw);
 
@@ -877,6 +901,63 @@ async fn attempt(
     }
 
     Ok(Attempt::Done(Outcome::Json(result)))
+}
+
+/// 读完整个上游响应体（非流式路径，以及 stream=true 却回了普通 JSON 的兜底）。
+///
+/// 没有整段上限：慢模型单次补全可能超过 20 分钟。要求只是「每两次读之间不超过
+/// [`UPSTREAM_IDLE_READ_TIMEOUT`]」，这样死流仍会在这里结束，而不是永久占着槽位。
+async fn read_body(mut upstream: reqwest::Response) -> Result<Vec<u8>, ApiError> {
+    let mut raw = Vec::new();
+    loop {
+        match tokio::time::timeout(UPSTREAM_IDLE_READ_TIMEOUT, upstream.chunk()).await {
+            Err(_) => return Err(idle_timeout_error("上游响应体")),
+            Ok(Ok(None)) => return Ok(raw),
+            Ok(Ok(Some(chunk))) => raw.extend_from_slice(&chunk),
+            Ok(Err(e)) => return Err(stream_read_error(&e, "上游响应体")),
+        }
+    }
+}
+
+/// 上游长时间没有任何数据的统一错误体。
+fn idle_timeout_error(what: &str) -> ApiError {
+    ApiError::new(
+        StatusCode::GATEWAY_TIMEOUT,
+        "upstream_idle_timeout",
+        format!(
+            "{what} {} 秒无任何数据",
+            UPSTREAM_IDLE_READ_TIMEOUT.as_secs()
+        ),
+    )
+}
+
+/// 读上游字节流的错误分类。
+///
+/// `Response::bytes_stream()` 会把所有 body 错误统一包成 `Kind::Decode`，Display 只剩
+/// "error decoding response body"——超时、上游提前断连、真解码失败看起来完全一样，
+/// 排查时只能反推。这里按 `is_timeout()` 分流，并把 source 链补进 message。
+fn stream_read_error<E>(error: &E, what: &str) -> ApiError
+where
+    E: std::error::Error + 'static,
+{
+    let timed_out = (error as &dyn std::error::Error)
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(|e| e.is_timeout());
+    let cause = <E as std::error::Error>::source(error)
+        .map(|e| format!(": {e}"))
+        .unwrap_or_default();
+    if timed_out {
+        return ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "upstream_idle_timeout",
+            format!("读取{what}超时: {error}{cause}"),
+        );
+    }
+    ApiError::new(
+        StatusCode::BAD_GATEWAY,
+        "upstream_network_error",
+        format!("读取{what}失败: {error}{cause}"),
+    )
 }
 
 /// 记录一条用量，并把 token 计入该账号的当日预算。
@@ -970,9 +1051,11 @@ fn tool_turn(body: &Value) -> bool {
 /// 结果，记进失败只会把健康的账号打成冷却（连续 3 次即触发）。
 /// 内容审核误拦截同理——它是请求内容触发的，与账号健康无关；连续几次误拦截
 /// 也不该把账号打成冷却。
+/// `upstream_idle_timeout` 是单条流卡死：慢模型（单次思考 20~30 分钟）偶发一次
+/// 不代表账号坏了，改由 `MODEL_IDLE_COOLDOWN` 让该模型退避。
 /// 其余错误（429/401/5xx/网络）仍然按账号故障处理。
 fn is_account_failure(code: &str) -> bool {
-    code != "model_not_multimodal" && code != "waf_blocked"
+    code != "model_not_multimodal" && code != "waf_blocked" && code != "upstream_idle_timeout"
 }
 
 /// 把上游错误归类：可换号的账号级错误 vs 客户端错误。
@@ -1253,9 +1336,12 @@ fn sse_stream(
                     true,
                     format!("{}: {}", error.code, error.message),
                 )).await;
-                // 流内 406 是模型能力问题，不是账号故障；计进失败会让连续几次
-                // 带图请求把账号打成冷却。这里与 run_for_model 共用同一判定。
-                if is_account_failure(&error.code) {
+                // 空闲超时只退避该模型：这是「这条流卡住」，不是「账号坏了」。
+                if error.code == "upstream_idle_timeout" {
+                    gate.cool_model(&model, MODEL_IDLE_COOLDOWN.as_secs()).await;
+                } else if is_account_failure(&error.code) {
+                    // 流内 406 是模型能力问题，不是账号故障；计进失败会让连续几次
+                    // 带图请求把账号打成冷却。这里与 run_for_model 共用同一判定。
                     gate.note_failure(&error.message).await;
                 }
                 yield Err(error);
@@ -1268,7 +1354,7 @@ fn sse_stream(
 fn decode_sse<S, E>(bytes: S) -> impl Stream<Item = DecoderEvent> + Send
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
-    E: std::fmt::Display + Send + 'static,
+    E: std::error::Error + Send + 'static,
 {
     use async_stream::stream;
     stream! {
@@ -1280,14 +1366,17 @@ where
         let mut ticker = tokio::time::interval(KEEPALIVE);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
+        // 死流判定：只要求「两次读之间的间隔」有限，整段流可以无限长。
+        let mut idle = Box::pin(tokio::time::sleep(UPSTREAM_IDLE_READ_TIMEOUT));
 
         'read: loop {
             tokio::select! {
                 chunk = bytes.next() => {
+                    idle.as_mut().reset(tokio::time::Instant::now() + UPSTREAM_IDLE_READ_TIMEOUT);
                     match chunk {
                         Some(Ok(chunk)) => buffer.extend_from_slice(&chunk),
                         Some(Err(e)) => {
-                            failure = Some(ApiError::new(StatusCode::BAD_GATEWAY, "upstream_network_error", format!("读取上游流失败: {e}")));
+                            failure = Some(stream_read_error(&e, "上游流"));
                             break;
                         }
                         None => break,
@@ -1309,6 +1398,10 @@ where
                             }
                         }
                     }
+                }
+                _ = idle.as_mut() => {
+                    failure = Some(idle_timeout_error("上游流"));
+                    break 'read;
                 }
                 _ = ticker.tick() => yield DecoderEvent::Event(Ok(StreamEvent::Chunk(Value::Null))),
             }
@@ -1474,7 +1567,7 @@ mod tests {
 
     #[tokio::test]
     async fn decoder_distinguishes_completion_from_truncation() {
-        let complete = decode_sse(futures_util::stream::iter(vec![Ok::<_, String>(
+        let complete = decode_sse(futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
             Bytes::from_static(
                 b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]",
             ),
@@ -1488,7 +1581,7 @@ mod tests {
             }))
         ));
 
-        let truncated = decode_sse(futures_util::stream::iter(vec![Ok::<_, String>(
+        let truncated = decode_sse(futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
             Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"),
         )]));
         let events: Vec<_> = truncated.collect().await;
@@ -1497,12 +1590,59 @@ mod tests {
         );
 
         let failed = decode_sse(futures_util::stream::iter(vec![
-            Ok::<_, String>(Bytes::from_static(b"data: {\"choices\":[]}\n\n")),
-            Err("connection reset".to_string()),
+            Ok::<_, std::io::Error>(Bytes::from_static(b"data: {\"choices\":[]}\n\n")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset",
+            )),
         ]));
         let events: Vec<_> = failed.collect().await;
         assert!(
             matches!(events.last(), Some(DecoderEvent::Complete(StreamCompletion { result: Err(e), .. })) if e.code == "upstream_network_error")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn long_stream_survives_past_the_old_total_timeout() {
+        // 180 秒曾是整段流的总时长上限（reqwest RequestBuilder::timeout 的语义是
+        // 「连上之后必须在 deadline 前读完 body」）。这里按 30 秒一帧推进 3600 秒
+        // 虚拟时间，必须能正常收到 [DONE]。
+        let source = async_stream::stream! {
+            for _ in 0..120 {
+                yield Ok::<_, std::io::Error>(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n",
+                ));
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n"));
+        };
+        let events: Vec<_> = decode_sse(source).collect().await;
+        let final_code = match events.last() {
+            Some(DecoderEvent::Complete(done)) => done.result.as_ref().err().map(|e| e.code.clone()),
+            _ => None,
+        };
+        assert!(
+            matches!(
+                events.last(),
+                Some(DecoderEvent::Complete(StreamCompletion { result: Ok(()), .. }))
+            ),
+            "长流不该被截止，最终错误: {final_code:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_stream_reports_idle_timeout() {
+        // 只吐一帧就永久静默：必须由每读空闲守卫收尾，而不能一直挂着。
+        let source = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+            ));
+            futures_util::future::pending::<()>().await;
+        };
+        let events: Vec<_> = decode_sse(source).collect().await;
+        assert!(
+            matches!(events.last(), Some(DecoderEvent::Complete(StreamCompletion { result: Err(e), .. })) if e.code == "upstream_idle_timeout"),
+            "应报 upstream_idle_timeout"
         );
     }
 
@@ -1567,6 +1707,8 @@ mod tests {
         assert!(!is_account_failure("model_not_multimodal"));
         // 内容审核误拦截与账号健康无关，同样不计失败。
         assert!(!is_account_failure("waf_blocked"));
+        // 空闲超时只退避模型；计账号失败会让慢模型把健康账号打进冷却。
+        assert!(!is_account_failure("upstream_idle_timeout"));
         for code in [
             "rate_limit_error",
             "authentication_error",

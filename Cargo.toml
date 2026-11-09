@@ -30,6 +30,10 @@ p256 = { version = "0.14.0", features = ["ecdsa", "arithmetic"] }
 base64 = "0.23.1"
 rand = "0.8"
 
+[dev-dependencies]
+# start_paused 需要 test-util（只在测试里用）。
+tokio = { version = "1", features = ["test-util"] }
+
 [profile.release]
 opt-level = 3
 lto = true
