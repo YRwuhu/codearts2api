@@ -161,16 +161,15 @@
 
       <div class="mx-card" style="margin-top:16px">
         <div class="mx-card-head">
-          <span class="mx-card-title">账号状态</span>
-          <span class="mx-badge" id="accountsHint">—</span>
+          <span class="mx-card-title">账号池与轮换</span>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <span class="mx-badge" id="rotationStrategy">轮换策略</span>
+            <span class="mx-badge" id="accountsHint">—</span>
+          </div>
         </div>
         <div class="mx-card-body">
-          <div class="mx-table-wrap">
-            <table class="mx-table">
-              <thead><tr><th>账号</th><th>AK</th><th>状态</th><th>模型数</th></tr></thead>
-              <tbody id="overviewAccounts"></tbody>
-            </table>
-          </div>
+          <p class="mx-helper" id="rotationHint" style="margin:0 0 10px">—</p>
+          <div class="pool-grid" id="poolCards"></div>
         </div>
       </div>
     </section>
@@ -197,6 +196,25 @@
             <button class="mx-btn mx-btn-secondary" id="oauthLinkBtn" hidden data-ripple>打开授权页</button>
             <span class="mx-helper" id="oauthHint"></span>
           </div>
+        </div>
+      </div>
+
+      <div class="mx-card" style="margin-bottom:16px">
+        <div class="mx-card-head">
+          <span class="mx-card-title">轮换策略</span>
+          <span class="mx-badge" id="rotationStrategyBadge">—</span>
+        </div>
+        <div class="mx-card-body">
+          <p class="helper-block">
+            新会话按下面策略选号；已建立的对话仍然钉在原账号上，保住 prompt cache。
+            冷却中的账号不会被剔除，只是排到队尾——上游抖动恢复后能立刻接回流量。
+          </p>
+          <div class="segment" id="rotationPicker" style="margin-top:12px">
+            <button class="mx-btn mx-btn-sm mx-btn-secondary" data-strategy="balanced">负载均衡</button>
+            <button class="mx-btn mx-btn-sm mx-btn-secondary" data-strategy="credit">余额优先</button>
+            <button class="mx-btn mx-btn-sm mx-btn-secondary" data-strategy="roundrobin">严格轮转</button>
+          </div>
+          <p class="mx-helper" id="rotationNote">—</p>
         </div>
       </div>
 

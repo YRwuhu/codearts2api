@@ -295,3 +295,100 @@ td.empty-cell {
   padding: 1px 5px;
   border-radius: var(--mx-r-xs);
 }
+
+/* ── 账号池与轮换 ── */
+.pool-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.pool-card {
+  border: 1px solid var(--mx-divider);
+  border-radius: var(--mx-r-md);
+  padding: 12px 14px;
+  background: var(--mx-s2);
+  min-width: 0;
+}
+.pool-card.primary {
+  border-color: var(--mx-primary);
+  box-shadow: 0 0 0 1px var(--mx-primary) inset;
+}
+.pool-card.warn { border-color: var(--mx-amber); }
+.pool-card.danger { border-color: var(--mx-error); }
+
+.pool-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.pool-name {
+  font-family: var(--mx-mono);
+  font-size: 13px;
+  color: var(--mx-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.pool-rank {
+  font-size: 11px;
+  color: var(--mx-t3);
+  flex: 0 0 auto;
+}
+.pool-meta {
+  margin-top: 8px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+  font-size: 12px;
+  color: var(--mx-t2);
+}
+.pool-meta b {
+  display: block;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--mx-text);
+  font-variant-numeric: tabular-nums;
+}
+.pool-load {
+  margin-top: 10px;
+  height: 4px;
+  border-radius: var(--mx-r-pill);
+  background: var(--mx-s4);
+  overflow: hidden;
+}
+.pool-load > span {
+  display: block;
+  height: 100%;
+  background: var(--mx-primary);
+  transition: width var(--mx-d3) var(--mx-ease);
+}
+.pool-load.warn > span { background: var(--mx-amber); }
+.pool-load.danger > span { background: var(--mx-error); }
+
+.pool-note {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--mx-t3);
+  line-height: 1.5;
+}
+.pool-note code {
+  font-family: var(--mx-mono);
+  background: var(--mx-s3);
+  padding: 0 4px;
+  border-radius: var(--mx-r-xs);
+}
+
+/* 策略选择按钮组：复用 range-picker 的视觉，但语义独立 */
+.segment { display: flex; gap: 6px; flex-wrap: wrap; }
+.segment .mx-btn.active {
+  background: var(--mx-primary);
+  color: #fff;
+}
+
+@media (max-width: 767px) {
+  .pool-grid { grid-template-columns: minmax(0, 1fr); }
+}

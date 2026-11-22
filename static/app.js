@@ -158,23 +158,8 @@
       }
     }
 
-    // 概览页账号表
-    const tbody = $('#overviewAccounts');
-    if (tbody) {
-      if (!state.accounts.length) {
-        tbody.innerHTML = '<tr><td colspan="4" class="empty-cell">还没有账号 —— 去「账号」页点「登录华为云」完成首次登录</td></tr>';
-      } else {
-        tbody.innerHTML = state.accounts.map((a) => `
-          <tr>
-            <td data-label="账号" class="mono">${escapeHtml(a.id)}</td>
-            <td data-label="AK" class="mono">${escapeHtml(a.ak)}</td>
-            <td data-label="状态">${a.enabled
-              ? '<span class="mx-badge mx-badge-success">启用</span>'
-              : '<span class="mx-badge">停用</span>'}</td>
-            <td data-label="模型数">${fmtNumber(a.model_count || 0)}</td>
-          </tr>`).join('');
-      }
-    }
+    // 概览页账号池卡片
+    renderPoolCards(data);
     const hint = $('#accountsHint');
     if (hint) hint.textContent = (state.accounts.length || 0) + ' 个账号';
 
@@ -196,6 +181,136 @@
       const found = preferred.find((m) => state.models.some((x) => x.id === m));
       connModel.textContent = found || (state.models[0] && state.models[0].id) || '—';
     }
+  }
+
+  // ── 账号池与轮换 ────────────────────────────────────────
+  const STRATEGY_TEXT = {
+    balanced: '负载均衡',
+    credit: '余额优先',
+    roundrobin: '严格轮转',
+  };
+
+  function fmtIdle(ms) {
+    if (ms == null) return '本次未用过';
+    if (ms < 1000) return '刚刚用过';
+    const s = Math.round(ms / 1000);
+    if (s < 60) return s + ' 秒前';
+    const m = Math.round(s / 60);
+    if (m < 60) return m + ' 分钟前';
+    return Math.round(m / 60) + ' 小时前';
+  }
+
+  function renderRotationPolicy(rotation, config) {
+    const strategy = (rotation && rotation.strategy) || (config && config.rotation) || 'balanced';
+    const label = (rotation && rotation.strategy_label) || STRATEGY_TEXT[strategy] || strategy;
+    const badge = $('#rotationStrategy');
+    if (badge) {
+      badge.textContent = label;
+      badge.className = 'mx-badge mx-badge-success';
+    }
+    const pageBadge = $('#rotationStrategyBadge');
+    if (pageBadge) {
+      pageBadge.textContent = '当前：' + label;
+      pageBadge.className = 'mx-badge mx-badge-success';
+    }
+    const note = $('#rotationNote');
+    const minCredit = (rotation && rotation.min_credit) || (config && config.min_credit) || 0;
+    const summary = strategy === 'credit'
+      ? '按剩余 credit 排序，余额多的先接新会话。'
+        + (minCredit > 0 ? ' 低于 ' + minCredit + ' credit 的账号只在其它账号都不可用时才接流量。' : '')
+      : strategy === 'roundrobin'
+        ? '只按「最久没被选中」轮转，请求数严格平均分配，不看负载。'
+        : '在途少的账号先接新会话；负载相同时按最久未用轮转，空闲时自动均摊。'
+          + (minCredit > 0 ? ' 低于 ' + minCredit + ' credit 的账号会被降级为兜底。' : '');
+    if (note) note.textContent = summary;
+    // 概览页用同一段说明的短句版本
+    const overviewHint = $('#rotationHint');
+    if (overviewHint) {
+      const enabled = (rotation && rotation.accounts || []).filter((r) => {
+        const acc = state.accounts.find((a) => a.id === r.id);
+        return acc && acc.enabled;
+      });
+      const ready = enabled.filter((r) => !r.cooling && !r.daily_exhausted).length;
+      overviewHint.textContent = '新会话按「' + label + '」选号，'
+        + ready + '/' + enabled.length + ' 个账号当前可接流量；冷却或额度耗尽的排在队尾兜底。';
+    }
+    $$('#rotationPicker .mx-btn').forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.strategy === strategy);
+    });
+  }
+
+  function renderPoolCards(data) {
+    const box = $('#poolCards');
+    if (!box) return;
+    const rotation = (data && data.rotation) || {};
+    renderRotationPolicy(rotation, (data && data.config) || {});
+
+    const rotationById = new Map((rotation.accounts || []).map((r) => [r.id, r]));
+    const health = (data && data.health) || {};
+    const list = (state.accounts || []).slice().sort((a, b) => {
+      const ra = rotationById.has(a.id) ? rotationById.get(a.id).rank : a.enabled ? 999 : 10000;
+      const rb = rotationById.has(b.id) ? rotationById.get(b.id).rank : b.enabled ? 999 : 10000;
+      return ra - rb;
+    });
+
+    if (!list.length) {
+      box.innerHTML = '<p class="mx-helper">还没有账号 —— 去「账号」页点「登录华为云」完成首次登录。</p>';
+      return;
+    }
+
+    box.innerHTML = list.map((a) => {
+      const r = rotationById.get(a.id) || {};
+      const h = health[a.id] || {};
+      const inFlight = r.in_flight != null ? r.in_flight : (h.in_flight || 0);
+      const limit = r.limit || h.limit || 1;
+      const pct = Math.min(100, Math.round((inFlight / Math.max(1, limit)) * 100));
+
+      // 卡片优先级：冷却/额度耗尽 > 负载高 > 正常；排序第一的号高亮
+      let cls = 'pool-card';
+      const notes = [];
+      if (r.cooling || h.available === false) {
+        cls += ' danger';
+        notes.push('账号冷却中' + (h.cooldown_remaining ? '（剩 ' + h.cooldown_remaining + 's）' : '') + '，排在队尾');
+      }
+      if (r.daily_exhausted) {
+        cls += ' warn';
+        notes.push('今日额度已用尽，仅在其它账号不可用时接管');
+      }
+      if (r.model_cooling) {
+        cls += ' warn';
+        notes.push('当前模型在该账号上冷却，其它模型不受影响');
+      }
+      if ((r.consecutive_failures || 0) > 0) {
+        notes.push('连续失败 ' + r.consecutive_failures + ' 次');
+      }
+      if (!a.enabled) {
+        cls += ' warn';
+        notes.push('已在配置中停用，不参与选号');
+      }
+      if (cls === 'pool-card' && r.rank === 0 && a.enabled) cls += ' primary';
+
+      const creditText = r.credit_remain != null
+        ? (fmtNumber(Math.round(r.credit_remain)) + (r.credit_ratio != null
+          ? ' · ' + Math.round(r.credit_ratio * 100) + '%'
+          : ''))
+        : '未刷新';
+
+      return `
+      <div class="${cls}">
+        <div class="pool-card-head">
+          <span class="pool-name" title="${escapeHtml(a.id)}">${escapeHtml(a.id)}</span>
+          <span class="pool-rank">${a.enabled && r.rank != null ? '优先级 #' + (r.rank + 1) : '不参与'}</span>
+        </div>
+        <div class="pool-meta">
+          <div><b>${inFlight}/${limit}</b>在途</div>
+          <div><b>${creditText}</b>剩余 credit</div>
+          <div><b>${fmtNumber(a.model_count || 0)}</b>模型</div>
+          <div><b>${escapeHtml(fmtIdle(r.idle_ms))}</b>上次选号</div>
+        </div>
+        <div class="pool-load${pct >= 90 ? ' danger' : pct >= 60 ? ' warn' : ''}"><span style="width:${pct}%"></span></div>
+        ${notes.length ? '<div class="pool-note">' + notes.map(escapeHtml).join('<br>') + '</div>' : ''}
+      </div>`;
+    }).join('');
   }
 
   function renderAccountRows() {
@@ -871,6 +986,24 @@
 
 
   // ── 事件绑定 ────────────────────────────────────────────
+  async function setRotationStrategy(strategy, picker) {
+    const label = STRATEGY_TEXT[strategy] || strategy;
+    const buttons = picker ? Array.from(picker.querySelectorAll('[data-strategy]')) : [];
+    buttons.forEach((b) => { b.disabled = true; });
+    try {
+      const data = await api('/api/rotation', {
+        method: 'POST',
+        body: JSON.stringify({ strategy: strategy }),
+      });
+      toast('success', '轮换策略已切换为「' + (data.strategy_label || label) + '」');
+      await loadStatus(false);
+    } catch (e) {
+      toast('error', '切换失败：' + e.message);
+    } finally {
+      buttons.forEach((b) => { b.disabled = false; });
+    }
+  }
+
   function bindEvents() {
     $$('.mx-nav-item, .mx-btm-item').forEach((el) => {
       el.addEventListener('click', () => {
@@ -916,6 +1049,15 @@
 
     const quotaBtn = $('#refreshQuotaBtn');
     if (quotaBtn) quotaBtn.addEventListener('click', () => loadQuota(true));
+
+    const rotationPicker = $('#rotationPicker');
+    if (rotationPicker) {
+      rotationPicker.addEventListener('click', (ev) => {
+        const btn = ev.target.closest('[data-strategy]');
+        if (!btn || btn.classList.contains('active')) return;
+        setRotationStrategy(btn.dataset.strategy, rotationPicker);
+      });
+    }
 
     const rangePicker = $('#usageRange');
     if (rangePicker) {
