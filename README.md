@@ -10,6 +10,8 @@ cargo build --release
 
 产物在 `target\release\codearts2api.exe`。也可以直接双击 `build.bat`。
 
+Android 版使用 Rust + Tauri，内置同一套管理面板和反代服务，见 [Android 构建与使用说明](android/README.md)。
+
 ## 快速开始
 
 首次使用**不需要先准备账号**，直接起来再登录：

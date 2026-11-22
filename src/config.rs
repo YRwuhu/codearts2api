@@ -142,6 +142,8 @@ pub struct Config {
     pub max_body_bytes: usize,
     pub model_cache_path: PathBuf,
     pub env_dir: PathBuf,
+    pub accounts_path: PathBuf,
+    pub(crate) explicit_data_dir: bool,
 }
 
 fn candidates() -> Vec<PathBuf> {
@@ -228,7 +230,7 @@ fn unique_id(base: &str, used: &mut Vec<String>) -> String {
 fn load_accounts_file(path: &Path) -> Result<Vec<Account>, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("读取账号文件 {} 失败: {e}", path.display()))?;
-    let parsed: AccountsFile = serde_json::from_str(&text)
+    let parsed: AccountsFile = serde_json::from_str(text.trim_start_matches('\u{feff}'))
         .map_err(|e| format!("解析账号文件 {} 失败: {e}", path.display()))?;
 
     let mut used: Vec<String> = Vec::new();
@@ -274,35 +276,62 @@ impl Config {
             .as_ref()
             .and_then(|p| p.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        Self::load_settings(env_dir, false, |name| std::env::var(name).ok())
+    }
 
-        // 账号来源优先级：CODEARTS_ACCOUNTS 指定文件 > 同目录 accounts.json
-        // > .env 里的单个 AK/SK（向后兼容）。
-        let accounts_path = std::env::var("CODEARTS_ACCOUNTS")
-            .ok()
+    /// The embedded app reads its own .env without changing process environment or cwd.
+    pub fn load_from_dir(dir: &Path) -> Result<Self, String> {
+        let env_path = dir.join(".env");
+        let mut values = std::collections::HashMap::new();
+        if env_path.exists() {
+            let entries = dotenvy::from_path_iter(&env_path)
+                .map_err(|e| format!("读取 {} 失败: {e}", env_path.display()))?;
+            for entry in entries {
+                let (key, value) = entry.map_err(|_| format!("{} 格式错误", env_path.display()))?;
+                values.entry(key).or_insert(value);
+            }
+        }
+        Self::load_settings(dir.to_path_buf(), true, |name| values.get(name).cloned())
+    }
+
+    fn load_settings(
+        env_dir: PathBuf,
+        explicit_data_dir: bool,
+        setting: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, String> {
+        // On mobile, keep all account mutations in the selected data directory.
+        let accounts_path = (!explicit_data_dir)
+            .then(|| setting("CODEARTS_ACCOUNTS"))
+            .flatten()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .or_else(|| {
+            .unwrap_or_else(|| {
                 let p = env_dir.join("accounts.json");
-                if p.is_file() {
-                    Some(p)
+                let legacy = env_dir.join("account.json");
+                if explicit_data_dir && !p.exists() && legacy.is_file() {
+                    legacy
                 } else {
-                    None
+                    p
                 }
             });
 
-        let mut accounts = match accounts_path {
-            Some(path) => load_accounts_file(&path)?,
-            None => Vec::new(),
+        let mut accounts = if accounts_path.exists()
+            || (!explicit_data_dir
+                && setting("CODEARTS_ACCOUNTS").is_some_and(|p| !p.trim().is_empty()))
+        {
+            load_accounts_file(&accounts_path)?
+        } else {
+            Vec::new()
         };
 
         // accounts.json 为空或不存在时回退到 .env 单账号
         if accounts.is_empty() {
-            let ak = std::env::var("CODEARTS_AK")
+            let ak = setting("CODEARTS_AK")
                 .unwrap_or_default()
                 .trim()
                 .to_string();
-            let sk = std::env::var("CODEARTS_SK")
+            let sk = setting("CODEARTS_SK")
                 .unwrap_or_default()
                 .trim()
                 .to_string();
@@ -313,51 +342,46 @@ impl Config {
 
         // 账号为空不算错误：首次使用需要先起服务，再从 WebUI 点
         // 「登录华为云」走 OAuth。CLI 子命令用 `require_accounts` 自行校验。
-        let host = std::env::var("CODEARTS_PROXY_HOST")
-            .unwrap_or_else(|_| "127.0.0.1".to_string())
+        let host = setting("CODEARTS_PROXY_HOST")
+            .unwrap_or_else(|| "127.0.0.1".to_string())
             .trim()
             .to_string();
-        let port = std::env::var("CODEARTS_PROXY_PORT")
-            .ok()
+        let port = setting("CODEARTS_PROXY_PORT")
             .and_then(|v| v.trim().parse::<u16>().ok())
             .unwrap_or(8787);
 
-        let concurrency = std::env::var("CODEARTS_CONCURRENCY")
-            .ok()
+        let concurrency = setting("CODEARTS_CONCURRENCY")
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(8);
 
         // 兜底值只在上游没给元数据时用；真实硬上限是 params::UPSTREAM_MAX_OUTPUT_TOKENS。
-        let max_tokens_cap = std::env::var("CODEARTS_MAX_TOKENS_CAP")
-            .ok()
+        let max_tokens_cap = setting("CODEARTS_MAX_TOKENS_CAP")
             .and_then(|v| v.trim().parse::<i64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(crate::params::UPSTREAM_MAX_OUTPUT_TOKENS);
 
-        let benefit_fallback = std::env::var("CODEARTS_BENEFIT_FALLBACK")
+        let benefit_fallback = setting("CODEARTS_BENEFIT_FALLBACK")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
 
         // 账号级会话头（x-ot-session-id）修好后，上游 3 会话限制已消失，
         // 工具轮不再需要降级非流式。保留开关供特殊场景使用。
-        let tool_turn_plain = std::env::var("CODEARTS_TOOL_TURN_PLAIN")
+        let tool_turn_plain = setting("CODEARTS_TOOL_TURN_PLAIN")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
 
-        let stream_degrade = std::env::var("CODEARTS_STREAM_DEGRADE")
+        let stream_degrade = setting("CODEARTS_STREAM_DEGRADE")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
 
-        let daily_token_cap = std::env::var("CODEARTS_DAILY_TOKEN_CAP")
-            .ok()
+        let daily_token_cap = setting("CODEARTS_DAILY_TOKEN_CAP")
             .and_then(|v| v.trim().parse::<i64>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(0);
 
         // 上限设个封顶，避免手滑写个超大值把内存吃满。
-        let max_body_bytes = std::env::var("CODEARTS_MAX_BODY_MB")
-            .ok()
+        let max_body_bytes = setting("CODEARTS_MAX_BODY_MB")
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_MAX_BODY_MB)
@@ -365,9 +389,11 @@ impl Config {
             * 1024
             * 1024;
 
-        let model_cache_path = std::env::var("CODEARTS_MODEL_CACHE")
+        let model_cache_path = (!explicit_data_dir)
+            .then(|| setting("CODEARTS_MODEL_CACHE"))
+            .flatten()
             .map(PathBuf::from)
-            .unwrap_or_else(|_| env_dir.join("models-cache.json"));
+            .unwrap_or_else(|| env_dir.join("models-cache.json"));
 
         Ok(Config {
             accounts,
@@ -382,6 +408,8 @@ impl Config {
             max_body_bytes,
             model_cache_path,
             env_dir,
+            accounts_path,
+            explicit_data_dir,
         })
     }
 
@@ -434,6 +462,40 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_config_reads_desktop_accounts_and_preserves_the_data_directory() {
+        let dir = std::env::temp_dir().join(format!("codearts-embedded-{}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let legacy = dir.join("account.json");
+        std::fs::write(
+            &legacy,
+            "\u{feff}{\"accounts\":[{\"id\":\"oauth-id\",\"oauth\":true}]}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".env"),
+            "CODEARTS_PROXY_PORT=8765\nCODEARTS_ACCOUNTS=ignored.json\n",
+        )
+        .unwrap();
+        let config = Config::load_from_dir(&dir).unwrap();
+        assert_eq!(config.accounts_path, legacy);
+        assert_eq!(config.accounts[0].id, "oauth-id");
+        assert!(config.accounts[0].is_oauth());
+        assert_eq!(config.port, 8765);
+
+        let canonical = dir.join("accounts.json");
+        std::fs::write(
+            &canonical,
+            r#"{"accounts":[{"id":"manual","ak":"fakeAK","sk":"fakeSK","enabled":false}]}"#,
+        )
+        .unwrap();
+        let config = Config::load_from_dir(&dir).unwrap();
+        assert_eq!(config.accounts_path, canonical);
+        assert_eq!(config.env_dir, dir);
+        assert!(!config.accounts[0].enabled);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn masked_ak_handles_ascii() {

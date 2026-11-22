@@ -94,7 +94,7 @@ fn parse_body(body: &Bytes) -> Result<Value, Box<Response>> {
 
 // ── OpenAI Chat Completions ──────────────────────────────────
 
-async fn chat_completions(
+pub(crate) async fn chat_completions(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     body: Bytes,

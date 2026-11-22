@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN" data-theme="dark" data-platform="desktop">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -400,6 +400,7 @@
         </div>
         <div class="mx-card-body">
           <div id="checkinMessage" class="helper-block">正在查询…</div>
+          <div id="checkinLast" class="helper-block" hidden></div>
           <div id="checkinAccounts"></div>
         </div>
       </div>
@@ -435,9 +436,10 @@
         <div class="mx-card-head"><span class="mx-card-title">连接参数</span></div>
         <div class="mx-card-body">
           <div class="kv"><span class="kv-k">Base URL</span><code class="kv-v" id="connBase">—</code></div>
-          <div class="kv"><span class="kv-k">API Key</span><code class="kv-v">codearts</code></div>
+          <div class="kv"><span class="kv-k">API Key</span><code class="kv-v" id="connKey">codearts</code></div>
+          <div class="kv" id="mobileDataRow" hidden><span class="kv-k">数据目录</span><code class="kv-v" id="mobileDataDir"></code></div>
           <div class="kv"><span class="kv-k">Model</span><code class="kv-v" id="connModel">—</code></div>
-          <p class="mx-helper">API Key 可填任意非空字符串；代理不校验它，实际鉴权由华为云 AK/SK 完成。</p>
+          <p class="mx-helper" id="connKeyHint">API Key 可填任意非空字符串；代理不校验它，实际鉴权由华为云 AK/SK 完成。</p>
         </div>
       </div>
       <div class="mx-card" style="margin-top:16px">
@@ -446,7 +448,7 @@
           <ul class="notes">
             <li>单账号套餐并发上限约为 3；多账号模式下超出会自动切换账号重试。</li>
             <li>强推理模型的思维链会占用输出额度，<code>max_tokens</code> 建议不低于 2000。</li>
-            <li>本服务仅绑定 <code>127.0.0.1</code>，同网段其他机器默认无法访问。</li>
+            <li id="connNetworkHint">本服务默认绑定 <code>127.0.0.1</code>，同网段其他机器无法访问。</li>
             <li>每次调用都会消耗华为云 CodeArts 额度。</li>
           </ul>
         </div>
@@ -506,22 +508,7 @@
 <script src="/vendor/utils/theme.js"></script>
 <script src="/vendor/utils/modal.js"></script>
 <script src="/vendor/utils/toast.js"></script>
-<script>
-  /* miuix 的 utils 用顶层 class 声明：这些绑定在全局词法环境里，
-     可以跨脚本按裸名字访问，但不会自动出现在 window 上。
-     统一挂到 window，后续 app.js 用 window.MxXxx 判断即可。 */
-  (function () {
-    var names = ['MxSmoothCorner', 'MxRipple', 'MxCounter', 'MxTheme', 'MxModal', 'MxToast'];
-    names.forEach(function (name) {
-      try {
-        var ctor = eval(name);
-        if (ctor) window[name] = ctor;
-      } catch (_) { /* 未加载的工具跳过 */ }
-    });
-    try { if (window.MxRipple && MxRipple.init) MxRipple.init(); } catch (_) {}
-    try { if (window.MxSmoothCorner && MxSmoothCorner.init) MxSmoothCorner.init(); } catch (_) {}
-  })();
-</script>
-<script src="/app.js?v=1792919805"></script>
+<script src="/console-init.js"></script>
+<script src="/app.js?v=1.2.0"></script>
 </body>
 </html>

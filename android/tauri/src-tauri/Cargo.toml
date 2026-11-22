@@ -1,0 +1,29 @@
+[package]
+name = "codearts2api-android"
+version = "1.2.0"
+edition = "2021"
+
+[lib]
+name = "codearts2api_mobile"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+axum = "0.8"
+codearts2api = { path = "../../.." }
+hex = "0.4"
+rand = "0.8"
+serde_json = "1"
+tokio = { version = "1", features = ["net"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+reqwest = { version = "0.13" }
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+webpki-root-certs = "1"
+
+[dev-dependencies]
+reqwest = { version = "0.13" }
+tower = { version = "0.5", features = ["util"] }

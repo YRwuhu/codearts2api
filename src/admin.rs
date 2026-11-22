@@ -68,12 +68,7 @@ pub fn router() -> axum::Router<WebState> {
 
 /// 账号文件位置：优先 CODEARTS_ACCOUNTS，其次 .env 同目录 accounts.json。
 pub fn accounts_file_path(cfg: &Config) -> PathBuf {
-    std::env::var("CODEARTS_ACCOUNTS")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| cfg.env_dir.join("accounts.json"))
+    cfg.accounts_path.clone()
 }
 
 fn read_accounts(path: &PathBuf) -> Result<Vec<AccountRecord>, String> {
@@ -81,7 +76,8 @@ fn read_accounts(path: &PathBuf) -> Result<Vec<AccountRecord>, String> {
         return Ok(Vec::new());
     }
     let text = std::fs::read_to_string(path).map_err(|e| format!("读取失败: {e}"))?;
-    let parsed: AccountsFile = serde_json::from_str(&text).map_err(|e| format!("解析失败: {e}"))?;
+    let parsed: AccountsFile = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|e| format!("解析失败: {e}"))?;
     Ok(parsed.accounts)
 }
 
@@ -168,7 +164,10 @@ pub async fn resolve_account(
             }
             Err(e) => {
                 if identity.expired() {
-                    return Err(format!("账号 {} 凭证已过期且续期失败: {e}", account.id));
+                    return Err(format!(
+                        "账号 {} 凭证已过期且续期失败，请重新登录华为云：{e}",
+                        account.id
+                    ));
                 }
                 eprintln!("[oauth] 账号 {} 续期失败（继续用旧凭证）: {e}", account.id);
             }
@@ -446,6 +445,15 @@ pub async fn delete_account(State(state): State<WebState>, Path(id): Path<String
 
 /// POST /api/refresh —— 重新同步所有账号的模型。
 pub async fn refresh_models(State(state): State<WebState>) -> Response {
+    if state.config().explicit_data_dir {
+        if let Err(e) = state.reload_config() {
+            return err(StatusCode::BAD_REQUEST, e);
+        }
+        if let Err(e) = rebuild_pool(&state).await {
+            *state.pool.write().await = Pool::new(Vec::new());
+            return err(StatusCode::BAD_REQUEST, e);
+        }
+    }
     let pool = state.pool.read().await.clone();
     let mut report = Vec::new();
     for catalog in pool.catalogs() {
@@ -485,11 +493,7 @@ pub async fn test_model(State(state): State<WebState>, Json(req): Json<TestReque
         .unwrap_or_else(|| "只回复两个字：成功".to_string());
     let max_tokens = req.max_tokens.unwrap_or(512).clamp(16, 8192);
 
-    // 用与正式请求相同的路径打一次自己的代理，确保测的是真实链路。
-    let url = format!(
-        "http://127.0.0.1:{}/v1/chat/completions",
-        state.config().port
-    );
+    // Exercise the same handler as the proxy without going through the listener's client auth.
     let payload = json!({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -498,20 +502,24 @@ pub async fn test_model(State(state): State<WebState>, Json(req): Json<TestReque
     });
 
     let started = std::time::Instant::now();
-    let resp = state
-        .http
-        .post(&url)
-        .json(&payload)
-        .timeout(std::time::Duration::from_secs(180))
-        .send()
-        .await;
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(180),
+        crate::api::chat_completions(
+            State(state),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from(payload.to_string()),
+        ),
+    )
+    .await;
 
     match resp {
         Ok(r) => {
             let status = r.status().as_u16();
-            let text = r.text().await.unwrap_or_default();
+            let body = axum::body::to_bytes(r.into_body(), 4 * 1024 * 1024)
+                .await
+                .unwrap_or_default();
             let elapsed = started.elapsed().as_millis();
-            let value: Value = serde_json::from_str(&text).unwrap_or(json!({"raw": text}));
+            let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let content = value["choices"][0]["message"]["content"]
                 .as_str()
                 .unwrap_or("")

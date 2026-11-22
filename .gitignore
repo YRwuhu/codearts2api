@@ -2,10 +2,19 @@
 .env.local
 .env.*.local
 accounts.json
+account.json
 
 # Rust build artifacts
 /target
 **/*.rs.bk
+
+# Android build artifacts
+/android/.gradle/
+/android/**/.kotlin/
+/android/local.properties
+/android/**/build/
+/android/tauri/src-tauri/target/
+/android/tauri/src-tauri/gen/schemas/
 
 # Runtime/cache
 models-cache.json
@@ -16,6 +25,7 @@ checkin.json
 
 # OAuth 登录凭证（含 refresh_token 与 DPoP 私钥）
 auths/
+auth/
 
 # Editor / OS
 .vscode/

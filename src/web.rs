@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::extract::State;
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -22,7 +23,7 @@ static ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/static");
 
 #[derive(Clone)]
 pub struct WebState {
-    pub config: Arc<RwLock<Config>>,
+    config: Arc<std::sync::RwLock<Config>>,
     pub pool: Arc<RwLock<Pool>>,
     pub http: reqwest::Client,
     pub usage: Arc<UsageStore>,
@@ -39,7 +40,7 @@ pub struct WebState {
 impl WebState {
     pub fn new(config: Config, pool: Pool, http: reqwest::Client, usage: Arc<UsageStore>) -> Self {
         Self {
-            config: Arc::new(RwLock::new(config)),
+            config: Arc::new(std::sync::RwLock::new(config)),
             pool: Arc::new(RwLock::new(pool)),
             http,
             usage,
@@ -53,9 +54,9 @@ impl WebState {
     /// 取配置快照，避免长时间持锁。
     pub fn config(&self) -> Config {
         self.config
-            .try_read()
-            .map(|c| c.clone())
-            .unwrap_or_else(|_| Config::load().expect("配置在运行期不应失效"))
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     /// 取（或按需创建）某账号的并发闸门。
@@ -78,13 +79,21 @@ impl WebState {
     }
 
     pub fn reload_config(&self) -> Result<(), String> {
-        let fresh = Config::load()?;
-        if let Ok(mut guard) = self.config.try_write() {
-            *guard = fresh;
-            Ok(())
+        let current = self.config();
+        let fresh = if current.explicit_data_dir {
+            let mut config = Config::load_from_dir(&current.env_dir)?;
+            // The live listener and OAuth callback use the active address until restart.
+            config.host = current.host;
+            config.port = current.port;
+            config
         } else {
-            Err("配置正被占用，请重试".to_string())
-        }
+            Config::load()?
+        };
+        *self
+            .config
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = fresh;
+        Ok(())
     }
 }
 
@@ -106,28 +115,38 @@ fn guess_mime(path: &str) -> &'static str {
 }
 
 /// 静态资源与 SPA 入口：未匹配的路径一律回落到 index.html。
-pub async fn static_handler(uri: Uri) -> Response {
+pub async fn static_handler(State(state): State<WebState>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
 
-    if let Some(file) = ASSETS.get_file(path) {
-        let mime = guess_mime(path);
-        return (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, mime)],
-            file.contents().to_vec(),
-        )
-            .into_response();
+    if path != "index.html" {
+        if let Some(file) = ASSETS.get_file(path) {
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, guess_mime(path))],
+                file.contents(),
+            )
+                .into_response();
+        }
     }
 
     // 根路径与前端路由（/accounts、/models）都交给 SPA 处理
     match ASSETS.get_file("index.html") {
-        Some(index) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            index.contents().to_vec(),
-        )
-            .into_response(),
+        Some(index) => {
+            let html = index
+                .contents_utf8()
+                .expect("embedded index.html uses UTF-8");
+            let html = if state.config().explicit_data_dir {
+                std::borrow::Cow::Owned(html.replacen(
+                    "data-platform=\"desktop\"",
+                    "data-platform=\"android\"",
+                    1,
+                ))
+            } else {
+                std::borrow::Cow::Borrowed(html)
+            };
+            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+        }
         None => (StatusCode::NOT_FOUND, "index.html 未嵌入").into_response(),
     }
 }

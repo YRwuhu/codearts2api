@@ -5,6 +5,8 @@
 (function () {
   'use strict';
 
+  const isAndroid = document.documentElement.dataset.platform === 'android';
+
   const state = {
     status: null,
     accounts: [],
@@ -84,6 +86,7 @@
     if (route === 'quota') loadQuota(false);
     if (route === 'usage') loadUsage();
     if (route === 'checkin') loadCheckin();
+    if (route === 'connect' && isAndroid) loadMobileConnection();
     // 桌面端顶栏的"刷新模型"只在概览/模型页有意义
     const refreshBtn = $('#refreshBtn');
     if (refreshBtn) refreshBtn.style.visibility = (route === 'connect') ? 'hidden' : 'visible';
@@ -93,6 +96,25 @@
   function currentRouteFromHash() {
     const h = (location.hash || '').replace(/^#/, '');
     return ROUTE_LABELS[h] ? h : 'overview';
+  }
+
+  async function loadMobileConnection() {
+    const key = $('#connKey');
+    key.textContent = '加载中…';
+    try {
+      const config = await api('/api/mobile');
+      $('#connBase').textContent = config.base_url;
+      key.textContent = config.api_key;
+      $('#mobileDataDir').textContent = config.data_dir;
+      $('#mobileDataRow').hidden = false;
+      $('#connKeyHint').textContent = '请复制此密钥；代理会校验 Authorization 或 x-api-key。';
+      $('#connNetworkHint').textContent = config.allow_lan
+        ? '同一局域网的客户端请把 127.0.0.1 换成手机的局域网 IP。管理面板仅供本机访问。'
+        : '代理仅在本机监听。若需在局域网访问，在 CodeArts/.env 设置 CODEARTS_PROXY_HOST=0.0.0.0 后重启应用。';
+    } catch (e) {
+      key.textContent = '读取失败';
+      toast('error', e.message);
+    }
   }
 
   // ── 渲染 ────────────────────────────────────────────────
@@ -166,7 +188,8 @@
 
     // 接入页
     const base = $('#connBase');
-    if (base) base.textContent = 'http://' + (summary.listen || '127.0.0.1:8787') + '/v1';
+    if (base) base.textContent = (isAndroid ? location.origin :
+      'http://' + (summary.listen || '127.0.0.1:8787')) + '/v1';
     const connModel = $('#connModel');
     if (connModel) {
       const preferred = ['deepseek-v4.1-flash', 'glm-5.3', 'kimi-k3'];
@@ -183,12 +206,22 @@
       return;
     }
     const health = (state.status && state.status.health) || {};
+    const oauthById = new Map(((state.status && state.status.oauth_accounts) || [])
+      .map((item) => [item.user_id, item]));
     tbody.innerHTML = state.accounts.map((a) => {
       const h = health[a.id] || {};
       const isOauth = a.oauth || (!a.ak || a.ak === '****');
-      const credBadge = isOauth
+      const identity = oauthById.get(a.id);
+      let credBadge = isOauth
         ? '<span class="mx-badge mx-badge-success">OAuth</span>'
         : '<span class="mx-badge">AK/SK</span>';
+      if (isOauth && !identity) {
+        credBadge = '<span class="mx-badge mx-badge-error" title="请重新登录华为云">OAuth 凭证缺失</span>';
+      } else if (isOauth && identity.remaining_secs <= 0) {
+        credBadge = '<span class="mx-badge mx-badge-error" title="若自动续期失败，请重新登录华为云">OAuth 已过期</span>';
+      } else if (isOauth && identity.expiring_soon) {
+        credBadge = '<span class="mx-badge mx-badge-warning">OAuth 即将续期</span>';
+      }
       let healthBadge;
       if (h.available === false) {
         healthBadge = '<span class="mx-badge mx-badge-error">冷却 ' + (h.cooldown_remaining || 0) + 's</span>';
@@ -650,6 +683,13 @@
     } catch (e) {
       if (msg) msg.textContent = '查询失败：' + e.message;
     }
+    const last = $('#checkinLast');
+    try {
+      const { last: result } = await api('/api/checkin/last');
+      last.hidden = !result;
+      if (result) last.textContent = '最近签到 · ' +
+        new Date(result.at * 1000).toLocaleString() + ' · ' + result.message;
+    } catch (_) { last.hidden = true; }
   }
 
   function statusBadge(status) {
@@ -763,14 +803,17 @@
       const data = await api('/api/oauth/start', { method: 'POST' });
       if (linkBtn) {
         linkBtn.hidden = false;
-        linkBtn.onclick = () => window.open(data.auth_url, '_blank', 'noopener');
+        linkBtn.onclick = () => isAndroid
+          ? location.assign(data.auth_url)
+          : window.open(data.auth_url, '_blank', 'noopener');
       }
       if (hint) {
-        hint.textContent = data.opened
+        hint.textContent = data.opened || isAndroid
           ? '浏览器已打开授权页，请完成登录（本页会自动检测）'
           : '请点击「打开授权页」完成登录';
       }
       pollOauth(data.session_id);
+      if (isAndroid) location.assign(data.auth_url);
     } catch (e) {
       if (hint) hint.textContent = '发起登录失败：' + e.message;
       toast('error', e.message);

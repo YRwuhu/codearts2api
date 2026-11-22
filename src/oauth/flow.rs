@@ -33,16 +33,24 @@ fn random_id() -> String {
 }
 
 fn open_browser(url: &str) -> bool {
-    #[cfg(windows)]
-    let child = std::process::Command::new("rundll32")
-        .args(["url.dll,FileProtocolHandler", url])
-        .spawn();
-    #[cfg(target_os = "macos")]
-    let child = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let child = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(target_os = "android")]
+    {
+        let _ = url;
+        false
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        #[cfg(windows)]
+        let child = std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn();
+        #[cfg(target_os = "macos")]
+        let child = std::process::Command::new("open").arg(url).spawn();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let child = std::process::Command::new("xdg-open").arg(url).spawn();
 
-    child.is_ok()
+        child.is_ok()
+    }
 }
 
 /// POST /api/oauth/start —— 创建登录会话，返回授权链接。
