@@ -144,6 +144,10 @@ pub struct Config {
     pub env_dir: PathBuf,
     pub accounts_path: PathBuf,
     pub(crate) explicit_data_dir: bool,
+    /// 多账号选号策略（`CODEARTS_ROTATION`）。
+    pub rotation: crate::rotate::Strategy,
+    /// 剩余 credit 低于该值的账号降级为兜底（`CODEARTS_MIN_CREDIT`），0 = 不启用。
+    pub min_credit: f64,
 }
 
 fn candidates() -> Vec<PathBuf> {
@@ -263,6 +267,45 @@ fn load_accounts_file(path: &Path) -> Result<Vec<Account>, String> {
         accounts.push(Account::manual(id, ak, sk, entry.enabled));
     }
     Ok(accounts)
+}
+
+/// `rotation.json` 的磁盘格式。只存策略相关字段，其余配置仍以 `.env` 为准。
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct RotationSettings {
+    #[serde(default)]
+    strategy: Option<String>,
+    #[serde(default)]
+    min_credit: Option<f64>,
+}
+
+fn rotation_path(env_dir: &Path) -> PathBuf {
+    env_dir.join("rotation.json")
+}
+
+fn read_rotation_settings(env_dir: &Path) -> Option<RotationSettings> {
+    let text = std::fs::read_to_string(rotation_path(env_dir)).ok()?;
+    serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()
+}
+
+fn read_rotation_file(env_dir: &Path) -> Option<crate::rotate::Strategy> {
+    read_rotation_settings(env_dir)
+        .and_then(|s| s.strategy)
+        .map(|v| crate::rotate::Strategy::parse(&v))
+}
+
+/// 保存选号策略到 `rotation.json`（面板改策略时调用）。
+pub fn save_rotation(
+    env_dir: &Path,
+    strategy: crate::rotate::Strategy,
+    min_credit: Option<f64>,
+) -> Result<(), String> {
+    let settings = RotationSettings {
+        strategy: Some(strategy.as_str().to_string()),
+        min_credit: min_credit.filter(|v| v.is_finite() && *v > 0.0),
+    };
+    let text = serde_json::to_string_pretty(&settings).map_err(|e| format!("序列化失败: {e}"))?;
+    let path = rotation_path(env_dir);
+    std::fs::write(&path, text).map_err(|e| format!("写入 {} 失败: {e}", path.display()))
 }
 
 impl Config {
@@ -395,6 +438,22 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|| env_dir.join("models-cache.json"));
 
+        // 选号策略：WebUI 保存的 rotation.json 优先，其次 .env，最后默认值。
+        // 放到单独文件是为了让面板能改策略而不动用户的 .env（那里可能有注释、
+        // 也可能是容器里的只读挂载）。
+        let rotation = read_rotation_file(&env_dir)
+            .or_else(|| setting("CODEARTS_ROTATION").map(|v| crate::rotate::Strategy::parse(&v)))
+            .unwrap_or_default();
+
+        let min_credit = read_rotation_settings(&env_dir)
+            .and_then(|s| s.min_credit)
+            .or_else(|| {
+                setting("CODEARTS_MIN_CREDIT")
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+            })
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(0.0);
+
         Ok(Config {
             accounts,
             host,
@@ -410,6 +469,8 @@ impl Config {
             env_dir,
             accounts_path,
             explicit_data_dir,
+            rotation,
+            min_credit,
         })
     }
 

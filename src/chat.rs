@@ -365,61 +365,77 @@ async fn run_for_model(
         }
     }
 
-    let mut candidates = pool.accounts_for(model).await;
-    if candidates.is_empty() {
+    let seen_accounts = pool.accounts_for(model).await;
+    if seen_accounts.is_empty() {
         return Err(ApiError::not_found(format!("model '{model}' 无可用账号")));
     }
 
+    // ── 选号 ────────────────────────────────────────────────
+    //
+    // 健康过滤 + 排序都交给 rotate 模块，这里只负责把每个账号的运行时状态
+    // 采集出来。排序是「可用账号按策略排前面，冷却/额度耗尽的沉底但保留」，
+    // 因此全都不健康时仍然会尝试，而不是直接 429。
+    let policy = crate::rotate::Policy {
+        strategy: config.rotation,
+        min_credit: config.min_credit,
+    };
+    let quota_cache = state.quota.read().await;
+    let mut states = Vec::with_capacity(seen_accounts.len());
+    for catalog in &seen_accounts {
+        let gate = state.gate(catalog.account_id(), config.concurrency).await;
+        // 额度信息只信「查询成功」的快照；拿不到就不参与排序，避免拿陈旧
+        // 或错误的数据把账号排错位置。
+        let (credit_remain, credit_ratio) = match quota_cache.get(catalog.account_id()) {
+            Some(q) if q.ok => (
+                Some(q.total_remain),
+                if q.total_amount > 0.0 {
+                    Some((q.total_remain / q.total_amount).clamp(0.0, 1.0))
+                } else {
+                    None
+                },
+            ),
+            _ => (None, None),
+        };
+        states.push(
+            gate.selection_state(model, config.daily_token_cap, credit_remain, credit_ratio)
+                .await,
+        );
+    }
+    drop(quota_cache);
+
     // 会话钉号：同一对话优先留在原账号（prompt cache 亲和）。
-    if let Some(key) = req.session_key.as_ref() {
-        if let Some(pinned) = state.pins.get(key).await {
-            if let Some(pos) = candidates.iter().position(|c| c.account_id() == pinned) {
-                let c = candidates.remove(pos);
-                candidates.insert(0, c);
-                state.pins.touch(key).await;
-            } else {
-                state.pins.release_account(&pinned).await;
+    let pinned_index = match req.session_key.as_ref() {
+        Some(key) => match state.pins.get(key).await {
+            Some(pinned) => {
+                let pos = seen_accounts
+                    .iter()
+                    .position(|c| c.account_id() == pinned);
+                if pos.is_some() {
+                    state.pins.touch(key).await;
+                } else {
+                    state.pins.release_account(&pinned).await;
+                }
+                pos
             }
-        }
-    }
+            None => None,
+        },
+        None => None,
+    };
 
-    // 多账号时先剔除冷却中的；全在冷却则退回完整列表（排队等）。
-    // 多账号时先剔除冷却中 / 该模型正在冷却 / 当日额度用尽的；
-    // 全都不可用时退回完整列表（排队等），而不是直接拒绝。
-    if candidates.len() > 1 {
-        let daily_cap = config.daily_token_cap;
-        let mut ready = Vec::new();
-        for c in &candidates {
-            let gate = state.gate(c.account_id(), config.concurrency).await;
-            if !gate.available().await {
-                continue;
-            }
-            if gate.model_cooling(model).await {
-                continue;
-            }
-            if daily_cap > 0 && gate.daily_tokens().await >= daily_cap {
-                continue;
-            }
-            ready.push(c.clone());
-        }
-        if !ready.is_empty() {
-            candidates = ready;
-        }
-    }
+    let ordered = crate::rotate::order_with_pin(&policy, &states, pinned_index);
+    let candidates: Vec<_> = ordered.iter().map(|&i| seen_accounts[i].clone()).collect();
 
-    // 单账号但额度/模型被挡时，明确告诉调用方原因，别静默失败。
+    // 单账号但额度被挡时，明确告诉调用方原因，别静默失败。
     if candidates.len() == 1 {
-        let gate = state
-            .gate(candidates[0].account_id(), config.concurrency)
-            .await;
-        let daily_cap = config.daily_token_cap;
-        if daily_cap > 0 && gate.daily_tokens().await >= daily_cap {
+        let only = &states[ordered[0]];
+        if only.daily_exhausted {
             return Err(ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit_error",
                 format!(
-                    "账号 {} 今日 token 已达上限 {daily_cap}",
-                    candidates[0].account_id()
+                    "账号 {} 今日 token 已达上限 {}",
+                    candidates[0].account_id(),
+                    config.daily_token_cap
                 ),
             ));
         }
@@ -447,17 +463,17 @@ async fn run_for_model(
     }
 
     if req.stream {
-        let mut with_slot = Vec::new();
+        // 选号阶段已经按在途负载排过序，这里只判断「是否还有账号有空闲流式位」：
+        // 有就排队拿位（顺序已经是负载最轻的在最前），全都占满才考虑降级。
+        let mut any_free = false;
         for c in &candidates {
             let gate = state.gate(c.account_id(), config.concurrency).await;
             if gate.free_stream_slots().await > 0 {
-                with_slot.push(c.clone());
+                any_free = true;
+                break;
             }
         }
-        if !with_slot.is_empty() && with_slot.len() < candidates.len() {
-            // 有槽位的账号排前面
-            candidates = with_slot;
-        } else if with_slot.is_empty() && use_upstream_stream {
+        if !any_free && use_upstream_stream {
             if config.stream_degrade {
                 use_upstream_stream = false;
                 println!("[pool] {model}: 流式名额已满，改用非流式上游并本地合成 SSE（不占名额）");
@@ -519,6 +535,10 @@ async fn run_for_model(
                     break;
                 }
             };
+
+            // 真正要发请求才记「用过」：等槽位超时、序列化失败都没到这步，
+            // 不该算这个账号被选中（否则连续失败的号会被越推越后，更难恢复）。
+            gate.mark_selected().await;
 
             let outcome = attempt(
                 state,
@@ -601,10 +621,13 @@ async fn run_for_model(
                         ))
                         .await;
                     if switch_account && idx + 1 < candidates.len() {
+                        let next = candidates[idx + 1].account_id();
                         println!(
-                            "[pool] {model}: 账号 {} 不可用（{}），切换下一个",
+                            "[pool] {model}: 账号 {} 不可用（{}），切换 {}（策略 {}）",
                             catalog.account_id(),
-                            error.code
+                            error.code,
+                            next,
+                            policy.strategy.as_str()
                         );
                         last = Some(error);
                         break;

@@ -62,6 +62,7 @@ pub fn router() -> axum::Router<WebState> {
         .route("/api/checkin/last", get(last_checkin))
         .route("/api/quota", get(quota))
         .route("/api/quota/refresh", post(quota_refresh))
+        .route("/api/rotation", get(rotation_config).post(set_rotation))
         .route("/api/usage", get(usage_summary))
         .route("/api/usage/recent", get(usage_recent))
 }
@@ -239,6 +240,67 @@ pub async fn status(State(state): State<WebState>) -> Response {
     }
     let pinned_sessions = state.pins.len().await;
 
+    // 选号视角：把「现在下一个请求会优先落在哪个账号」也算出来，
+    // 前端用它渲染池卡片。这里用不带钉号的全局排序（钉号是会话级的，
+    // 状态页看不到具体会话）。
+    let policy = crate::rotate::Policy {
+        strategy: cfg.rotation,
+        min_credit: cfg.min_credit,
+    };
+    let quota_cache = state.quota.read().await;
+    let mut pool_view = Vec::new();
+    for account in &cfg.accounts {
+        let gate = state.gate(&account.id, cfg.concurrency).await;
+        let (credit_remain, credit_ratio) = match quota_cache.get(&account.id) {
+            Some(q) if q.ok => (
+                Some(q.total_remain),
+                if q.total_amount > 0.0 {
+                    Some(q.total_remain / q.total_amount)
+                } else {
+                    None
+                },
+            ),
+            _ => (None, None),
+        };
+        let selection = gate
+            .selection_state("", cfg.daily_token_cap, credit_remain, credit_ratio)
+            .await;
+        pool_view.push((account.id.clone(), selection, credit_remain, credit_ratio));
+    }
+    drop(quota_cache);
+
+    let states: Vec<_> = pool_view.iter().map(|(_, s, _, _)| s.clone()).collect();
+    let rank: std::collections::HashMap<String, usize> = crate::rotate::order(&policy, &states)
+        .into_iter()
+        .enumerate()
+        .map(|(pos, i)| (pool_view[i].0.clone(), pos))
+        .collect();
+
+    let rotation_accounts: Vec<Value> = pool_view
+        .iter()
+        .map(|(id, s, remain, ratio)| {
+            json!({
+                "id": id,
+                "rank": rank.get(id).copied().unwrap_or(usize::MAX),
+                "in_flight": s.in_flight,
+                "limit": s.limit,
+                "cooling": s.cooling,
+                "model_cooling": s.model_cooling,
+                "daily_exhausted": s.daily_exhausted,
+                "idle_ms": s.idle_ms,
+                "credit_remain": remain,
+                "credit_ratio": ratio,
+                "consecutive_failures": s.consecutive_failures,
+            })
+        })
+        .collect();
+    let rotation = json!({
+        "strategy": policy.strategy.as_str(),
+        "strategy_label": policy.strategy.label(),
+        "min_credit": policy.min_credit,
+        "accounts": rotation_accounts,
+    });
+
     let merged = pool.merged_models().await;
     let model_list: Vec<Value> = merged
         .iter()
@@ -270,6 +332,7 @@ pub async fn status(State(state): State<WebState>) -> Response {
         },
         "oauth": oauth_accounts,
         "health": health,
+        "rotation": rotation,
         "config": {
             "host": cfg.host,
             "port": cfg.port,
@@ -278,6 +341,8 @@ pub async fn status(State(state): State<WebState>) -> Response {
             "daily_token_cap": cfg.daily_token_cap,
             "benefit_fallback": cfg.benefit_fallback,
             "accounts_file": accounts_file_path(&cfg).display().to_string(),
+            "rotation": cfg.rotation.as_str(),
+            "min_credit": cfg.min_credit,
         }
     }))
     .into_response()
@@ -645,6 +710,64 @@ pub struct UsageQuery {
     pub hours: Option<i64>,
     #[serde(default)]
     pub bucket: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SetRotationRequest {
+    pub strategy: String,
+    /// 传 `null` 表示清除阈值，恢复「只看策略」。
+    #[serde(default)]
+    pub min_credit: Option<f64>,
+}
+
+/// GET /api/rotation —— 当前选号策略与可选值。
+pub async fn rotation_config(State(state): State<WebState>) -> Response {
+    let cfg = state.config();
+    Json(json!({
+        "strategy": cfg.rotation.as_str(),
+        "strategy_label": cfg.rotation.label(),
+        "min_credit": cfg.min_credit,
+        "options": [
+            {"value": "balanced", "label": crate::rotate::Strategy::Balanced.label()},
+            {"value": "credit", "label": crate::rotate::Strategy::Credit.label()},
+            {"value": "roundrobin", "label": crate::rotate::Strategy::RoundRobin.label()},
+        ],
+    }))
+    .into_response()
+}
+
+/// POST /api/rotation —— 切换选号策略（写 rotation.json 并热重载配置）。
+pub async fn set_rotation(
+    State(state): State<WebState>,
+    Json(req): Json<SetRotationRequest>,
+) -> Response {
+    let cfg = state.config();
+    let strategy = crate::rotate::Strategy::parse(&req.strategy);
+    // 显式给了 strategy 却解析成默认值，多半是拼错了；报错比静默改策略好。
+    let normalized = req.strategy.trim().to_ascii_lowercase();
+    let known = matches!(
+        normalized.as_str(),
+        "balanced" | "credit" | "quota" | "balance" | "roundrobin" | "round-robin" | "rr" | "rotate"
+    );
+    if !known {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("unknown strategy '{}'（可选 balanced / credit / roundrobin）", req.strategy),
+        );
+    }
+    if let Err(e) = crate::config::save_rotation(&cfg.env_dir, strategy, req.min_credit) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    if let Err(e) = state.reload_config() {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("重载配置失败: {e}"));
+    }
+    Json(json!({
+        "ok": true,
+        "strategy": strategy.as_str(),
+        "strategy_label": strategy.label(),
+        "min_credit": state.config().min_credit,
+    }))
+    .into_response()
 }
 
 /// GET /api/usage —— 用量汇总与趋势。

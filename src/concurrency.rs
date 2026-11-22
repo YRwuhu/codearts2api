@@ -76,6 +76,11 @@ struct GateState {
     /// 日切时间戳（本地日期 0 点的秒级时间）
     daily_reset_ts: i64,
     last_error: Option<String>,
+    /// 上次被选号器选中的时刻；`None` 表示本进程内还没用过。
+    ///
+    /// 选号器用它做「最久未用」的公平性排序：负载相同时自然轮转，
+    /// 不会所有请求都压在配置里的第一个账号上。
+    last_selected: Option<Instant>,
 }
 
 impl AccountGate {
@@ -178,6 +183,47 @@ impl AccountGate {
         }
     }
 
+    /// 记录一次「这个账号刚被选号器选中」。
+    ///
+    /// 只影响公平性排序，不涉及健康状态；失败切换时也会更新，
+    /// 让连续失败的账号自然沉底。
+    pub async fn mark_selected(&self) {
+        let mut st = self.state.write().await;
+        st.last_selected = Some(Instant::now());
+    }
+
+    /// 选号器用的状态快照（不含当日 token 的具体值，只给是否耗尽）。
+    ///
+    /// 额度信息由调用方注入：`quota` 参数是「剩余 credit / 总额」，
+    /// 不知道就传 `None`，不会凭猜测给账号加分或减分。
+    pub async fn selection_state(
+        &self,
+        model: &str,
+        daily_cap: i64,
+        credit_remain: Option<f64>,
+        credit_ratio: Option<f64>,
+    ) -> crate::rotate::AccountState {
+        let now = Instant::now();
+        let st = self.state.read().await;
+        let cooling = st.cooldown_until.map(|u| now < u).unwrap_or(false);
+        let daily_exhausted = daily_cap > 0 && st.daily_tokens >= daily_cap && st.daily_reset_ts == local_midnight_ts();
+        crate::rotate::AccountState {
+            in_flight: st.stream_in_flight,
+            limit: self.limit as u32,
+            cooling,
+            model_cooling: st
+                .model_cooldowns
+                .get(model)
+                .map(|u| now < *u)
+                .unwrap_or(false),
+            daily_exhausted,
+            idle_ms: st.last_selected.map(|t| now.saturating_duration_since(t).as_millis() as u64),
+            credit_remain,
+            credit_ratio,
+            consecutive_failures: st.consecutive_failures,
+        }
+    }
+
     /// 让某个模型在这个账号上冷却一段时间。
     pub async fn cool_model(&self, model: &str, secs: u64) {
         let mut st = self.state.write().await;
@@ -245,6 +291,7 @@ impl AccountGate {
             "total_failures": st.total_failures,
             "last_error": st.last_error,
             "daily_tokens": st.daily_tokens,
+            "last_selected_ms": st.last_selected.map(|t| now.saturating_duration_since(t).as_millis() as u64),
             "model_cooldowns": st.model_cooldowns.iter()
                 .filter(|(_, until)| **until > now)
                 .map(|(m, until)| (m.clone(), until.saturating_duration_since(now).as_secs()))
