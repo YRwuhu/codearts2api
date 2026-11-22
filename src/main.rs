@@ -45,7 +45,9 @@ fn print_help() {
 
 多账号:
   在 .env 同目录创建 accounts.json（参考 accounts.example.json）即可启用多账号。
-  请求按文件中的顺序尝试，遇到并发超限/鉴权失败/该账号无此模型时自动切换下一个。
+  新会话按 CODEARTS_ROTATION 选号（默认 balanced：在途最少的先接，空闲时轮转）；
+  会话已建立的对话仍钉在原账号上保住 prompt cache。
+  遇到并发超限/鉴权失败/该账号无此模型时自动切换下一个账号。
   未创建 accounts.json 时退回 .env 里的单个 CODEARTS_AK / CODEARTS_SK。
 
 环境变量（也可写在 .env）:
@@ -58,6 +60,8 @@ fn print_help() {
   CODEARTS_STREAM_DEGRADE       名额用完时降级非流式，默认 0（关）
   CODEARTS_CONCURRENCY          本地在途流式请求上限，默认 8
   CODEARTS_DAILY_TOKEN_CAP      每账号每日 token 上限，0 = 不限制
+  CODEARTS_ROTATION             多账号选号策略：balanced（默认）/ credit / roundrobin
+  CODEARTS_MIN_CREDIT           剩余 credit 低于该值的账号降级为兜底，0 = 不启用
   CODEARTS_MAX_BODY_MB          单请求体上限（MB），默认 32；贴大段代码/日志时调大
   CODEARTS_BENEFIT_FALLBACK     1 = 免费模型拿不到时仍暴露兜底列表
   CODEARTS_MODEL_CACHE          模型缓存路径，默认与 .env 同目录

@@ -77,8 +77,9 @@ codearts2api.exe benefit claim   手动签到领额度
 ## 一些值得知道的事
 
 - 多账号时模型列表自动合并去重，请求按顺序故障切换。
+- 多账号选号默认「负载均衡」：新会话落到在途最少的账号，负载相同时按最久未用轮转，不会把第一个号打死。可选余额优先 / 严格轮转，见下面的环境变量。
 - 模型目录优先读取缓存，过期后后台单飞刷新，不阻塞聊天首字。
-- 同一对话会固定路由到同一账号（prompt cache 是账号级的）。
+- 同一对话会固定路由到同一账号（prompt cache 是账号级的）；钉住的号不健康时，故障切换会接手并把钉号改过去。
 - 支持模型原生识图：图片直接内嵌发送，不再绕网页附件会话；纯文本模型收到图片会自动回退视觉模型（`CODEARTS_VISION_MODEL`，设为 `off` 可关闭）。
 - 上游内容审核误拦截（`InferHub.ModelArts.81011.403`，返回一段固定拒答）会自动立即重试，最多 5 次，不计账号失败。
 - `/v1/responses` 完整兼容 Codex / ZCode：思维链走 reasoning summary 事件，`response.completed` 带齐 usage，不会把思维链当正文显示。
@@ -96,8 +97,13 @@ codearts2api.exe benefit claim   手动签到领额度
 | `CODEARTS_PROXY_HOST` | `127.0.0.1` | 监听地址 |
 | `CODEARTS_CONCURRENCY` | `8` | 本地并发上限 |
 | `CODEARTS_DAILY_TOKEN_CAP` | `0` | 每账号每日 token 上限，0 不限 |
+| `CODEARTS_ROTATION` | `balanced` | 多账号选号：`balanced` 负载均衡 / `credit` 余额优先 / `roundrobin` 严格轮转 |
+| `CODEARTS_MIN_CREDIT` | `0` | 剩余 credit 低于该值的账号降级为兜底，0 不启用 |
 | `CODEARTS_SANITIZE` | 开 | 设为 `0` / `off` 关闭提示词清洗 |
 | `CODEARTS_SANITIZE_RULES` | `sanitize.json` | 自定义规则文件路径（不存在则用内置规则） |
+
+`CODEARTS_ROTATION` 也可以在面板「账号 → 轮换策略」直接切换，会写进
+`rotation.json`（优先于 `.env`）并即时生效，不用重启。
 
 其余的看 `.env.example`。
 
