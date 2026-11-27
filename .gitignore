@@ -37,3 +37,9 @@ desktop.ini
 
 # 发布产物校验文件（由构建流程生成）
 SHA256SUMS.txt
+
+# Android release 签名（私钥与口令，绝不提交）
+android/tauri/keystore/
+*.jks
+*.keystore
+!**/debug.keystore
