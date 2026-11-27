@@ -637,7 +637,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "codearts2api"
-version = "0.7.2"
+version = "0.9.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -650,6 +650,7 @@ dependencies = [
  "hmac 0.12.1",
  "include_dir",
  "p256",
+ "pbkdf2",
  "percent-encoding",
  "rand 0.8.8",
  "reqwest",
@@ -3069,6 +3070,16 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
+]
+
+[[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest 0.10.7",
+ "hmac 0.12.1",
 ]
 
 [[package]]

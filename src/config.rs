@@ -411,8 +411,12 @@ impl Config {
         // 「登录华为云」走 OAuth。CLI 子命令用 `require_accounts` 自行校验。
         let access = crate::access::load(&env_dir);
         let env_host = setting("CODEARTS_PROXY_HOST");
-        let host = if !explicit_data_dir && access.lan == Some(true) {
-            "0.0.0.0".to_string()
+        let host = if !explicit_data_dir && access.lan.is_some() {
+            if access.lan == Some(true) {
+                "0.0.0.0".to_string()
+            } else {
+                "127.0.0.1".to_string()
+            }
         } else {
             env_host
                 .unwrap_or_else(|| "127.0.0.1".to_string())
@@ -624,6 +628,16 @@ mod tests {
         let config = Config::load_desktop_dir(&dir).unwrap();
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.api_key.as_deref(), Some("test-long-key"));
+
+        crate::access::save_for_test(
+            &dir,
+            &crate::access::Settings {
+                lan: Some(false),
+                ..Default::default()
+            },
+        );
+        let local = Config::load_desktop_dir(&dir).unwrap();
+        assert_eq!(local.host, "127.0.0.1");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

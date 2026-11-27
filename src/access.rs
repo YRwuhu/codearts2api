@@ -56,6 +56,11 @@ fn save(dir: &Path, settings: &Settings) -> Result<(), String> {
     std::fs::rename(temp, path(dir)).map_err(|e| format!("保存访问配置失败: {e}"))
 }
 
+#[cfg(test)]
+pub(crate) fn save_for_test(dir: &Path, settings: &Settings) {
+    save(dir, settings).unwrap();
+}
+
 fn secret() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -226,7 +231,11 @@ fn secure_response(mut response: Response, path: &str) -> Response {
     if path.starts_with("/api/") {
         headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     }
-    if path == "/" || path.ends_with(".html") {
+    if headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|kind| kind.starts_with("text/html"))
+    {
         headers.insert(
             header::CONTENT_SECURITY_POLICY,
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; font-src 'self' https://cdn.jsdelivr.net; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'".parse().unwrap(),
