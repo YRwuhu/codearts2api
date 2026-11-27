@@ -27,10 +27,13 @@ pub struct WebState {
     pub pool: Arc<RwLock<Pool>>,
     pub http: reqwest::Client,
     pub usage: Arc<UsageStore>,
+    pub log: crate::logging::Logger,
     /// 最近一次额度查询结果（按账号缓存），由定时任务或 WebUI 触发更新。
     pub quota: Arc<RwLock<HashMap<String, Quota>>>,
-    /// 最近一次签到结果，供页面展示。
-    pub last_checkin: Arc<RwLock<Option<crate::checkin::Outcome>>>,
+    /// 每个账号最近一次签到结果，按账号归属并持久化到 checkin.json。
+    pub checkins: Arc<RwLock<crate::checkin::History>>,
+    /// 同一账号的手动与后台签到互斥。
+    pub checkin_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// 每账号的并发闸门与健康状态。
     pub gates: Arc<RwLock<HashMap<String, Arc<crate::concurrency::AccountGate>>>>,
     /// 会话钉号表。
@@ -39,13 +42,17 @@ pub struct WebState {
 
 impl WebState {
     pub fn new(config: Config, pool: Pool, http: reqwest::Client, usage: Arc<UsageStore>) -> Self {
+        let checkins = crate::checkin::load_history(&config.env_dir);
+        let log = crate::logging::Logger::new(Some(config.env_dir.join("logs/server.log")));
         Self {
             config: Arc::new(std::sync::RwLock::new(config)),
             pool: Arc::new(RwLock::new(pool)),
             http,
             usage,
+            log,
             quota: Arc::new(RwLock::new(HashMap::new())),
-            last_checkin: Arc::new(RwLock::new(None)),
+            checkins: Arc::new(RwLock::new(checkins)),
+            checkin_locks: Arc::new(RwLock::new(HashMap::new())),
             gates: Arc::new(RwLock::new(HashMap::new())),
             pins: crate::concurrency::SessionPins::new(),
         }
@@ -75,6 +82,18 @@ impl WebState {
         guard
             .entry(account_id.to_string())
             .or_insert_with(|| Arc::new(crate::concurrency::AccountGate::new(limit)))
+            .clone()
+    }
+
+    pub async fn checkin_lock(&self, account: &str) -> Arc<tokio::sync::Mutex<()>> {
+        if let Some(lock) = self.checkin_locks.read().await.get(account) {
+            return lock.clone();
+        }
+        self.checkin_locks
+            .write()
+            .await
+            .entry(account.to_string())
+            .or_default()
             .clone()
     }
 

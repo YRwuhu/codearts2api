@@ -9,6 +9,8 @@
 
 .route[hidden] { display: none; }
 
+#checkinLast { white-space: pre-line; }
+
 /* 键值行（接入页） */
 .kv {
   display: flex;
@@ -25,6 +27,7 @@
 }
 .kv-v {
   flex: 1 1 auto;
+  min-width: 0;
   font-family: var(--mx-mono);
   font-size: 13px;
   color: var(--mx-text);

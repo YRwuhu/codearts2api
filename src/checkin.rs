@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 use crate::signer::Signer;
 
@@ -80,6 +81,50 @@ pub struct Outcome {
     pub benefit_amount: f64,
     pub activities: Vec<Activity>,
     pub at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AccountOutcome {
+    pub account: String,
+    pub trigger: String,
+    #[serde(flatten)]
+    pub outcome: Outcome,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct History {
+    #[serde(default)]
+    pub accounts: HashMap<String, AccountOutcome>,
+}
+
+pub fn load_history(dir: &std::path::Path) -> History {
+    std::fs::read_to_string(dir.join("checkin.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_history(dir: &std::path::Path, history: &History) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("创建签到目录失败: {e}"))?;
+    let text = serde_json::to_string_pretty(history).map_err(|e| format!("序列化失败: {e}"))?;
+    let temp = dir.join("checkin.json.tmp");
+    std::fs::write(&temp, text).map_err(|e| format!("写入签到结果失败: {e}"))?;
+    std::fs::rename(&temp, dir.join("checkin.json")).map_err(|e| format!("保存签到结果失败: {e}"))
+}
+
+/// 进程重启或上一轮请求超时后，复用同一账号、日期和活动的幂等键。
+fn idempotency_key(account: &str, campaign_id: i64, date: &str) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    Digest::update(&mut hasher, account.as_bytes());
+    Digest::update(&mut hasher, b":");
+    Digest::update(&mut hasher, date.as_bytes());
+    let digest = hasher.finalize();
+    format!("claim_{}_{}", campaign_id, hex::encode(&digest[..8]))
+}
+
+fn local_date() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
 fn now() -> i64 {
@@ -217,16 +262,18 @@ async fn fetch_activities_at(
 /// 执行签到：查询 → 逐个领取并确认 → 复查到账状态。
 pub async fn run(
     http: &reqwest::Client,
+    account: &str,
     ak: &str,
     sk: &str,
     security_token: Option<&str>,
 ) -> Outcome {
-    run_at(http, SNAP_BASE, ak, sk, security_token).await
+    run_at(http, SNAP_BASE, account, ak, sk, security_token).await
 }
 
 async fn run_at(
     http: &reqwest::Client,
     base: &str,
+    account: &str,
     ak: &str,
     sk: &str,
     security_token: Option<&str>,
@@ -268,16 +315,13 @@ async fn run_at(
     let mut attempted = 0;
     let mut claimed_amount = 0.0;
     let mut errors = Vec::new();
+    let date = local_date();
     for activity in daily {
         if activity.claimed() || !activity.claimable {
             continue;
         }
         attempted += 1;
-        let idem = format!(
-            "claim_{}_{}",
-            activity.campaign_id,
-            chrono::Utc::now().timestamp_millis()
-        );
+        let idem = idempotency_key(account, activity.campaign_id, &date);
         let claim = json!({
             "campaignId": activity.campaign_id,
             "channel": CHANNEL,
@@ -319,6 +363,19 @@ async fn run_at(
         Ok(refreshed) => {
             out.claimed_today = daily_completed(&refreshed);
             out.ok = out.claimed_today && errors.is_empty();
+            if out.claimed_today {
+                let received = refreshed
+                    .iter()
+                    .filter(|a| a.is_daily() && a.claimed())
+                    .map(|a| a.benefit_amount)
+                    .sum::<f64>()
+                    - activities
+                        .iter()
+                        .filter(|a| a.is_daily() && a.claimed())
+                        .map(|a| a.benefit_amount)
+                        .sum::<f64>();
+                claimed_amount = received.max(0.0);
+            }
             out.activities = refreshed;
         }
         Err(e) => errors.push(format!("签到后复查失败：{e}")),
@@ -517,7 +574,15 @@ mod tests {
             ..Default::default()
         }));
         let base = fake_server(state.clone()).await;
-        let out = run_at(&reqwest::Client::new(), &base, "test-ak", "test-sk", None).await;
+        let out = run_at(
+            &reqwest::Client::new(),
+            &base,
+            "test-account",
+            "test-ak",
+            "test-sk",
+            None,
+        )
+        .await;
 
         assert!(out.ok, "{}", out.message);
         assert!(out.claimed_today);
@@ -543,7 +608,15 @@ mod tests {
             ..Default::default()
         }));
         let base = fake_server(state.clone()).await;
-        let out = run_at(&reqwest::Client::new(), &base, "test-ak", "test-sk", None).await;
+        let out = run_at(
+            &reqwest::Client::new(),
+            &base,
+            "test-account",
+            "test-ak",
+            "test-sk",
+            None,
+        )
+        .await;
 
         assert!(!out.ok);
         assert!(!out.claimed_today);
@@ -564,7 +637,15 @@ mod tests {
             ..Default::default()
         }));
         let base = fake_server(state.clone()).await;
-        let out = run_at(&reqwest::Client::new(), &base, "test-ak", "test-sk", None).await;
+        let out = run_at(
+            &reqwest::Client::new(),
+            &base,
+            "test-account",
+            "test-ak",
+            "test-sk",
+            None,
+        )
+        .await;
 
         assert!(out.ok);
         assert!(out.claimed_today);
@@ -580,7 +661,15 @@ mod tests {
             ..Default::default()
         }));
         let base = fake_server(state).await;
-        let out = run_at(&reqwest::Client::new(), &base, "test-ak", "test-sk", None).await;
+        let out = run_at(
+            &reqwest::Client::new(),
+            &base,
+            "test-account",
+            "test-ak",
+            "test-sk",
+            None,
+        )
+        .await;
 
         assert!(!out.ok);
         assert!(!out.claimed_today);

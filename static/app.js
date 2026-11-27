@@ -44,6 +44,10 @@
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch (_) { data = { raw: text }; }
     if (!resp.ok) {
+      if (resp.status === 401 && !path.startsWith('/api/access/')) {
+        location.reload();
+        throw new Error('管理登录已失效，正在返回登录页');
+      }
       const msg = (data && (data.error || data.message)) || ('HTTP ' + resp.status);
       throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
     }
@@ -87,6 +91,7 @@
     if (route === 'usage') loadUsage();
     if (route === 'checkin') loadCheckin();
     if (route === 'connect' && isAndroid) loadMobileConnection();
+    if (route === 'connect' && !isAndroid) loadAccessSettings();
     // 桌面端顶栏的"刷新模型"只在概览/模型页有意义
     const refreshBtn = $('#refreshBtn');
     if (refreshBtn) refreshBtn.style.visibility = (route === 'connect') ? 'hidden' : 'visible';
@@ -115,6 +120,62 @@
       key.textContent = '读取失败';
       toast('error', e.message);
     }
+  }
+
+  async function loadAccessSettings() {
+    try {
+      const [settings, session] = await Promise.all([
+        api('/api/access/settings'),
+        api('/api/access/session'),
+      ]);
+      $('#lanEnabled').checked = !!settings.lan;
+      $('#lanListen').textContent = settings.listen || '—';
+      $('#lanStatus').textContent = settings.restart_required
+        ? '设置已变更，重启服务后生效。'
+        : (settings.lan ? '局域网访问已开启。手机请使用电脑的局域网 IP，并在系统防火墙中允许本程序。' : '当前仅本机访问。');
+      $('#connKey').textContent = settings.api_key || 'codearts';
+      $('#connKeyHint').textContent = settings.api_key
+        ? '客户端必须填写此 API Key；它与华为云凭证和管理密码相互独立。'
+        : '本机模式未启用客户端鉴权。开启局域网访问后会生成独立 API Key。';
+      $('#connNetworkHint').textContent = settings.lan
+        ? '已允许局域网访问，请仅在可信网络中开启，不要把管理面板暴露到公网。'
+        : '本服务默认绑定 127.0.0.1，同网段其他机器无法访问。';
+      $('#logoutBtn').hidden = !session.protected;
+    } catch (e) {
+      $('#lanStatus').textContent = '读取访问设置失败：' + e.message;
+    }
+  }
+
+  async function saveAccessSettings() {
+    const btn = $('#saveAccessBtn');
+    btn.disabled = true;
+    try {
+      const result = await api('/api/access/settings', {
+        method: 'POST',
+        body: JSON.stringify({
+          lan: $('#lanEnabled').checked,
+          password: $('#lanPassword').value || null,
+          current_password: $('#lanCurrentPassword').value || null,
+        }),
+      });
+      $('#lanPassword').value = '';
+      $('#lanCurrentPassword').value = '';
+      $('#connKey').textContent = result.api_key || 'codearts';
+      $('#lanStatus').textContent = '已保存。重启服务后生效；' + (result.lan
+        ? '请保存 API Key 和管理密码，然后使用手机访问电脑的局域网地址。'
+        : '已恢复本机监听，访问凭证仍然保留。');
+      toast('success', '访问设置已保存，请重启服务');
+    } catch (e) {
+      $('#lanStatus').textContent = e.message;
+      toast('error', e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function logoutAdmin() {
+    await api('/api/access/logout', { method: 'POST' });
+    location.reload();
   }
 
   // ── 渲染 ────────────────────────────────────────────────
@@ -173,8 +234,8 @@
 
     // 接入页
     const base = $('#connBase');
-    if (base) base.textContent = (isAndroid ? location.origin :
-      'http://' + (summary.listen || '127.0.0.1:8787')) + '/v1';
+    if (base) base.textContent = (isAndroid || (summary.listen || '').startsWith('0.0.0.0:')
+      ? location.origin : 'http://' + (summary.listen || '127.0.0.1:8787')) + '/v1';
     const connModel = $('#connModel');
     if (connModel) {
       const preferred = ['deepseek-v4.1-flash', 'glm-5.3', 'kimi-k3'];
@@ -800,10 +861,14 @@
     }
     const last = $('#checkinLast');
     try {
-      const { last: result } = await api('/api/checkin/last');
-      last.hidden = !result;
-      if (result) last.textContent = '最近签到 · ' +
-        new Date(result.at * 1000).toLocaleString() + ' · ' + result.message;
+      const { accounts: results } = await api('/api/checkin/last');
+      last.hidden = !results || !results.length;
+      if (results && results.length) {
+        last.textContent = results.slice(0, 5).map((result) =>
+          new Date(result.at * 1000).toLocaleString() + ' · ' + result.account + ' · ' +
+          (result.trigger === 'auto' ? '自动' : '手动') + ' · ' + result.message
+        ).join('\n');
+      }
     } catch (_) { last.hidden = true; }
   }
 
@@ -1050,6 +1115,15 @@
 
     const runCkBtn = $('#runCheckinBtn');
     if (runCkBtn) runCkBtn.addEventListener('click', runCheckin);
+
+    const saveAccessBtn = $('#saveAccessBtn');
+    if (saveAccessBtn) saveAccessBtn.addEventListener('click', saveAccessSettings);
+    const logoutBtn = $('#logoutBtn');
+    if (logoutBtn) logoutBtn.addEventListener('click', logoutAdmin);
+    const lanEnabled = $('#lanEnabled');
+    if (lanEnabled) lanEnabled.addEventListener('change', () => {
+      $('#lanCurrentPasswordWrap').hidden = lanEnabled.checked;
+    });
 
     const quotaBtn = $('#refreshQuotaBtn');
     if (quotaBtn) quotaBtn.addEventListener('click', () => loadQuota(true));

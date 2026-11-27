@@ -747,19 +747,32 @@ pub async fn set_rotation(
     let normalized = req.strategy.trim().to_ascii_lowercase();
     let known = matches!(
         normalized.as_str(),
-        "balanced" | "credit" | "quota" | "balance" | "roundrobin" | "round-robin" | "rr" | "rotate"
+        "balanced"
+            | "credit"
+            | "quota"
+            | "balance"
+            | "roundrobin"
+            | "round-robin"
+            | "rr"
+            | "rotate"
     );
     if !known {
         return err(
             StatusCode::BAD_REQUEST,
-            format!("unknown strategy '{}'（可选 balanced / credit / roundrobin）", req.strategy),
+            format!(
+                "unknown strategy '{}'（可选 balanced / credit / roundrobin）",
+                req.strategy
+            ),
         );
     }
     if let Err(e) = crate::config::save_rotation(&cfg.env_dir, strategy, req.min_credit) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
     if let Err(e) = state.reload_config() {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, format!("重载配置失败: {e}"));
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("重载配置失败: {e}"),
+        );
     }
     Json(json!({
         "ok": true,
@@ -898,68 +911,103 @@ pub async fn checkin_status(State(state): State<WebState>) -> Response {
     .into_response()
 }
 
+async fn checkin_account(
+    state: &WebState,
+    account: &crate::config::Account,
+    trigger: &str,
+) -> AccountCheckin {
+    let lock = state.checkin_lock(&account.id).await;
+    let Ok(_guard) = lock.try_lock() else {
+        return AccountCheckin {
+            account: account.id.clone(),
+            ok: false,
+            message: "该账号正在签到，请稍候".to_string(),
+            claimed_today: false,
+            benefit_amount: 0.0,
+            activities: Vec::new(),
+        };
+    };
+    let cfg = state.config();
+    let mut outcome = match resolve_account(&state.http, &cfg.env_dir, account).await {
+        Ok(resolved) => {
+            crate::checkin::run(
+                &state.http,
+                &account.id,
+                &resolved.ak,
+                &resolved.sk,
+                resolved.security_token(),
+            )
+            .await
+        }
+        Err(message) => crate::checkin::Outcome {
+            message,
+            at: chrono::Utc::now().timestamp(),
+            ..Default::default()
+        },
+    };
+    if outcome.ok && outcome.claimed_today && outcome.benefit_amount == 0.0 {
+        outcome.message = "今日所有每日活动均已到账".to_string();
+    }
+    println!(
+        "[checkin] trigger={trigger} account={} ok={} claimed={} {}",
+        account.id, outcome.ok, outcome.claimed_today, outcome.message
+    );
+    state.log.event(
+        "checkin",
+        json!({
+            "trigger": trigger,
+            "account": account.id,
+            "ok": outcome.ok,
+            "claimed_today": outcome.claimed_today,
+            "benefit_amount": outcome.benefit_amount,
+            "message": outcome.message,
+        }),
+    );
+    let result = AccountCheckin {
+        account: account.id.clone(),
+        ok: outcome.ok,
+        message: outcome.message.clone(),
+        claimed_today: outcome.claimed_today,
+        benefit_amount: outcome.benefit_amount,
+        activities: outcome.activities.clone(),
+    };
+    let record = crate::checkin::AccountOutcome {
+        account: account.id.clone(),
+        trigger: trigger.to_string(),
+        outcome,
+    };
+    let mut history = state.checkins.write().await;
+    history.accounts.insert(account.id.clone(), record);
+    if let Err(e) = crate::checkin::save_history(&cfg.env_dir, &history) {
+        eprintln!("[checkin] account={} {e}", account.id);
+    }
+    result
+}
+
 /// POST /api/checkin/run —— 对所有启用账号执行签到。
 pub async fn run_checkin(State(state): State<WebState>) -> Response {
     let cfg = state.config();
     let mut accounts = Vec::new();
-    let mut all_ok = true;
-    let mut any_claimed = false;
-
     for account in cfg.accounts.iter().filter(|a| a.enabled) {
-        let resolved = match resolve_account(&state.http, &cfg.env_dir, account).await {
-            Ok(a) => a,
-            Err(e) => {
-                all_ok = false;
-                accounts.push(AccountCheckin {
-                    account: account.id.clone(),
-                    ok: false,
-                    message: e,
-                    claimed_today: false,
-                    benefit_amount: 0.0,
-                    activities: Vec::new(),
-                });
-                continue;
-            }
-        };
-        let outcome = crate::checkin::run(
-            &state.http,
-            &resolved.ak,
-            &resolved.sk,
-            resolved.security_token(),
-        )
-        .await;
-        println!(
-            "[checkin] account={} ok={} claimed={} {}",
-            account.id, outcome.ok, outcome.claimed_today, outcome.message
-        );
-        if outcome.ok {
-            any_claimed = any_claimed || outcome.claimed_today;
-        } else {
-            all_ok = false;
-        }
-        accounts.push(AccountCheckin {
-            account: account.id.clone(),
-            ok: outcome.ok,
-            message: outcome.message.clone(),
-            claimed_today: outcome.claimed_today,
-            benefit_amount: outcome.benefit_amount,
-            activities: outcome.activities.clone(),
-        });
-        *state.last_checkin.write().await = Some(outcome);
+        accounts.push(checkin_account(&state, account, "manual").await);
     }
-
+    let completed = accounts.iter().filter(|a| a.ok && a.claimed_today).count();
+    let all_ok = accounts.iter().all(|a| a.ok);
     Json(json!({
         "ok": all_ok,
-        "claimed_today": any_claimed,
+        "claimed_today": !accounts.is_empty() && completed == accounts.len(),
+        "completed_count": completed,
         "accounts": accounts,
     }))
     .into_response()
 }
 
-/// GET /api/checkin/last —— 最近一次结果。
+/// GET /api/checkin/last —— 按账号保存的最近结果，重启后仍可查看。
 pub async fn last_checkin(State(state): State<WebState>) -> Response {
-    let last = state.last_checkin.read().await.clone();
-    Json(json!({ "last": last })).into_response()
+    let history = state.checkins.read().await;
+    let mut accounts: Vec<_> = history.accounts.values().cloned().collect();
+    accounts.sort_by_key(|result| std::cmp::Reverse(result.outcome.at));
+    Json(json!({ "accounts": accounts })).into_response()
 }
 
 /// 后台每日签到：启动后 15 秒检查一次，之后每 30 分钟一轮。
@@ -969,42 +1017,9 @@ pub fn spawn_checkin_scheduler(state: WebState) {
         loop {
             let cfg = state.config();
             for account in cfg.accounts.iter().filter(|a| a.enabled) {
-                let resolved = match resolve_account(&state.http, &cfg.env_dir, account).await {
-                    Ok(a) => a,
-                    Err(e) => {
-                        eprintln!("[checkin] account={} 凭证不可用: {e}", account.id);
-                        continue;
-                    }
-                };
-                match crate::checkin::fetch_activities(
-                    &state.http,
-                    &resolved.ak,
-                    &resolved.sk,
-                    resolved.security_token(),
-                )
-                .await
-                {
-                    Ok(activities) => {
-                        let daily: Vec<_> = activities.iter().filter(|a| a.is_daily()).collect();
-                        if daily.is_empty() || daily.iter().all(|a| a.claimed()) {
-                            continue;
-                        }
-                        let outcome = crate::checkin::run(
-                            &state.http,
-                            &resolved.ak,
-                            &resolved.sk,
-                            resolved.security_token(),
-                        )
-                        .await;
-                        println!(
-                            "[checkin] 自动签到 account={} ok={} {}",
-                            account.id, outcome.ok, outcome.message
-                        );
-                        *state.last_checkin.write().await = Some(outcome);
-                    }
-                    Err(e) => {
-                        eprintln!("[checkin] account={} 状态检查失败: {e}", account.id);
-                    }
+                let result = checkin_account(&state, account, "auto").await;
+                if !result.ok {
+                    eprintln!("[checkin] account={} {}", result.account, result.message);
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
