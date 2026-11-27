@@ -821,18 +821,19 @@
     const runBtn = $('#runCheckinBtn');
 
     const accounts = data.accounts || [];
-    const okAccounts = accounts.filter((a) => a.ok);
-    const claimed = !!data.claimed_today;
+    const completedCount = data.completed_count ?? accounts.filter((a) => a.ok && a.claimed_today).length;
+    const errorCount = data.query_error_count ?? accounts.filter((a) => !a.ok).length;
+    const claimed = accounts.length > 0 && completedCount === accounts.length;
 
     if (badge) {
       if (!accounts.length) {
         badge.textContent = '无账号';
         badge.className = 'mx-badge mx-badge-error';
-      } else if (!okAccounts.length) {
+      } else if (errorCount === accounts.length) {
         badge.textContent = '查询失败';
         badge.className = 'mx-badge mx-badge-error';
       } else {
-        badge.textContent = claimed ? '今日已签到' : '可签到';
+        badge.textContent = claimed ? '今日已签到' : '待签到 ' + (accounts.length - completedCount) + ' 个账号';
         badge.className = 'mx-badge ' + (claimed ? 'mx-badge-success' : 'mx-badge-warning');
       }
     }
@@ -840,7 +841,10 @@
     if (msg) {
       msg.textContent = !accounts.length
         ? '还没有配置账号，请先到「账号」页添加。'
-        : (claimed ? '今天已经签到过了，明天会自动领取。' : '今天还未签到，点「立即签到」或等待自动执行。');
+        : claimed
+          ? '全部 ' + accounts.length + ' 个账号的每日签到均已到账。'
+          : '已完成 ' + completedCount + '/' + accounts.length + ' 个账号；剩余账号会自动领取所有待签到的每日活动。'
+            + (errorCount ? '其中 ' + errorCount + ' 个账号查询失败。' : '');
     }
 
     if (!box) return;
@@ -856,8 +860,8 @@
       }
       const rows = (acc.activities || []).map((a) => {
         const pair = statusBadge(a.status);
-        const kind = KIND_LABEL[a.type] || a.type;
-        const amount = a.benefitAmount ? (a.benefitAmount + ' 积分') : '—';
+        const kind = KIND_LABEL[a.kind] || a.kind;
+        const amount = a.benefit_amount ? (a.benefit_amount + ' 积分') : '—';
         return '<tr>' +
           '<td data-label="活动">' + escapeHtml(a.title || '') + '</td>' +
           '<td data-label="类型">' + escapeHtml(kind) + '</td>' +
@@ -871,7 +875,7 @@
         '<span class="quota-name">' + escapeHtml(acc.account) + '</span>' +
         '<span class="quota-nums">' +
         (acc.claimed_today ? '今日已签到' : '今日未签到') +
-        (acc.benefit_amount ? ' · 每日 ' + acc.benefit_amount + ' 积分' : '') +
+        (acc.benefit_amount ? ' · 待领 ' + acc.benefit_amount + ' 积分' : '') +
         '</span>' +
         '</div>' +
         '<div class="mx-table-wrap" style="margin-top:10px">' +

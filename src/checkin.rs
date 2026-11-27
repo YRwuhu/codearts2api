@@ -59,6 +59,19 @@ impl Activity {
     }
 }
 
+/// 同一个账号可能同时有多个每日签到活动，不能只检查列表中的第一项。
+pub fn daily_completed(activities: &[Activity]) -> bool {
+    let mut found = false;
+    activities.iter().filter(|a| a.is_daily()).all(|a| {
+        found = true;
+        a.claimed()
+    }) && found
+}
+
+fn is_benign_claim_error(error: &str) -> bool {
+    error.contains("尚未到达") || error.contains("已领取")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Outcome {
     pub ok: bool,
@@ -78,6 +91,7 @@ struct Ctx<'a> {
     ak: &'a str,
     sk: &'a str,
     security_token: Option<&'a str>,
+    base: &'a str,
 }
 
 impl<'a> Ctx<'a> {
@@ -87,7 +101,7 @@ impl<'a> Ctx<'a> {
         path_query: &str,
         body: Option<Value>,
     ) -> Result<Value, String> {
-        let url = format!("{SNAP_BASE}{path_query}");
+        let url = format!("{}{}", self.base, path_query);
         let payload = match body {
             Some(v) => serde_json::to_vec(&v).map_err(|e| format!("序列化失败: {e}"))?,
             None => Vec::new(),
@@ -177,11 +191,22 @@ pub async fn fetch_activities(
     sk: &str,
     security_token: Option<&str>,
 ) -> Result<Vec<Activity>, String> {
+    fetch_activities_at(http, SNAP_BASE, ak, sk, security_token).await
+}
+
+async fn fetch_activities_at(
+    http: &reqwest::Client,
+    base: &str,
+    ak: &str,
+    sk: &str,
+    security_token: Option<&str>,
+) -> Result<Vec<Activity>, String> {
     let ctx = Ctx {
         http,
         ak,
         sk,
         security_token,
+        base,
     };
     let value = ctx
         .call("GET", &format!("{EP_DELIVERY}?channel={CHANNEL}"), None)
@@ -189,9 +214,19 @@ pub async fn fetch_activities(
     Ok(parse_activities(&value))
 }
 
-/// 执行签到：查询 → 领取 → 确认。
+/// 执行签到：查询 → 逐个领取并确认 → 复查到账状态。
 pub async fn run(
     http: &reqwest::Client,
+    ak: &str,
+    sk: &str,
+    security_token: Option<&str>,
+) -> Outcome {
+    run_at(http, SNAP_BASE, ak, sk, security_token).await
+}
+
+async fn run_at(
+    http: &reqwest::Client,
+    base: &str,
     ak: &str,
     sk: &str,
     security_token: Option<&str>,
@@ -200,15 +235,15 @@ pub async fn run(
         at: now(),
         ..Default::default()
     };
-
     let ctx = Ctx {
         http,
         ak,
         sk,
         security_token,
+        base,
     };
 
-    let activities = match fetch_activities(http, ak, sk, security_token).await {
+    let activities = match fetch_activities_at(http, base, ak, sk, security_token).await {
         Ok(a) => a,
         Err(e) => {
             out.message = e;
@@ -217,70 +252,211 @@ pub async fn run(
     };
     out.activities = activities.clone();
 
-    let Some(daily) = activities.iter().find(|a| a.is_daily()).cloned() else {
-        out.message = "未找到每日签到活动".to_string();
-        return out;
-    };
-    out.benefit_amount = daily.benefit_amount;
-
-    if daily.claimed() {
+    if daily_completed(&activities) {
         out.ok = true;
         out.claimed_today = true;
         out.message = "今日已签到".to_string();
         return out;
     }
 
-    // 领取
-    let idem = format!(
-        "claim_{}_{}",
-        daily.campaign_id,
-        chrono::Utc::now().timestamp_millis()
-    );
-    let claim_body = json!({
-        "campaignId": daily.campaign_id,
-        "channel": CHANNEL,
-        "idempotentKey": idem,
-    });
-    if let Err(e) = ctx.call("POST", EP_CLAIM, Some(claim_body)).await {
-        // 未到刷新时间 / 已领取都算今天已完成
-        let benign = e.contains("尚未到达") || e.contains("已领取");
-        out.ok = benign;
-        out.claimed_today = benign;
-        out.message = if benign {
-            format!("今日已签到（{e}）")
-        } else {
-            format!("领取失败: {e}")
-        };
+    let daily: Vec<_> = activities.iter().filter(|a| a.is_daily()).collect();
+    if daily.is_empty() {
+        out.message = "未找到每日签到活动".to_string();
         return out;
     }
 
-    // 确认
-    let confirm_ok = ctx
-        .call(
-            "POST",
-            EP_CONFIRM,
-            Some(json!({ "campaignId": daily.campaign_id })),
-        )
-        .await
-        .is_ok();
-
-    out.ok = true;
-    out.claimed_today = true;
-    out.message = if confirm_ok {
-        if daily.benefit_amount > 0.0 {
-            format!("签到成功，获得 {:.0} 积分", daily.benefit_amount)
-        } else {
-            "签到成功".to_string()
+    let mut attempted = 0;
+    let mut claimed_amount = 0.0;
+    let mut errors = Vec::new();
+    for activity in daily {
+        if activity.claimed() || !activity.claimable {
+            continue;
         }
+        attempted += 1;
+        let idem = format!(
+            "claim_{}_{}",
+            activity.campaign_id,
+            chrono::Utc::now().timestamp_millis()
+        );
+        let claim = json!({
+            "campaignId": activity.campaign_id,
+            "channel": CHANNEL,
+            "idempotentKey": idem,
+        });
+        if let Err(e) = ctx.call("POST", EP_CLAIM, Some(claim)).await {
+            if !is_benign_claim_error(&e) {
+                errors.push(format!("{}：{e}", activity.title));
+                continue;
+            }
+            if e.contains("已领取") {
+                let _ = ctx
+                    .call(
+                        "POST",
+                        EP_CONFIRM,
+                        Some(json!({ "campaignId": activity.campaign_id })),
+                    )
+                    .await;
+            }
+        } else {
+            // 确认失败也要继续处理其他每日活动，最终由复查判断是否到账。
+            let _ = ctx
+                .call(
+                    "POST",
+                    EP_CONFIRM,
+                    Some(json!({ "campaignId": activity.campaign_id })),
+                )
+                .await;
+            claimed_amount += activity.benefit_amount;
+        }
+    }
+
+    if attempted == 0 && errors.is_empty() {
+        out.message = "今日签到活动暂不可领取，将自动重试".to_string();
+        return out;
+    }
+
+    match fetch_activities_at(http, base, ak, sk, security_token).await {
+        Ok(refreshed) => {
+            out.claimed_today = daily_completed(&refreshed);
+            out.ok = out.claimed_today && errors.is_empty();
+            out.activities = refreshed;
+        }
+        Err(e) => errors.push(format!("签到后复查失败：{e}")),
+    }
+    out.benefit_amount = claimed_amount;
+
+    if out.claimed_today && errors.is_empty() {
+        out.message = if claimed_amount > 0.0 {
+            format!("签到成功，获得 {:.0} 积分", claimed_amount)
+        } else {
+            "今日已签到".to_string()
+        };
+    } else if out.claimed_today {
+        out.message = format!("每日活动已到账，但有 {} 项领取失败", errors.len());
+    } else if !errors.is_empty() {
+        out.message = format!("签到未完成：{}", errors.join("；"));
     } else {
-        "领取成功，确认步骤稍后自动到账".to_string()
-    };
+        out.message = "签到请求已提交，仍有每日活动未到账，将自动重试".to_string();
+    }
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Default)]
+    struct FakeOps {
+        activities: Vec<Value>,
+        calls: Vec<String>,
+        fail_claim: Option<i64>,
+        fail_confirm: Option<i64>,
+        claim_marks_claimed: bool,
+    }
+
+    async fn fake_server(state: Arc<Mutex<FakeOps>>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 4096];
+                    let (method, path, body) = loop {
+                        let n = socket.read(&mut buffer).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..n]);
+                        let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&request[..end]).to_string();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if request.len() < end + 4 + length {
+                            continue;
+                        }
+                        let mut lines = headers.lines();
+                        let mut first = lines.next().unwrap().split_whitespace();
+                        break (
+                            first.next().unwrap().to_string(),
+                            first.next().unwrap().to_string(),
+                            request[end + 4..end + 4 + length].to_vec(),
+                        );
+                    };
+                    let response = {
+                        let mut state = state.lock().unwrap();
+                        let id = serde_json::from_slice::<Value>(&body)
+                            .ok()
+                            .and_then(|v| v.get("campaignId").and_then(|v| v.as_i64()))
+                            .unwrap_or(0);
+                        state.calls.push(format!("{method} {path} {id}"));
+                        if path.starts_with(EP_DELIVERY) {
+                            let activities = state
+                                .activities
+                                .iter()
+                                .map(|item| {
+                                    let mut item = item.clone();
+                                    if state.claim_marks_claimed
+                                        && item["claimable"] == Value::Bool(false)
+                                        && item["status"].is_null()
+                                    {
+                                        item["status"] = Value::String("CLAIMED".to_string());
+                                    }
+                                    item
+                                })
+                                .collect::<Vec<_>>();
+                            json!({"code": 0, "data": {"items": activities}})
+                        } else if path == EP_CLAIM && state.fail_claim == Some(id) {
+                            json!({"code": 409, "message": "活动暂不可领取"})
+                        } else if path == EP_CONFIRM && state.fail_confirm == Some(id) {
+                            json!({"code": 500, "message": "确认暂未成功"})
+                        } else if path == EP_CLAIM || path == EP_CONFIRM {
+                            let mark_claimed = path == EP_CONFIRM && state.fail_confirm != Some(id);
+                            for item in &mut state.activities {
+                                if item.get("campaignId").and_then(|v| v.as_i64()) == Some(id)
+                                    && mark_claimed
+                                {
+                                    item["status"] = Value::String("CONFIRMED".to_string());
+                                    item["claimable"] = Value::Bool(false);
+                                }
+                            }
+                            json!({"code": 0, "data": {"campaignId": id}})
+                        } else {
+                            json!({"code": 404, "message": "not found"})
+                        }
+                    };
+                    let body = response.to_string();
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(headers.as_bytes()).await.unwrap();
+                    socket.write_all(body.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        base
+    }
+
+    fn activity(id: i64, title: &str, amount: f64, claimed: bool) -> Value {
+        json!({
+            "campaignId": id, "type": "USER_LOGIN", "title": title,
+            "benefitAmount": amount, "benefitUnit": "CREDIT",
+            "status": claimed.then_some("CONFIRMED"), "claimable": !claimed,
+        })
+    }
 
     #[test]
     fn parses_delivery_payload() {
@@ -328,5 +504,86 @@ mod tests {
     fn consumed_status_is_claimed() {
         let v = json!([{"campaignId": 1, "type": "USER_LOGIN", "status": "CONSUME"}]);
         assert!(parse_activities(&v)[0].claimed());
+    }
+
+    #[tokio::test]
+    async fn claims_all_pending_daily_activities() {
+        let state = Arc::new(Mutex::new(FakeOps {
+            activities: vec![
+                activity(42, "Skill创新赛报名礼", 2000.0, true),
+                activity(40, "Skill创新赛每日签到礼", 1000.0, false),
+                activity(34, "每日签到领100积分", 100.0, false),
+            ],
+            ..Default::default()
+        }));
+        let base = fake_server(state.clone()).await;
+        let out = run_at(&reqwest::Client::new(), &base, "test-ak", "test-sk", None).await;
+
+        assert!(out.ok, "{}", out.message);
+        assert!(out.claimed_today);
+        assert_eq!(out.benefit_amount, 1100.0);
+        let calls = state.lock().unwrap().calls.join("\n");
+        assert!(calls.contains("POST /v1/ops/claim 40"));
+        assert!(calls.contains("POST /v1/ops/confirm 40"));
+        assert!(calls.contains("POST /v1/ops/claim 34"));
+        assert!(calls.contains("POST /v1/ops/confirm 34"));
+        assert!(!calls.contains("claim 42"));
+        assert_eq!(calls.matches("GET /v1/ops/delivery").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_daily_does_not_block_other_activities() {
+        let state = Arc::new(Mutex::new(FakeOps {
+            activities: vec![
+                activity(42, "Skill创新赛报名礼", 2000.0, true),
+                activity(40, "Skill创新赛每日签到礼", 1000.0, false),
+                activity(34, "每日签到领100积分", 100.0, false),
+            ],
+            fail_claim: Some(40),
+            ..Default::default()
+        }));
+        let base = fake_server(state.clone()).await;
+        let out = run_at(&reqwest::Client::new(), &base, "test-ak", "test-sk", None).await;
+
+        assert!(!out.ok);
+        assert!(!out.claimed_today);
+        assert!(out.message.contains("Skill创新赛每日签到礼"));
+        let calls = state.lock().unwrap().calls.join("\n");
+        assert!(calls.contains("POST /v1/ops/claim 34"));
+        assert!(calls.contains("POST /v1/ops/confirm 34"));
+    }
+
+    #[tokio::test]
+    async fn confirmed_activities_do_not_trigger_another_claim() {
+        let state = Arc::new(Mutex::new(FakeOps {
+            activities: vec![
+                activity(42, "Skill创新赛报名礼", 2000.0, true),
+                activity(40, "Skill创新赛每日签到礼", 1000.0, true),
+                activity(34, "每日签到领100积分", 100.0, true),
+            ],
+            ..Default::default()
+        }));
+        let base = fake_server(state.clone()).await;
+        let out = run_at(&reqwest::Client::new(), &base, "test-ak", "test-sk", None).await;
+
+        assert!(out.ok);
+        assert!(out.claimed_today);
+        assert_eq!(state.lock().unwrap().calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_confirmation_is_not_reported_as_received() {
+        let state = Arc::new(Mutex::new(FakeOps {
+            activities: vec![activity(40, "Skill创新赛每日签到礼", 1000.0, false)],
+            claim_marks_claimed: true,
+            fail_confirm: Some(40),
+            ..Default::default()
+        }));
+        let base = fake_server(state).await;
+        let out = run_at(&reqwest::Client::new(), &base, "test-ak", "test-sk", None).await;
+
+        assert!(!out.ok);
+        assert!(!out.claimed_today);
+        assert!(out.message.contains("未到账"));
     }
 }

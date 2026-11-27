@@ -432,8 +432,8 @@
           </p>
           <ol class="steps">
             <li>服务启动 15 秒后检查一次，之后每 30 分钟一轮</li>
-            <li>当天尚未签到时自动领取（claim + confirm），已签到则跳过</li>
-            <li>领取失败会记录原因，不会重复请求</li>
+            <li>自动逐项领取所有每日签到活动（claim + confirm），已到账则跳过</li>
+            <li>领取后复查到账状态，失败项会在下一轮继续处理</li>
           </ol>
           <p class="helper-block" style="margin-top:10px">
             <strong>签名要点：</strong>该接口要求携带 <code>X-Sdk-Content-Sha256</code>

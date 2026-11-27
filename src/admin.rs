@@ -819,6 +819,7 @@ pub async fn checkin_status(State(state): State<WebState>) -> Response {
     let cfg = state.config();
     let mut accounts = Vec::new();
     let mut any_claimed = false;
+    let mut completed = 0;
     let mut all_ok = true;
 
     for account in cfg.accounts.iter().filter(|a| a.enabled) {
@@ -846,22 +847,29 @@ pub async fn checkin_status(State(state): State<WebState>) -> Response {
         .await
         {
             Ok(activities) => {
-                let daily = activities.iter().find(|a| a.is_daily());
-                let claimed = daily.map(|a| a.claimed()).unwrap_or(false);
-                if claimed {
-                    any_claimed = true;
-                }
+                let claimed = crate::checkin::daily_completed(&activities);
+                any_claimed = any_claimed || claimed;
+                completed += usize::from(claimed);
+                let pending = activities
+                    .iter()
+                    .filter(|a| a.is_daily() && !a.claimed())
+                    .count();
                 accounts.push(AccountCheckin {
                     account: account.id.clone(),
                     ok: true,
                     message: if claimed {
-                        "今日已签到"
+                        "今日已签到".to_string()
+                    } else if pending > 0 {
+                        format!("还有 {pending} 项每日签到待领取")
                     } else {
-                        "今日未签到"
-                    }
-                    .to_string(),
+                        "未找到每日签到活动".to_string()
+                    },
                     claimed_today: claimed,
-                    benefit_amount: daily.map(|a| a.benefit_amount).unwrap_or(0.0),
+                    benefit_amount: activities
+                        .iter()
+                        .filter(|a| a.is_daily() && !a.claimed())
+                        .map(|a| a.benefit_amount)
+                        .sum(),
                     activities,
                 });
             }
@@ -884,6 +892,8 @@ pub async fn checkin_status(State(state): State<WebState>) -> Response {
         "claimed_today": any_claimed,
         "accounts": accounts,
         "account_count": cfg.accounts.iter().filter(|a| a.enabled).count(),
+        "completed_count": completed,
+        "query_error_count": accounts.iter().filter(|a| !a.ok).count(),
     }))
     .into_response()
 }
