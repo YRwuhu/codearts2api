@@ -47,21 +47,16 @@ pub struct AccountState {
 }
 
 /// 账号选择策略。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Strategy {
     /// 负载均衡：在途少的优先，空闲时按最久未用轮转。
+    #[default]
     Balanced,
     /// 余额优先：剩余 credit 多的优先，适合套餐额度不均。
     Credit,
     /// 严格轮转：只按最久未用，平均分配请求数。
     RoundRobin,
-}
-
-impl Default for Strategy {
-    fn default() -> Self {
-        Self::Balanced
-    }
 }
 
 impl Strategy {
@@ -209,9 +204,7 @@ fn compare(policy: &Policy, a: &AccountState, b: &AccountState) -> Ordering {
 /// 返回候选账号的下标顺序（升序优先级）。下标对应调用方传入的切片顺序。
 pub fn order(policy: &Policy, states: &[AccountState]) -> Vec<usize> {
     let mut indices: Vec<usize> = (0..states.len()).collect();
-    indices.sort_by(|&i, &j| {
-        compare(policy, &states[i], &states[j]).then_with(|| i.cmp(&j))
-    });
+    indices.sort_by(|&i, &j| compare(policy, &states[i], &states[j]).then_with(|| i.cmp(&j)));
     indices
 }
 
@@ -220,7 +213,11 @@ pub fn order(policy: &Policy, states: &[AccountState]) -> Vec<usize> {
 /// 钉号账号即使被排到兜底层，也仍然排在第一——请求先在原账号上试，
 /// 失败后由 `run_for_model` 的切换逻辑接手。这样既保住 prompt cache，
 /// 又不会因为钉在一个坏号上而让整段对话卡死。
-pub fn order_with_pin(policy: &Policy, states: &[AccountState], pinned: Option<usize>) -> Vec<usize> {
+pub fn order_with_pin(
+    policy: &Policy,
+    states: &[AccountState],
+    pinned: Option<usize>,
+) -> Vec<usize> {
     let mut ordered = order(policy, states);
     if let Some(pin) = pinned {
         if let Some(pos) = ordered.iter().position(|&i| i == pin) {
@@ -256,7 +253,11 @@ mod tests {
     #[test]
     fn balanced_picks_the_least_loaded_account() {
         let policy = Policy::default();
-        let states = [state(2, 4, Some(1000)), state(0, 4, Some(10)), state(1, 4, None)];
+        let states = [
+            state(2, 4, Some(1000)),
+            state(0, 4, Some(10)),
+            state(1, 4, None),
+        ];
         assert_eq!(order(&policy, &states), vec![1, 2, 0]);
     }
 
@@ -264,7 +265,11 @@ mod tests {
     fn balanced_ties_break_by_least_recently_used() {
         let policy = Policy::default();
         // 三个号都空闲：先选从没用过的，再按最久没用的顺序
-        let states = [state(0, 4, Some(5000)), state(0, 4, None), state(0, 4, Some(9000))];
+        let states = [
+            state(0, 4, Some(5000)),
+            state(0, 4, None),
+            state(0, 4, Some(9000)),
+        ];
         assert_eq!(order(&policy, &states), vec![1, 2, 0]);
     }
 
@@ -365,7 +370,11 @@ mod tests {
     #[test]
     fn pin_moves_to_front_without_dropping_others() {
         let policy = Policy::default();
-        let states = [state(3, 4, None), state(0, 4, Some(100)), state(1, 4, Some(200))];
+        let states = [
+            state(3, 4, None),
+            state(0, 4, Some(100)),
+            state(1, 4, Some(200)),
+        ];
         assert_eq!(order_with_pin(&policy, &states, Some(2)), vec![2, 1, 0]);
         assert_eq!(order_with_pin(&policy, &states, None), vec![1, 2, 0]);
         // 越界或已不存在的钉号被忽略
