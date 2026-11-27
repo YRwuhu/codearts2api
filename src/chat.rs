@@ -422,9 +422,7 @@ async fn run_for_model(
     let pinned_index = match req.session_key.as_ref() {
         Some(key) => match state.pins.get(key).await {
             Some(pinned) => {
-                let pos = seen_accounts
-                    .iter()
-                    .position(|c| c.account_id() == pinned);
+                let pos = seen_accounts.iter().position(|c| c.account_id() == pinned);
                 if pos.is_some() {
                     state.pins.touch(key).await;
                 } else {
@@ -750,10 +748,7 @@ async fn attempt(
                 error: ApiError::new(
                     StatusCode::GATEWAY_TIMEOUT,
                     "upstream_ttfb_timeout",
-                    format!(
-                        "上游 {} 秒未返回响应头",
-                        UPSTREAM_TTFB_TIMEOUT.as_secs()
-                    ),
+                    format!("上游 {} 秒未返回响应头", UPSTREAM_TTFB_TIMEOUT.as_secs()),
                 ),
                 switch_account: true,
             })
@@ -762,9 +757,18 @@ async fn attempt(
 
     let status = upstream.status();
 
-    // HTTP 层失败
+    // HTTP 层失败；错误响应体同样可能被慢速连接无限拖住。
     if !status.is_success() {
-        let detail = upstream.text().await.unwrap_or_default();
+        let raw = match read_body(upstream).await {
+            Ok(raw) => raw,
+            Err(error) => {
+                return Ok(Attempt::Retry {
+                    error,
+                    switch_account: true,
+                })
+            }
+        };
+        let detail = String::from_utf8_lossy(&raw);
         let text = detail.chars().take(2000).collect::<String>();
         let parsed = serde_json::from_str::<Value>(&detail).unwrap_or(Value::Null);
         let code = parsed
@@ -799,7 +803,12 @@ async fn attempt(
         if !content_type.contains("text/event-stream") {
             let raw = match read_body(upstream).await {
                 Ok(raw) => raw,
-                Err(error) => return Ok(Attempt::Retry { error, switch_account: true }),
+                Err(error) => {
+                    return Ok(Attempt::Retry {
+                        error,
+                        switch_account: true,
+                    })
+                }
             };
             let mut result = crate::stream::parse_upstream(&raw);
             if let Some(err) = result.get("error") {
@@ -874,7 +883,12 @@ async fn attempt(
     // 非流式
     let raw = match read_body(upstream).await {
         Ok(raw) => raw,
-        Err(error) => return Ok(Attempt::Retry { error, switch_account: true }),
+        Err(error) => {
+            return Ok(Attempt::Retry {
+                error,
+                switch_account: true,
+            })
+        }
     };
     let mut result = crate::stream::parse_upstream(&raw);
 
@@ -1641,13 +1655,18 @@ mod tests {
         };
         let events: Vec<_> = decode_sse(source).collect().await;
         let final_code = match events.last() {
-            Some(DecoderEvent::Complete(done)) => done.result.as_ref().err().map(|e| e.code.clone()),
+            Some(DecoderEvent::Complete(done)) => {
+                done.result.as_ref().err().map(|e| e.code.clone())
+            }
             _ => None,
         };
         assert!(
             matches!(
                 events.last(),
-                Some(DecoderEvent::Complete(StreamCompletion { result: Ok(()), .. }))
+                Some(DecoderEvent::Complete(StreamCompletion {
+                    result: Ok(()),
+                    ..
+                }))
             ),
             "长流不该被截止，最终错误: {final_code:?}"
         );
