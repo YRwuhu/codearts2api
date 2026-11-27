@@ -334,7 +334,7 @@ async fn guard(
         )
             .into_response();
     }
-    Html(LOGIN_PAGE).into_response()
+    secure_response(Html(LOGIN_PAGE).into_response(), &path)
 }
 
 pub fn secure(router: Router, state: &WebState) -> Router {
@@ -555,6 +555,25 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(app.oneshot(proxy).await.unwrap().status(), StatusCode::OK);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn login_page_carries_security_headers() {
+        let (app, dir) = app(true);
+        let response = app.oneshot(request("/")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::X_FRAME_OPTIONS).unwrap(),
+            "DENY"
+        );
+        assert!(response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("frame-ancestors 'none'"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
