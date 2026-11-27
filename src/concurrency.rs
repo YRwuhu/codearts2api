@@ -206,7 +206,9 @@ impl AccountGate {
         let now = Instant::now();
         let st = self.state.read().await;
         let cooling = st.cooldown_until.map(|u| now < u).unwrap_or(false);
-        let daily_exhausted = daily_cap > 0 && st.daily_tokens >= daily_cap && st.daily_reset_ts == local_midnight_ts();
+        let daily_exhausted = daily_cap > 0
+            && st.daily_tokens >= daily_cap
+            && st.daily_reset_ts == local_midnight_ts();
         crate::rotate::AccountState {
             in_flight: st.stream_in_flight,
             limit: self.limit as u32,
@@ -217,7 +219,9 @@ impl AccountGate {
                 .map(|u| now < *u)
                 .unwrap_or(false),
             daily_exhausted,
-            idle_ms: st.last_selected.map(|t| now.saturating_duration_since(t).as_millis() as u64),
+            idle_ms: st
+                .last_selected
+                .map(|t| now.saturating_duration_since(t).as_millis() as u64),
             credit_remain,
             credit_ratio,
             consecutive_failures: st.consecutive_failures,
@@ -350,6 +354,15 @@ fn local_midnight_ts() -> i64 {
 /// 上游并发上限错误的判定。
 pub fn is_concurrency_error(text: &str) -> bool {
     text.contains("TM.00001041") || text.contains("并发会话数")
+}
+
+/// 上游引擎容量与账号 token 配额是两种不同的 429，分别记录便于排查。
+pub fn upstream_overloaded(text: &str) -> bool {
+    text.contains("ModelArts.81101")
+}
+
+pub fn account_rate_limited(text: &str) -> bool {
+    text.contains("ModelArts.81114")
 }
 
 /// 上游鉴权/凭证过期：可切换账号，也可续期。
@@ -542,6 +555,13 @@ mod tests {
         assert!(is_concurrency_error("TM.00001041"));
         assert!(is_concurrency_error("并发会话数已达上限(3个)"));
         assert!(!is_concurrency_error("benefit not found"));
+    }
+
+    #[test]
+    fn distinguishes_engine_overload_from_account_rate_limit() {
+        assert!(upstream_overloaded("InferHub.ModelArts.81101.429"));
+        assert!(account_rate_limited("InferHub.ModelArts.81114.429"));
+        assert!(!account_rate_limited("InferHub.ModelArts.81101.429"));
     }
 
     #[test]

@@ -460,6 +460,25 @@
           <p class="mx-helper" id="connKeyHint">API Key 可填任意非空字符串；代理不校验它，实际鉴权由华为云 AK/SK 完成。</p>
         </div>
       </div>
+      <div class="mx-card" style="margin-top:16px" id="desktopAccessCard">
+        <div class="mx-card-head"><span class="mx-card-title">局域网访问</span></div>
+        <div class="mx-card-body">
+          <p class="mx-helper">默认仅本机访问。开启后监听 0.0.0.0，客户端必须使用 API Key，管理面板必须登录；保存后重启服务生效。</p>
+          <label class="mx-label" style="margin-top:12px"><input id="lanEnabled" type="checkbox"> 允许局域网设备访问</label>
+          <div class="mx-input-wrap" style="margin-top:12px">
+            <input class="mx-input" id="lanPassword" type="password" autocomplete="new-password" placeholder="管理密码（首次开启至少 12 位）">
+          </div>
+          <div class="mx-input-wrap" id="lanCurrentPasswordWrap" style="margin-top:12px" hidden>
+            <input class="mx-input" id="lanCurrentPassword" type="password" autocomplete="current-password" placeholder="当前管理密码（关闭局域网时验证）">
+          </div>
+          <div class="kv"><span class="kv-k">当前监听</span><code class="kv-v" id="lanListen">—</code></div>
+          <p class="mx-helper" id="lanStatus"></p>
+          <div class="row-actions" style="margin-top:12px">
+            <button class="mx-btn mx-btn-primary mx-btn-sm" id="saveAccessBtn">保存访问设置</button>
+            <button class="mx-btn mx-btn-ghost mx-btn-sm" id="logoutBtn" hidden>退出管理登录</button>
+          </div>
+        </div>
+      </div>
       <div class="mx-card" style="margin-top:16px">
         <div class="mx-card-head"><span class="mx-card-title">注意事项</span></div>
         <div class="mx-card-body">
@@ -527,6 +546,6 @@
 <script src="/vendor/utils/modal.js"></script>
 <script src="/vendor/utils/toast.js"></script>
 <script src="/console-init.js"></script>
-<script src="/app.js?v=1.2.0"></script>
+<script src="/app.js?v=1.3.0"></script>
 </body>
 </html>

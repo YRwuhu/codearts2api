@@ -30,6 +30,9 @@ pub struct UsageRecord {
     pub elapsed_ms: i64,
     pub stream: bool,
     pub ok: bool,
+    /// 稳定匿名会话标识；由已有上游 chat-id 哈希派生，不存原始会话内容。
+    #[serde(default)]
+    pub session: Option<String>,
     /// 失败时的错误码或简述
     #[serde(default)]
     pub error: Option<String>,
@@ -72,6 +75,7 @@ impl UsageRecord {
             elapsed_ms,
             stream,
             ok: true,
+            session: None,
             error: None,
         }
     }
@@ -94,6 +98,7 @@ impl UsageRecord {
             elapsed_ms,
             stream,
             ok: false,
+            session: None,
             error: Some(error.into()),
         }
     }
@@ -303,6 +308,15 @@ mod tests {
         assert_eq!(r.total_tokens, 150);
         assert_eq!(r.reasoning_tokens, 20);
         assert!(r.ok);
+    }
+
+    #[test]
+    fn session_hash_does_not_expose_original_conversation() {
+        let secret = "user:private-conversation-id";
+        let hash = crate::concurrency::upstream_chat_id(secret);
+        assert!(hash.starts_with("chat-"));
+        assert!(!hash.contains("private-conversation-id"));
+        assert_eq!(hash, crate::concurrency::upstream_chat_id(secret));
     }
 
     #[test]

@@ -84,8 +84,8 @@ codearts2api.exe benefit claim   手动签到领额度
 - 上游内容审核误拦截（`InferHub.ModelArts.81011.403`，返回一段固定拒答）会自动立即重试，最多 5 次，不计账号失败。
 - `/v1/responses` 完整兼容 Codex / ZCode：思维链走 reasoning summary 事件，`response.completed` 带齐 usage，不会把思维链当正文显示。
 - 服务启动后自动签到领每日免费额度，不用管。同一账号有多个每日签到活动时，会逐项领取并确认，例如「Skill创新赛每日签到礼」和「每日签到领100积分」。
-- 默认只监听本机。改成 `0.0.0.0` 的话同网段谁都能用你的额度，自己掂量。
-- 用量数据存在 `usage.jsonl`，面板里能看趋势和明细。
+- 默认只监听本机。需要手机查看用量时，在「客户端接入 → 局域网访问」开启；服务会强制使用独立 API Key 和管理密码，保存后重启生效。
+- 用量数据存在 `usage.jsonl`，面板里能看趋势和明细；运行日志存于 `logs/server.log`，单个文件最多 5 MiB，不记录提示词正文或访问凭证。
 
 ## 环境变量
 
@@ -99,11 +99,23 @@ codearts2api.exe benefit claim   手动签到领额度
 | `CODEARTS_DAILY_TOKEN_CAP` | `0` | 每账号每日 token 上限，0 不限 |
 | `CODEARTS_ROTATION` | `balanced` | 多账号选号：`balanced` 负载均衡 / `credit` 余额优先 / `roundrobin` 严格轮转 |
 | `CODEARTS_MIN_CREDIT` | `0` | 剩余 credit 低于该值的账号降级为兜底，0 不启用 |
+| `CODEARTS_API_KEY` | 空 | 非本机模式必需的 `/v1` API Key，也可在面板生成 |
+| `CODEARTS_ADMIN_PASSWORD` | 空 | 非本机监听的管理密码（环境变量方式），建议优先用面板设置 |
 | `CODEARTS_SANITIZE` | 开 | 设为 `0` / `off` 关闭提示词清洗 |
 | `CODEARTS_SANITIZE_RULES` | `sanitize.json` | 自定义规则文件路径（不存在则用内置规则） |
 
 `CODEARTS_ROTATION` 也可以在面板「账号 → 轮换策略」直接切换，会写进
 `rotation.json`（优先于 `.env`）并即时生效，不用重启。
+
+### 局域网访问
+
+默认仅监听 `127.0.0.1`，无需管理登录。在「客户端接入 → 局域网访问」开启后，
+保存独立 API Key 和至少 12 位的管理密码，再重启服务。此时监听 `0.0.0.0`，
+手机访问 `http://电脑局域网IP:8787`，管理面板需要登录，客户端必须使用 API Key。
+首次启动请在电脑上完成；OAuth 回调仍仅允许本机，不建议把服务暴露到公网。
+
+访问配置存于 `access.json`（管理密码仅存 PBKDF2 哈希），不要提交或分享此文件。
+关闭局域网后恢复 `127.0.0.1`，但已生成的访问凭证会保留。
 
 其余的看 `.env.example`。
 
@@ -146,6 +158,10 @@ Main branch (you will usually use this for PRs): master
 cargo test           单元测试
 cargo run -- models  用真实凭证验证签名和模型同步
 ```
+
+## CI
+
+GitHub Actions 在 `main` 推送及以 `main` 为目标的 Pull Request 时，于 Windows 上运行格式检查、Clippy、单元测试和 release 构建。
 
 ## 免责声明
 

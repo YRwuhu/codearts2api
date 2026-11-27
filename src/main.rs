@@ -165,8 +165,13 @@ fn serve() -> ExitCode {
         admin::spawn_quota_refresher(state.clone());
         admin::spawn_checkin_scheduler(state.clone());
 
-        let app = api::router(state);
-        if let Err(e) = axum::serve(listener, app).await {
+        let app = access::secure(api::router(state.clone()), &state);
+        if let Err(e) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        {
             eprintln!("服务异常退出: {e}");
             return ExitCode::FAILURE;
         }

@@ -1,3 +1,4 @@
+pub mod access;
 pub mod admin;
 pub mod anthropic;
 pub mod api;
@@ -5,6 +6,7 @@ pub mod chat;
 pub mod checkin;
 pub mod concurrency;
 pub mod config;
+pub mod logging;
 pub mod models;
 pub mod oauth;
 pub mod params;

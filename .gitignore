@@ -23,6 +23,7 @@ models-cache.*.json
 usage.jsonl
 checkin.json
 rotation.json
+access.json
 
 # OAuth 登录凭证（含 refresh_token 与 DPoP 私钥）
 auths/

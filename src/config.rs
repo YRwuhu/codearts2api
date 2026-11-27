@@ -109,11 +109,24 @@ pub const DEFAULT_MAX_BODY_MB: usize = 32;
 /// `CODEARTS_MAX_BODY_MB` 的封顶值，防止误配把内存吃满。
 pub const MAX_BODY_MB_CEILING: usize = 512;
 
+pub fn host_is_loopback(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+pub fn host_is_lan(host: &str) -> bool {
+    !host_is_loopback(host)
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub accounts: Vec<Account>,
     pub host: String,
     pub port: u16,
+    /// 非回环监听时必须设置的客户端与管理访问凭证。
+    pub api_key: Option<String>,
+    pub admin_password: Option<String>,
     /// 本地在途流式请求上限，不是上游会话数。
     pub concurrency: usize,
     /// 模型允许的最大输出 token 数兜底值（模型元数据缺失时使用）。
@@ -324,6 +337,15 @@ impl Config {
 
     /// The embedded app reads its own .env without changing process environment or cwd.
     pub fn load_from_dir(dir: &Path) -> Result<Self, String> {
+        Self::load_settings_from_dir(dir, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_desktop_dir(dir: &Path) -> Result<Self, String> {
+        Self::load_settings_from_dir(dir, false)
+    }
+
+    fn load_settings_from_dir(dir: &Path, explicit_data_dir: bool) -> Result<Self, String> {
         let env_path = dir.join(".env");
         let mut values = std::collections::HashMap::new();
         if env_path.exists() {
@@ -334,7 +356,9 @@ impl Config {
                 values.entry(key).or_insert(value);
             }
         }
-        Self::load_settings(dir.to_path_buf(), true, |name| values.get(name).cloned())
+        Self::load_settings(dir.to_path_buf(), explicit_data_dir, |name| {
+            values.get(name).cloned()
+        })
     }
 
     fn load_settings(
@@ -385,10 +409,16 @@ impl Config {
 
         // 账号为空不算错误：首次使用需要先起服务，再从 WebUI 点
         // 「登录华为云」走 OAuth。CLI 子命令用 `require_accounts` 自行校验。
-        let host = setting("CODEARTS_PROXY_HOST")
-            .unwrap_or_else(|| "127.0.0.1".to_string())
-            .trim()
-            .to_string();
+        let access = crate::access::load(&env_dir);
+        let env_host = setting("CODEARTS_PROXY_HOST");
+        let host = if !explicit_data_dir && access.lan == Some(true) {
+            "0.0.0.0".to_string()
+        } else {
+            env_host
+                .unwrap_or_else(|| "127.0.0.1".to_string())
+                .trim()
+                .to_string()
+        };
         let port = setting("CODEARTS_PROXY_PORT")
             .and_then(|v| v.trim().parse::<u16>().ok())
             .unwrap_or(8787);
@@ -447,17 +477,33 @@ impl Config {
 
         let min_credit = read_rotation_settings(&env_dir)
             .and_then(|s| s.min_credit)
-            .or_else(|| {
-                setting("CODEARTS_MIN_CREDIT")
-                    .and_then(|v| v.trim().parse::<f64>().ok())
-            })
+            .or_else(|| setting("CODEARTS_MIN_CREDIT").and_then(|v| v.trim().parse::<f64>().ok()))
             .filter(|v| v.is_finite() && *v > 0.0)
             .unwrap_or(0.0);
+
+        let access = crate::access::load(&env_dir);
+        let non_loopback = host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| !ip.is_loopback())
+            .unwrap_or(true);
+        let api_key = setting("CODEARTS_API_KEY")
+            .or_else(|| (!access.api_key.is_empty()).then_some(access.api_key));
+        let admin_password = setting("CODEARTS_ADMIN_PASSWORD");
+        if non_loopback
+            && !explicit_data_dir
+            && (api_key.as_deref().unwrap_or("").is_empty()
+                || (access.admin_hash.is_empty()
+                    && admin_password.as_deref().unwrap_or("").len() < 12))
+        {
+            return Err("监听非回环地址时必须配置访问凭证。请在面板开启局域网访问，或同时设置 CODEARTS_API_KEY 与至少 12 位的 CODEARTS_ADMIN_PASSWORD。".to_string());
+        }
 
         Ok(Config {
             accounts,
             host,
             port,
+            api_key,
+            admin_password,
             concurrency,
             max_tokens_cap,
             benefit_fallback,
@@ -555,6 +601,29 @@ mod tests {
         assert_eq!(config.accounts_path, canonical);
         assert_eq!(config.env_dir, dir);
         assert!(!config.accounts[0].enabled);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn non_loopback_requires_both_access_credentials() {
+        let dir =
+            std::env::temp_dir().join(format!("codearts-lan-config-{}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join(".env"),
+            "CODEARTS_PROXY_HOST=0.0.0.0\nCODEARTS_API_KEY=test-long-key\n",
+        )
+        .unwrap();
+        let error = Config::load_desktop_dir(&dir).unwrap_err();
+        assert!(error.contains("CODEARTS_ADMIN_PASSWORD"));
+        std::fs::write(
+            dir.join(".env"),
+            "CODEARTS_PROXY_HOST=0.0.0.0\nCODEARTS_API_KEY=test-long-key\nCODEARTS_ADMIN_PASSWORD=correct-long-password\n",
+        )
+        .unwrap();
+        let config = Config::load_desktop_dir(&dir).unwrap();
+        assert_eq!(config.host, "0.0.0.0");
+        assert_eq!(config.api_key.as_deref(), Some("test-long-key"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

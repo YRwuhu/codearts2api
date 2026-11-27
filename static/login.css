@@ -1,0 +1,8 @@
+body { min-height: 100vh; display: grid; place-items: center; background: var(--mx-bg); }
+.login { width: min(380px, calc(100% - 40px)); }
+.login .mx-card-body { padding: 28px; }
+h1 { font-size: 20px; margin: 0 0 8px; }
+p { color: var(--mx-t2); font-size: 13px; line-height: 1.7; }
+.mx-input { width: 100%; margin: 12px 0; box-sizing: border-box; }
+.mx-btn { width: 100%; margin-top: 12px; }
+#error { color: var(--mx-red); min-height: 20px; }

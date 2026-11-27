@@ -561,6 +561,7 @@ async fn run_for_model(
                 use_upstream_stream,
                 req.stream,
                 chat_id.as_deref(),
+                req.session_key.as_deref(),
                 started,
                 guard,
                 gate.clone(),
@@ -626,16 +627,19 @@ async fn run_for_model(
                         continue;
                     }
 
-                    state
-                        .usage
-                        .record(crate::usage::UsageRecord::failed(
-                            model,
-                            catalog.account_id(),
-                            started.elapsed().as_millis() as i64,
-                            req.stream,
-                            format!("{}: {}", error.code, error.message),
-                        ))
-                        .await;
+                    log_error(state, model, catalog.account_id(), &error);
+                    let mut record = crate::usage::UsageRecord::failed(
+                        model,
+                        catalog.account_id(),
+                        started.elapsed().as_millis() as i64,
+                        req.stream,
+                        format!("{}: {}", error.code, error.message),
+                    );
+                    record.session = req
+                        .session_key
+                        .as_deref()
+                        .map(crate::concurrency::upstream_chat_id);
+                    state.usage.record(record).await;
                     if switch_account && idx + 1 < candidates.len() {
                         let next = candidates[idx + 1].account_id();
                         println!(
@@ -684,6 +688,7 @@ async fn attempt(
     upstream_stream: bool,
     client_stream: bool,
     chat_id: Option<&str>,
+    session_key: Option<&str>,
     started: Instant,
     guard: SlotGuard,
     gate: std::sync::Arc<crate::concurrency::AccountGate>,
@@ -844,6 +849,9 @@ async fn attempt(
                 true,
                 started,
                 usage.as_ref(),
+                session_key
+                    .map(crate::concurrency::upstream_chat_id)
+                    .as_deref(),
             )
             .await;
             // 与「客户端要流式、上游走非流式」那条路径保持同一形态，
@@ -873,6 +881,7 @@ async fn attempt(
                     state.clone(),
                     model.to_string(),
                     account_id.clone(),
+                    session_key.map(crate::concurrency::upstream_chat_id),
                     started,
                 );
                 return Ok(Attempt::Done(Outcome::Stream(stream)));
@@ -925,6 +934,9 @@ async fn attempt(
         client_stream,
         started,
         result.get("usage"),
+        session_key
+            .map(crate::concurrency::upstream_chat_id)
+            .as_deref(),
     )
     .await;
 
@@ -1000,6 +1012,7 @@ where
 /// 记录一条用量，并把 token 计入该账号的当日预算。
 ///
 /// 调用方已持有该账号的 `gate`，直接复用，避免再按账号查表并克隆一次配置。
+#[allow(clippy::too_many_arguments)]
 async fn record_usage(
     state: &WebState,
     gate: &crate::concurrency::AccountGate,
@@ -1008,16 +1021,20 @@ async fn record_usage(
     stream: bool,
     started: Instant,
     usage: Option<&Value>,
+    session: Option<&str>,
 ) {
     state
         .usage
-        .record(crate::usage::UsageRecord::from_upstream(
-            model,
-            account_id,
-            started.elapsed().as_millis() as i64,
-            stream,
-            usage,
-        ))
+        .record(crate::usage::UsageRecord {
+            session: session.map(str::to_string),
+            ..crate::usage::UsageRecord::from_upstream(
+                model,
+                account_id,
+                started.elapsed().as_millis() as i64,
+                stream,
+                usage,
+            )
+        })
         .await;
 
     if let Some(total) = usage
@@ -1095,6 +1112,18 @@ fn is_account_failure(code: &str) -> bool {
     code != "model_not_multimodal" && code != "waf_blocked" && code != "upstream_idle_timeout"
 }
 
+fn log_error(state: &WebState, model: &str, account: &str, error: &ApiError) {
+    state.log.event(
+        "upstream_error",
+        serde_json::json!({
+            "model": model,
+            "account": account,
+            "code": error.code,
+            "message": error.message.chars().take(2000).collect::<String>(),
+        }),
+    );
+}
+
 /// 把上游错误归类：可换号的账号级错误 vs 客户端错误。
 fn classify_failure(status: StatusCode, code: &str, msg: &str) -> Attempt {
     let text = format!("{code} {msg}");
@@ -1129,6 +1158,18 @@ fn classify_failure(status: StatusCode, code: &str, msg: &str) -> Attempt {
                 format!("模型不支持图片输入（上游明确拒绝）：{msg}"),
             ),
             switch_account: false,
+        };
+    }
+
+    if concurrency::upstream_overloaded(&text) || concurrency::account_rate_limited(&text) {
+        let kind = if concurrency::upstream_overloaded(&text) {
+            "upstream_overloaded"
+        } else {
+            "account_rate_limited"
+        };
+        return Attempt::Retry {
+            error: ApiError::new(StatusCode::TOO_MANY_REQUESTS, kind, msg.to_string()),
+            switch_account: true,
         };
     }
 
@@ -1343,6 +1384,7 @@ fn sse_stream(
     state: WebState,
     model: String,
     account: String,
+    session: Option<String>,
     started: Instant,
 ) -> EventStream {
     Box::pin(async_stream::stream! {
@@ -1362,17 +1404,21 @@ fn sse_stream(
         let Some(completion) = completion else { return };
         match completion.result {
             Ok(()) => {
-                record_usage(&state, &gate, &model, &account, true, started, completion.usage.as_ref()).await;
+                record_usage(&state, &gate, &model, &account, true, started, completion.usage.as_ref(), session.as_deref()).await;
                 yield Ok(StreamEvent::Done);
             }
             Err(error) => {
-                state.usage.record(crate::usage::UsageRecord::failed(
-                    &model,
-                    &account,
-                    started.elapsed().as_millis() as i64,
-                    true,
-                    format!("{}: {}", error.code, error.message),
-                )).await;
+                log_error(&state, &model, &account, &error);
+                state.usage.record(crate::usage::UsageRecord {
+                    session: session.clone(),
+                    ..crate::usage::UsageRecord::failed(
+                        &model,
+                        &account,
+                        started.elapsed().as_millis() as i64,
+                        true,
+                        format!("{}: {}", error.code, error.message),
+                    )
+                }).await;
                 // 空闲超时只退避该模型：这是「这条流卡住」，不是「账号坏了」。
                 if error.code == "upstream_idle_timeout" {
                     gate.cool_model(&model, MODEL_IDLE_COOLDOWN.as_secs()).await;

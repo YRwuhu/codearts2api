@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CodeArts2API 管理登录</title>
+<link rel="stylesheet" href="/vendor/core/tokens.css">
+<link rel="stylesheet" href="/vendor/core/base.css">
+<link rel="stylesheet" href="/vendor/components/card.css">
+<link rel="stylesheet" href="/vendor/components/button.css">
+<link rel="stylesheet" href="/vendor/components/input.css">
+<link rel="stylesheet" href="/login.css">
+</head>
+<body>
+<main class="login mx-card">
+  <div class="mx-card-body">
+    <h1>CodeArts2API 控制台</h1>
+    <p>此服务已启用访问保护。请输入管理密码；这与华为云账号、客户端 API Key 无关。</p>
+    <form id="loginForm">
+      <input class="mx-input" id="password" type="password" autocomplete="current-password" placeholder="管理密码" autofocus required>
+      <button class="mx-btn mx-btn-primary" id="submit" type="submit">登录</button>
+      <p id="error" role="alert"></p>
+    </form>
+  </div>
+</main>
+<script src="/login.js"></script>
+</body>
+</html>

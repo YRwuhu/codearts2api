@@ -27,7 +27,7 @@ pub fn router(state: AppState) -> Router {
     // （根本到不了上游）。这里按配置放宽。
     let body_limit = axum::extract::DefaultBodyLimit::max(state.config().max_body_bytes);
 
-    Router::new()
+    let app: Router = Router::new()
         .route("/v1/models", get(list_models).options(preflight))
         .route("/v1/models/{*model_id}", get(get_model).options(preflight))
         .route(
@@ -44,7 +44,8 @@ pub fn router(state: AppState) -> Router {
         .layer(cors)
         .merge(crate::admin::router())
         .merge(crate::web::router())
-        .with_state(state)
+        .with_state(state);
+    app
 }
 
 async fn preflight() -> StatusCode {
