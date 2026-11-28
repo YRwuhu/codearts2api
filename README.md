@@ -152,6 +152,18 @@ Main branch (you will usually use this for PRs): master
 `scopes` 可选 `system` / `user` / `assistant` / `tool`；`replacement` 留空表示删除。
 匹配是纯字面量，不支持正则。
 
+## v0.9.1
+
+- 修复上游 `InferHub.001001005.400 The request param is invalid` 不明原因失败：发往上游前统一规整参数，
+  越界值收敛到实测合法区间（`temperature`、`top_p`、`presence_penalty`、`frequency_penalty`、`seed`、
+  `top_k`、`top_logprobs`、`max_tokens`），`stop` 统一改写为最多 5 项的数组，剔除上游不支持的 `logit_bias`。
+- `tool_choice` 只保留 `none`/`auto`/`required`：对象形状（指定某个函数）与其它取值降级为 `auto`，工具仍可用。
+- 自动修复畸形消息形状：空 `text` 块与空 `content` 数组、非字符串 `content`、`tool_calls` 缺 `type` 或
+  `arguments` 非字符串。这类块会让长会话**永久**无法发送，现在在本地修掉。
+- 无法收敛的语义冲突（如 `n=2`）改为返回带合法范围的 400，不再透传上游的通用错误。
+- 上游仍返回 `001001005` 时记录该请求的参数指纹（只含字段形状，绝不含提示词与 base64），便于事后定位。
+- 修正 `model_not_multimodal` 被通用参数码吞掉的归类顺序：模型不支持图片时仍给出可操作的错误提示。
+
 ## v0.9.0
 
 - 合入长思考流超时修复：取消 180 秒整流硬上限，改为响应头与逐读空闲超时，正常长流不再被代理截断。

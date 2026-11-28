@@ -365,6 +365,20 @@ async fn run_for_model(
         if let Some((orig, capped)) = params::normalize_params(obj, cap) {
             println!("[param] {model}: max_tokens {orig} -> {capped} (上限 {cap})");
         }
+        // 上游对越界参数只回 `001001005 The request param is invalid`，不带字段名。
+        // 能收敛的在这里收敛，收敛不了的直接给调用方可读的 400——比让整单
+        // 失败、再翻日志猜字段好得多。
+        match params::repair_params(obj) {
+            Ok(notes) => {
+                if !notes.is_empty() {
+                    println!("[param] {model}: {}", notes.join("；"));
+                }
+            }
+            Err(reason) => {
+                println!("[param] {model}: 拒绝请求：{reason}");
+                return Err(ApiError::bad_request(reason));
+            }
+        }
     }
 
     // 上游按会话计并发时用得到 chat_id；同时保证同账号上同一对话能命中
@@ -790,6 +804,14 @@ async fn attempt(
             "[{account_id}] {model}: 上游 HTTP {status} {code} {}",
             msg.chars().take(200).collect::<String>()
         );
+        // 001001005 是上游参数校验器的通用兜底码，不说是哪个字段。这条请求的
+        // 采样参数指纹是唯一能事后复现的线索（不含提示词与 base64）。
+        if code.contains(params::UPSTREAM_PARAM_INVALID) {
+            println!(
+                "[param] {model}: 参数指纹 {}",
+                params::param_fingerprint(body.as_object().unwrap_or(&serde_json::Map::new()))
+            );
+        }
         return Ok(classify_failure(status, &code, &msg));
     }
 
@@ -1150,6 +1172,10 @@ fn classify_failure(status: StatusCode, code: &str, msg: &str) -> Attempt {
 
     // 模型本身不支持图片：属于客户端能力问题，换账号是徒劳的，也不能计入
     // 账号失败（否则连续几次带图请求会把账号打冷却）。
+    //
+    // 必须排在 `001001005` 通用分支**之前**：上游把"模型不支持图片"也包在同一个
+    // 通用参数码里（`InferHub.001001005.400 The request model is not multimodal`），
+    // 先匹配通用码会把这个可操作的能力错误吞成一句"参数非法"。
     if msg.contains("model is not multimodal") || code.contains("001001020") {
         return Attempt::Retry {
             error: ApiError::new(
@@ -1157,6 +1183,24 @@ fn classify_failure(status: StatusCode, code: &str, msg: &str) -> Attempt {
                 "model_not_multimodal",
                 format!("模型不支持图片输入（上游明确拒绝）：{msg}"),
             ),
+            switch_account: false,
+        };
+    }
+
+    // 上游参数校验器的通用兜底错误。绝大多数情况是客户端带了越界字段：把
+    // 实测的合法范围一并回给调用方，别让用户只看到 "param is invalid"。
+    //
+    // 请求体已经在发出前过了一遍 `params::repair_params`，能收敛的都收敛了；
+    // 走到这里通常说明是这里没有覆盖的字段，或 `n` 这类无法收敛的语义冲突。
+    if code.contains(params::UPSTREAM_PARAM_INVALID) {
+        return Attempt::Retry {
+            error: ApiError::bad_request(format!(
+                "上游拒绝该请求参数（{code}）：{msg}。常见越界项与允许范围：\
+                 max_tokens ≥ 1、n 只能为 1、temperature ∈ [0,2]、top_p ∈ (0,1]、\
+                 presence_penalty / frequency_penalty ∈ [-2,2]、stop 为最多 5 项的数组、\
+                 seed ∈ [0, 2147483647]、top_k ≥ 1、top_logprobs ∈ [0,20]、\
+                 tool_choice 只能是 none/auto/required。日志里已记录该请求的参数指纹。"
+            )),
             switch_account: false,
         };
     }
